@@ -18,6 +18,7 @@ from __future__ import annotations
 import hashlib
 import ipaddress
 import json
+import os
 import socket
 import time
 from datetime import datetime, timezone
@@ -25,16 +26,23 @@ from pathlib import Path
 from urllib.parse import urlparse
 
 import httpx
-import trafilatura
 from ddgs import DDGS
+from dotenv import load_dotenv
 from mcp.server.fastmcp import FastMCP
+
+load_dotenv(Path(__file__).parent.parent / ".env")
 
 SNAP_DIR = Path(__file__).parent / "snapshots"
 SNAP_DIR.mkdir(exist_ok=True)
 
-MAX_BYTES = 4_000_000          # 单页抓取上限，防超大响应
+MAX_BYTES = 4_000_000          # 单页正文上限，防超大响应
 FETCH_TIMEOUT = 20.0
+CRAWL_TIMEOUT = 120.0          # crawl4ai 带 JS 渲染，抓取较慢
 UA = "research-poc/0 (+local validation)"
+
+# 固化后端：crawl4ai 服务（服务器端抓取+渲染+正文抽取）。唯一后端，遇爬不了的资源再调整。
+CRAWL4AI_BASE = os.environ.get("CRAWL4AI_BASE_URL", "").rstrip("/")
+CRAWL4AI_TOKEN = os.environ.get("CRAWL4AI_TOKEN", "")
 
 mcp = FastMCP("web-search-source")
 
@@ -135,21 +143,33 @@ def open_source(candidate_id: str) -> str:
     ok, why = _is_public_http(url)
     if not ok:
         return json.dumps({"error": f"URL 校验失败: {why}", "url": url}, ensure_ascii=False)
+    if not CRAWL4AI_BASE or not CRAWL4AI_TOKEN:
+        return json.dumps({"error": "未配置 CRAWL4AI_BASE_URL / CRAWL4AI_TOKEN"}, ensure_ascii=False)
+    # 固化经 crawl4ai：服务器端抓取+JS 渲染+正文抽取，直接取 markdown。
     try:
-        with httpx.Client(follow_redirects=True, timeout=FETCH_TIMEOUT,
-                          headers={"User-Agent": UA}) as c:
-            resp = c.get(url)
-            final = str(resp.url)
-            ok, why = _is_public_http(final)   # 重定向落点复检，防越界到内网
-            if not ok:
-                return json.dumps({"error": f"重定向越界: {why}", "final_url": final},
-                                  ensure_ascii=False)
-            raw = resp.content[:MAX_BYTES]
+        with httpx.Client(timeout=CRAWL_TIMEOUT) as c:
+            resp = c.post(f"{CRAWL4AI_BASE}/crawl",
+                          headers={"Authorization": f"Bearer {CRAWL4AI_TOKEN}"},
+                          json={"urls": [url]})
+        if resp.status_code != 200:
+            return json.dumps({"error": f"crawl4ai HTTP {resp.status_code}", "url": url},
+                              ensure_ascii=False)
+        results = resp.json().get("results") or []
+        res = results[0] if results else {}
     except Exception as e:
         return json.dumps({"error": f"抓取失败: {e}", "url": url}, ensure_ascii=False)
 
-    html = raw.decode(resp.encoding or "utf-8", errors="replace")
-    text = trafilatura.extract(html, url=final, favor_precision=True) or ""
+    if not res.get("success"):
+        return json.dumps({"error": f"crawl4ai 抓取未成功 (status={res.get('status_code')})，"
+                                    f"资源可能反爬/失效，按原则弃取", "url": url}, ensure_ascii=False)
+    final = res.get("url") or url
+    ok, why = _is_public_http(final)      # 重定向落点复检，防越界到内网
+    if not ok:
+        return json.dumps({"error": f"重定向越界: {why}", "final_url": final}, ensure_ascii=False)
+    md = res.get("markdown")
+    if isinstance(md, dict):
+        md = md.get("raw_markdown", "")
+    text = (md or "")[:MAX_BYTES]
     if not text.strip():
         return json.dumps({"error": "正文抽取为空（可能为动态渲染或登录墙）", "url": final},
                           ensure_ascii=False)

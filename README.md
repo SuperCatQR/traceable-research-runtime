@@ -5,6 +5,7 @@
 当前处于架构验证阶段。暂定设计见：
 
 - [架构设计（暂定）](docs/architecture.md)
+- [验证版设计（PoC）](docs/validation-poc.md)
 
 ## 当前原则
 

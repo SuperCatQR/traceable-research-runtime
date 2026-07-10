@@ -97,7 +97,7 @@ sequenceDiagram
     participant R as run.py 环路
     participant S as 强模型<br/>research-strong
     participant C as 廉价模型<br/>research-cheap
-    participant SI as 三工具<br/>server
+    participant SI as 工具层 server.py<br/>（进程内 import，非 MCP 服务）
 
     U->>R: 问题
     R->>S: 生成搜索词

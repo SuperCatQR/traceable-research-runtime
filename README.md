@@ -12,5 +12,5 @@
 - 模型只生成结构化候选；程序掌握状态、校验与控制流。
 - 以有界数据协议和无状态调用消解上下文问题，不设专门管理层。
 - Source Interface 统一提供普通索引与版本化原文，稳定 `source_ref` 贯穿证据链。
-- 采用克制的微服务：API、薄 Research Runtime、独立 Model/Worker Service；Source 首期同进程实现。
+- 采用克制的微服务：API、薄 Research Runtime、独立 Model API Gateway（可直接部署 New API）；Source 首期同进程实现。
 - 按变化与故障边界拆分；不预设 KG、常驻多 Agent 或“每个名词一个服务”。

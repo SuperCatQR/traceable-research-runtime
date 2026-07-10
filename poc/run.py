@@ -39,10 +39,20 @@ TRACE_DIR = ROOT / "trace"
 TRACE_DIR.mkdir(exist_ok=True)
 DB_PATH = ROOT / "store.sqlite"
 
-STRONG = os.environ["MODEL_STRONG"]
-CHEAP = os.environ["MODEL_CHEAP"]
 _client = openai.OpenAI(base_url=os.environ["DEEPSEEK_BASE_URL"],
                         api_key=os.environ["DEEPSEEK_API_KEY"])
+
+# strong 角色的 4 个待对比配置：{flash,pro} × {思考,非思考}。
+# DeepSeek v4 同一 model id 靠 extra_body.thinking 切思考模式（官方文档）。
+CONFIGS = {
+    "flash-nothink": {"model": "deepseek-v4-flash", "thinking": False},
+    "flash-think":   {"model": "deepseek-v4-flash", "thinking": True},
+    "pro-nothink":   {"model": "deepseek-v4-pro",   "thinking": False},
+    "pro-think":     {"model": "deepseek-v4-pro",   "thinking": True},
+}
+DEFAULT_CONFIG = "flash-nothink"
+# cheap 角色（逐字取证）是机械活，思考无增益且更贵，固定为 flash 非思考。
+CHEAP_MODEL = "deepseek-v4-flash"
 
 MAX_QUERIES = 3        # 有界搜索词
 MAX_CANDIDATES = 5     # 每词候选上限
@@ -83,14 +93,16 @@ class Loop:
         self.trace_fp.write(json.dumps(rec, ensure_ascii=False) + "\n")
         self.trace_fp.flush()
 
-    def chat(self, model: str, system: str, user: str) -> str:
+    def chat(self, model: str, system: str, user: str,
+             thinking: bool = False, role: str = "strong") -> str:
         kw = {"model": model,
               "messages": [{"role": "system", "content": system},
-                           {"role": "user", "content": user}]}
-        if model == CHEAP:
-            kw["temperature"] = 0          # reasoner 不接受 temperature
+                           {"role": "user", "content": user}],
+              "extra_body": {"thinking": {"type": "enabled" if thinking else "disabled"}}}
+        if not thinking:
+            kw["temperature"] = 0          # 思考模式不支持 temperature，仅非思考设 0 求可复现
         r = _client.chat.completions.create(**kw)
-        if model == STRONG:
+        if role == "strong":
             self.strong_calls += 1
         else:
             self.cheap_calls += 1
@@ -116,15 +128,17 @@ def _tool(fn, **kw) -> dict:
 
 
 # ---------- 10 步环路 ----------
-def run_once(question: str) -> dict:
+def run_once(question: str, strong_cfg: dict | None = None) -> dict:
+    cfg = strong_cfg or CONFIGS[DEFAULT_CONFIG]
+    smodel, sthink = cfg["model"], cfg["thinking"]
     lp = Loop(question)
     lp.log("question", text=question)
 
     # 2. strong 生成有界搜索词
-    raw = lp.chat(STRONG,
+    raw = lp.chat(smodel,
                   "你是检索规划器。只输出 JSON 数组，元素为搜索词字符串，"
                   f"最多 {MAX_QUERIES} 个，覆盖问题的关键事实点。不要解释。",
-                  question)
+                  question, thinking=sthink)
     queries = _extract_json(raw)[:MAX_QUERIES]
     lp.log("queries", queries=queries)
 
@@ -144,10 +158,10 @@ def run_once(question: str) -> dict:
 
     cand_menu = [{"candidate_id": k, "title": v["title"], "snippet": v["snippet"]}
                  for k, v in seen_cid.items()]
-    raw = lp.chat(STRONG,
+    raw = lp.chat(smodel,
                   "从候选中选出最可能含权威事实依据的网页。只输出 JSON 数组，"
                   f"元素为 candidate_id 字符串，最多 {MAX_OPEN} 个。只能从给定 id 中选，不得自造。",
-                  json.dumps(cand_menu, ensure_ascii=False))
+                  json.dumps(cand_menu, ensure_ascii=False), thinking=sthink)
     picked = [cid for cid in _extract_json(raw) if cid in seen_cid][:MAX_OPEN]
     lp.log("picked", picked=picked)
 
@@ -175,11 +189,11 @@ def run_once(question: str) -> dict:
         sref = o["source_ref"]
         snap = _tool(server.read_source, source_ref=sref)
         text = snap["text"]
-        raw = lp.chat(CHEAP,
+        raw = lp.chat(CHEAP_MODEL,
                       "你是取证助手。只依据给定网页正文，摘出能回答问题的逐字引文片段。"
                       "只输出 JSON 数组，每元素 {\"quote\": \"原文逐字片段\"}；"
                       "quote 必须是正文中连续出现的原文，不得改写、拼接或翻译。无相关内容则输出 []。",
-                      f"问题：{question}\n\n网页正文：\n{text}")
+                      f"问题：{question}\n\n网页正文：\n{text}", thinking=False, role="cheap")
         try:
             cands = _extract_json(raw)
         except ValueError:
@@ -206,11 +220,11 @@ def run_once(question: str) -> dict:
     # 8. strong 读已验证证据 → Claim + 带引用答案
     ev_menu = [{"id": i, "source_ref": v["source_ref"], "quote": v["quote"]}
                for i, v in enumerate(verified)]
-    raw = lp.chat(STRONG,
+    raw = lp.chat(smodel,
                   "仅依据给定证据回答问题，不得引入证据外的事实。输出 JSON 对象："
                   '{"answer": "综合回答", "claims": [{"text": "事实句", "evidence_ids": [证据id]}]}。'
                   "每条事实句必须由至少一个 evidence_id 支撑；不要编造 id。",
-                  f"问题：{question}\n\n证据：\n{json.dumps(ev_menu, ensure_ascii=False, indent=2)}")
+                  f"问题：{question}\n\n证据：\n{json.dumps(ev_menu, ensure_ascii=False, indent=2)}", thinking=sthink)
     out = _extract_json(raw)
     answer = out.get("answer", "")
     claims = out.get("claims", [])
@@ -245,33 +259,95 @@ def run_once(question: str) -> dict:
             "cheap_calls": lp.cheap_calls}
 
 
-def main():
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--question")
-    ap.add_argument("--gold", help="gold.jsonl 路径，批量跑")
-    args = ap.parse_args()
-
-    if args.gold:
-        gp = Path(args.gold)
-        out_fp = (ROOT / "eval" / "results.jsonl").open("w", encoding="utf-8")
-        for line in gp.read_text(encoding="utf-8").splitlines():
+def _run_gold(gold_path: Path, cfg_name: str, out_path: Path) -> list[dict]:
+    """按指定 strong 配置批量跑 gold，写 out_path，返回结果列表。"""
+    cfg = CONFIGS[cfg_name]
+    results = []
+    with out_path.open("w", encoding="utf-8") as out_fp:
+        for line in gold_path.read_text(encoding="utf-8").splitlines():
             line = line.strip()
             if not line:
                 continue
             item = json.loads(line)
             t0 = time.time()
-            r = run_once(item["question"])
+            r = run_once(item["question"], cfg)
             r["qid"] = item.get("qid")
+            r["config"] = cfg_name
             r["elapsed_s"] = round(time.time() - t0, 1)
             out_fp.write(json.dumps(r, ensure_ascii=False) + "\n")
             out_fp.flush()
-            print(f"[{r['qid']}] {r['run_id']} claims={len(r.get('claims', []))} "
+            results.append(r)
+            print(f"  [{cfg_name}] [{r['qid']}] claims={len(r.get('claims', []))} "
                   f"cites={len(r['citations'])} {r['elapsed_s']}s")
-        out_fp.close()
+    return results
+
+
+def _metrics(results: list[dict], gold: dict) -> dict:
+    """内联复用 eval/score.py 的程序可判定指标。"""
+    n = len(results)
+    answered = grounded = total = must_hit = must_total = 0
+    strong = cheap = 0
+    elapsed = 0.0
+    for r in results:
+        claims = r.get("claims", [])
+        total += len(claims)
+        grounded += sum(1 for c in claims if c.get("grounded"))
+        if r.get("answer") and r.get("citations"):
+            answered += 1
+        strong += r.get("strong_calls", 0)
+        cheap += r.get("cheap_calls", 0)
+        elapsed += r.get("elapsed_s", 0)
+        g = gold.get(r.get("qid"))
+        if g:
+            facts = g.get("must_cite_facts", [])
+            must_total += len(facts)
+            ans = r.get("answer", "")
+            must_hit += sum(1 for f in facts
+                            if f in ans or any(f in e["quote"] for e in r.get("evidence", [])))
+    return {"n": n, "answered": answered, "grounded": grounded, "total": total,
+            "must_hit": must_hit, "must_total": must_total,
+            "strong": strong, "cheap": cheap, "elapsed": elapsed}
+
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--question")
+    ap.add_argument("--gold", help="gold.jsonl 路径，批量跑")
+    ap.add_argument("--config", default=DEFAULT_CONFIG, choices=list(CONFIGS),
+                    help="strong 角色配置")
+    ap.add_argument("--bench", action="store_true",
+                    help="对 gold 跑全部 4 个 strong 配置并出对比表")
+    args = ap.parse_args()
+
+    if args.bench:
+        gp = Path(args.gold or ROOT / "eval" / "gold.jsonl")
+        gold = {g["qid"]: g for g in
+                (json.loads(l) for l in gp.read_text(encoding="utf-8").splitlines() if l.strip())}
+        table = {}
+        for name in CONFIGS:
+            print(f"=== {name} ===")
+            out = ROOT / "eval" / f"results-{name}.jsonl"
+            table[name] = _metrics(_run_gold(gp, name, out), gold)
+
+        def pct(a, b):
+            return f"{100*a/b:.0f}%" if b else "n/a"
+        print("\n配置            覆盖率  引用忠实  Trace  必答点  strong/题  s/题")
+        for name, m in table.items():
+            nn = m["n"] or 1
+            print(f"{name:<14}  {pct(m['answered'],m['n']):>5}  "
+                  f"{pct(m['grounded'],m['total']):>7}  {pct(m['grounded'],m['total']):>5}  "
+                  f"{pct(m['must_hit'],m['must_total']):>5}  "
+                  f"{m['strong']/nn:>7.1f}  {m['elapsed']/nn:>5.1f}")
+        return
+
+    if args.gold:
+        gp = Path(args.gold)
+        out = ROOT / "eval" / "results.jsonl"
+        _run_gold(gp, args.config, out)
         return
 
     q = args.question or "劳动合同被用人单位违法解除，劳动者可以主张哪些救济？"
-    r = run_once(q)
+    r = run_once(q, CONFIGS[args.config])
     print(json.dumps(r, ensure_ascii=False, indent=2))
 
 

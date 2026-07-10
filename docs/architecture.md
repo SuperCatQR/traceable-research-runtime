@@ -180,7 +180,7 @@ research-cheap   → 当前选定的廉价模型渠道
 | 强模型  | 生成研究计划候选、Claim 候选和带引用答案草稿 |
 | 廉价模型 | 生成单个局部任务的导航结果与证据候选        |
 
-不设常驻路由 Agent。Runtime 按阶段指定固定模型别名，不让模型自选模型。网关只处理可安全重试的传输失败；Runtime 以稳定 `request_id` 记录调用，校验计划、证据和 Claim 候选后方可写入。模型若返回 Source 工具请求，Runtime 执行工具并以结果发起下一次无状态模型调用，网关不参与工具循环。
+不设常驻路由 Agent。Runtime 按阶段指定固定模型角色，不让模型自选模型。Runtime 以稳定 `request_id` 记录调用，校验计划、证据和 Claim 候选后方可写入。模型若返回 Source 工具请求，Runtime 执行工具并以结果发起下一次无状态模型调用。
 
 ## 5. 统一受控工作流
 
@@ -189,33 +189,25 @@ sequenceDiagram
     participant U as 用户
     participant A as API
     participant R as Research Runtime
-    participant G as Model API Gateway
-    participant M as 模型渠道
+    participant S as 强模型
+    participant C as 廉价模型
     participant SI as Source Interface
 
     U->>A: 专业问题
     A->>R: 创建 Research Run
-    R->>G: model=research-strong，结构化计划请求
-    G->>M: 转发至所映射渠道
-    M-->>G: 计划候选
-    G-->>R: OpenAI-compatible 响应
+    R->>S: 请求结构化计划候选
+    S-->>R: 计划候选
     R->>R: 校验并生成有限任务
-    R->>G: model=research-cheap，局部任务与授权范围
-    G->>M: 转发至所映射渠道
-    M-->>G: list / search / read 工具请求
-    G-->>R: OpenAI-compatible 工具响应
+    R->>C: 局部任务与授权范围
+    C-->>R: list / search / read 工具请求
     R->>SI: 绑定 access_context 后调用
     SI-->>R: 原文单元与 source_ref
-    R->>G: model=research-cheap，附工具结果继续调用
-    G->>M: 转发至所映射渠道
-    M-->>G: 证据候选
-    G-->>R: OpenAI-compatible 响应
+    R->>C: 附工具结果继续调用
+    C-->>R: 证据候选
     R->>SI: verify_quote
     SI-->>R: 校验结果
-    R->>G: model=research-strong，提供已验证证据
-    G->>M: 转发至所映射渠道
-    M-->>G: Claim 候选与答案草稿
-    G-->>R: OpenAI-compatible 响应
+    R->>S: 提供已验证证据
+    S-->>R: Claim 候选与答案草稿
     R->>R: 校验引用并完成 Research Run
     R->>A: 答案与可点击依据
     A->>U: 输出
@@ -352,7 +344,7 @@ Model API Gateway（New API）
 
 Source Interface、Evidence 与 Claim 首期为边界清晰的同进程模块，不因名称不同便拆成独立服务。Source 契约保持与传输无关；仅当出现多个独立消费者、独立权限域、独立扩容、故障隔离或团队所有权时，才在契约外加 HTTP 或 RPC 适配器并拆为服务。
 
-API 创建 Research Run 后即可异步返回 `run_id`；Runtime 自行推进持久任务，并通过 New API 的同步或流式 OpenAI-compatible 接口调用模型。首期不为模型调用另设消息队列或完成事件服务；正文进入 PostgreSQL 或对象存储，Run 更新以 `revision` 防止并发覆盖。
+API 创建 Research Run 后即可异步返回 `run_id`；Runtime 自行推进持久任务。模型调用在部署层经 New API 的同步或流式 OpenAI-compatible 接口完成，不改变研究工作流。首期不为模型调用另设消息队列或完成事件服务；正文进入 PostgreSQL 或对象存储，Run 更新以 `revision` 防止并发覆盖。
 
 API 与 Runtime 可共用一个 PostgreSQL 实例以降低运维成本，但表所有权唯一：API 写用户与会话，Runtime 写 Run、Task、Model Call、Evidence、Claim 与 Trace；服务不得跨边界直接修改他方表。New API 使用其自身数据库保存渠道配置、密钥与用量，不作为研究状态库。文档及其索引同属 Versioned Document Store。
 

@@ -112,9 +112,7 @@ sequenceDiagram
     R->>R: 校验候选 ID 归属本 run
     loop 每个选中候选
         R->>SI: open_source(candidate_id)
-        SI-->>R: 固化快照与 source_ref + content_hash
-    end
-    loop 每个 source_ref
+        SI-->>R: 固化快照 source_ref + content_hash
         R->>SI: read_source(source_ref)
         SI-->>R: 快照正文
         R->>C: 问题与快照正文

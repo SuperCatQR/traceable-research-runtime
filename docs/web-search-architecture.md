@@ -33,7 +33,7 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 | 动作 | 签名 | 职责 | 返回 |
 | --- | --- | --- | --- |
 | 搜索 | `search_candidates(query, k=6)` | 拿有界候选，仅供导航 | `[{candidate_id, title, url, snippet}]` |
-| 存档 | `open_source(candidate_id)` | 抓取正文、存快照、算哈希 | `{source_ref, source_uri, title, content_hash, char_len, fetched_at}` |
+| 抓取+存档 | `open_source(candidate_id)` | 经 crawl4ai 抓正文（§3.2），再锁版本存快照（§3.3） | `{source_ref, source_uri, title, content_hash, char_len, fetched_at}` |
 | 读取 | `read_source(source_ref)` | 读回已存档的快照正文 | `{source_ref, source_uri, content_hash, truncated, text}` |
 
 关键约束：`open_source` 只接受本次会话里 `search_candidates` 产生过的 `candidate_id`，拒绝任何集合外的 URL。模型不能凭空造 URL 让系统去抓。
@@ -45,21 +45,39 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 - 每条候选按 `sha1(query|url)` 生成 12 位 `candidate_id`，登记进会话内候选表 `_candidates`。
 - 标题和摘要**只用于让模型判断该不该打开，绝不能当事实证据**。证据只能来自存档后的快照正文。
 
-### 3.2 存档：`open_source`
+`open_source` 一个调用里其实做了两件不同性质的事：先**向不可信的外部世界抓一次**（crawl4ai 负责），再**把抓回来的东西存成不可变版本**（我们自己负责）。这两件事信任边界不同、失败原因不同，下面分开讲。
 
-这是网页架构最重的一步，也是信任边界所在。流程严格按序：
+### 3.2 抓取：crawl4ai（向外，最易出错的一步）
 
-1. 用 `candidate_id` 取出 URL；未知 id 直接拒绝。
+这一步是整个架构里唯一"主动向公网发请求"的动作，也是最容易出错的一步：抓什么、抓没抓到、抓回来的是不是正文，全在这里决定。信任边界就在这：crawl4ai 是外部服务，它的返回是不可信输入。
+
+1. 用 `candidate_id` 取出 URL；未知 id 直接拒绝（越过候选表就没有抓取）。
 2. **抓取前 SSRF 守卫** `_is_public_http`：解析 URL，只允许 http(s)，DNS 解析后逐个地址检查，拦掉内网、环回、link-local、保留、组播地址。
-3. 经 crawl4ai 抓取：`POST {CRAWL4AI_BASE}/crawl`，带 `Bearer` token，body `{"urls": [url]}`。crawl4ai 在服务器端完成抓取、JS 渲染、正文抽取，直接给 markdown。crawl4ai 是唯一抓取后端；遇到它也爬不动的资源（登录墙/付费墙），按"弃取"处理，不硬扛。
-4. 判 `results[0].success`。不成功即视为反爬或失效，放弃这条候选。
+3. 经 crawl4ai 抓取：`POST {CRAWL4AI_BASE}/crawl`，带 `Bearer` token，body `{"urls": [url]}`。crawl4ai 在服务器端完成抓取、JS 渲染（无头浏览器）、正文抽取。crawl4ai 是唯一抓取后端；遇到它也爬不动的资源（登录墙/付费墙），按"弃取"处理，不硬扛。
+4. 判 `results[0].success`。不成功即视为反爬或失效，放弃这条候选，换下一个。
 5. **抓取后重定向复检**：对最终落点 URL 再跑一次 `_is_public_http`，防止跳转越界打到内网。
-6. 取 markdown 正文（若为 dict 取 `raw_markdown`），截到 `MAX_BYTES = 4_000_000`。正文为空视为动态渲染失败或登录墙，放弃。
-7. **存档并锁版本**：`content_hash = "sha256:" + sha256(text)`，`snap_id = sha1(final_url|content_hash)[:16]`，`source_ref = "source:web/<snap_id>"`。快照写入 `snapshots/<snap_id>.json`，含 url、title、正文、哈希、抓取时间。
+
+抓取的产物是 crawl4ai 的结构化返回，正文取其 markdown（当前取 `raw_markdown`）。抓取阶段只负责"拿到、且确认拿到了"，不做版本锁定。
+
+### 3.3 存档：锁版本（向内，产物不可变）
+
+抓取成功后才进存档，这一步纯本地、确定性：
+
+1. 取 markdown 正文，截到 `MAX_BYTES = 4_000_000`。正文为空视为动态渲染失败或登录墙，放弃。
+2. **锁版本**：`content_hash = "sha256:" + sha256(text)`，`snap_id = sha1(final_url|content_hash)[:16]`，`source_ref = "source:web/<snap_id>"`。
+3. 快照写入 `snapshots/<snap_id>.json`，含 url、title、正文、哈希、抓取时间。
 
 存档之后，这份快照就是不可变的原文版本。后续取证、校验、引用全部只认 `source_ref` 和 `content_hash`，不再触网。
 
-### 3.3 读取：`read_source`
+### 3.4 抓取可审计性（规划中，未落地）
+
+抓取是最易出错的一步，却也是当前最不可审计的一步。现状：存档只保留最终 markdown 正文，crawl4ai 返回的其余结构化字段——`status_code`、最终响应头、页面 `metadata`、以及 `fit_markdown`（去噪正文）等 markdown 变体——都未入档。
+
+后果：正文一旦抽歪（该有的正文没了、或截断切错），无法回溯是**抓取端**（crawl4ai 抓错、反爬返回了空壳页）还是**本地处理**（取错 markdown 变体、截断位置不对）导致的。"crawl4ai 到底抓了什么"查不到。
+
+规划中的改进：把存档从"只留一段正文"扩成**抓取凭证**，记录 crawl4ai 的关键结构化输出（`status_code`、`final_url`、`metadata`、各 markdown 变体的长度对照）。有了长度对照，"抽取抽歪了"这类最常见错误就能一眼看出，且不必存原始 HTML——渲染态 HTML 只是某一时刻某一滚动位置的快照，要说清它是哪个状态还得引入页面状态判断，代价大而审计价值薄，不做。正文来源可从 `raw_markdown` 换成 `fit_markdown` 以提升正文质量，同时记下两者长度做对照。此项属未落地设计，落地时同步更新 §3.3。
+
+### 3.5 读取：`read_source`
 
 按 `source_ref` 从快照记录里读回正文，供廉价模型取证。读的是存档，不是原页。
 

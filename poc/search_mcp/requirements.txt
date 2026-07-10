@@ -1,0 +1,4 @@
+mcp>=1.28
+httpx>=0.28
+trafilatura>=2.1
+ddgs>=9.14

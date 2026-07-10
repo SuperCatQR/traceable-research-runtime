@@ -1,2 +1,9 @@
 
 .reasonix/
+
+.env
+poc/.env
+poc/trace/
+poc/store.sqlite
+poc/search_mcp/snapshots/
+poc/eval/results.jsonl

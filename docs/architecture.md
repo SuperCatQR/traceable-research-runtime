@@ -54,13 +54,14 @@ flowchart TB
     UI --> API[API Service]
     API --> R[Thin Research Runtime]
 
-    R <-->|受控任务 / 结构化候选| MS[Model / Worker Service]
+    R <-->|任务、候选与工具消息| MS[Model / Worker Service]
     MS --> SM[强模型]
     MS --> CM[廉价模型]
 
+    R <-->|只读调用| SI[Source Interface]
     R <--> E[Evidence / Claim 模块]
-    R <--> D[Versioned Document Store / Index]
-    E <--> D
+    E <-->|引文校验| SI
+    SI <--> D[Versioned Document Store / Index]
     R --> A[Trace / Audit]
 
     R --> API
@@ -117,13 +118,38 @@ Transition      按固定阶段执行状态转移
 
 Evidence、Claim、模型输出和原文均以稳定 ID 或 `ref` 引用，不复制进 Runtime 状态。Runtime 不向其他服务暴露内部框架类型。
 
-### 4.4 Versioned Document Store
+### 4.4 Source Interface 与 Versioned Document Store
 
-保存 PDF、网页快照、结构化文本、历史版本及普通导航索引。索引节点仅是可引用的数据记录主题、层级和资料地址，不构成独立模块或特殊类型。
-
-证据地址至少包含：
+Source Interface 是模型及证据校验模块读取数据源的唯一边界；首期作为 Runtime 进程内、文档库前的独立模块，不另部署服务。模型提出工具请求，Runtime 代为调用并返回结果，故 Model Service 无须跨网直连 Source 或持数据库凭据。它隐藏 PostgreSQL、对象存储和索引实现，仅暴露四个只读操作：
 
 ```text
+list_sources    列出授权范围内的主题、层级和来源
+search_sources  以关键词检索索引与原文，返回 source_ref 列表
+read_source     按 source_ref 读取固定版本的原文单元
+verify_quote    校验逐字引文属于 source_ref 指定内容
+```
+
+`read_source` 同时完成引用解析，不另设 `resolve`。Runtime 将身份授权绑定为模型不可修改的 `access_context`，工具参数只含检索词、范围引用、分页游标或 `source_ref`；Source Interface 执行权限与长度校验。采集、更新、删除和建索引属于离线入库流程，不进入此接口。
+
+内部契约与未来对外 API 共用同一 schema，首期只作函数调用，不为“以后拆分”预写 HTTP 客户端：
+
+```json
+{
+  "request_id": "SR1",
+  "operation": "read_source",
+  "args": {"source_ref": "source:law/doc87/v4#section-12:0-64"},
+  "access_context": {"subject_id": "U1", "collection_ids": ["law"]}
+}
+```
+
+成功响应统一含 `request_id`、`result`；失败统一含稳定错误码 `INVALID_ARGUMENT`、`FORBIDDEN`、`NOT_FOUND`、`STALE_CURSOR` 或 `INTERNAL`，不泄露未授权来源是否存在。列表和检索使用不透明游标分页；`read_source` 返回下列来源单元；`verify_quote` 仅返回 `valid`、`content_hash` 与规范化位置。
+
+Versioned Document Store 保存 PDF、网页快照、结构化文本、历史版本及普通导航索引。索引节点仅是可引用的数据记录主题、层级和资料地址，不构成独立模块或特殊类型。
+
+每个返回单元使用不可变 `source_ref`，并至少包含：
+
+```text
+source_ref
 collection_id
 document_id
 version_id
@@ -134,7 +160,7 @@ source_uri
 ingested_at
 ```
 
-地址必须稳定；历史回答须能按当时版本重放。
+`source_ref` 编码文档版本与位置；内容发布后不可变。历史回答须能按该引用读取原文，并以 `content_hash` 验证内容。Evidence 保存 `source_ref` 与短引文，Claim 引用 Evidence，答案引用 Claim 或 Evidence，故全链可回放。
 
 ### 4.5 Model / Worker Service
 
@@ -158,17 +184,21 @@ sequenceDiagram
     participant R as Research Runtime
     participant S as 强模型
     participant C as 廉价模型
-    participant K as 索引/文档库
+    participant SI as Source Interface
 
     U->>A: 专业问题
     A->>R: 创建 Research Run
     R->>S: 请求结构化计划候选
     S-->>R: 计划候选
     R->>R: 校验并生成有限任务
-    R->>C: 派发已批准的局部任务
-    C->>K: 沿允许的索引范围读取资料
+    R->>C: 派发已批准的局部任务与授权范围
+    C-->>R: list / search / read 工具请求
+    R->>SI: 绑定 access_context 后调用
+    SI-->>R: 原文单元与 source_ref
+    R->>C: 工具结果
     C-->>R: 证据候选
-    R->>R: 校验地址、引文与权限
+    R->>SI: verify_quote
+    SI-->>R: 校验结果
     R->>S: 提供已验证证据
     S-->>R: Claim 候选与答案草稿
     R->>R: 校验引用并完成 Research Run
@@ -181,8 +211,8 @@ sequenceDiagram
 1. API 为每个专业问题创建 Research Run。
 2. 强模型生成结构化研究计划候选，不直接创建或派发任务。
 3. Runtime 按 schema 与允许索引范围校验计划候选，并据其任务列表创建局部任务。
-4. 廉价模型只返回证据候选，不写 Evidence Store。
-5. 程序验证权限、版本、地址、逐字引文和去重后，接受证据对象。
+4. 廉价模型经 Source Interface 在授权范围内导航和读取，只返回带 `source_ref` 的证据候选，不写 Evidence Store。
+5. 程序调用 `verify_quote` 验证权限、版本、哈希、逐字引文和去重后，接受证据对象。
 6. 全部局部任务完成后，强模型基于已验证证据生成 Claim 候选和答案草稿。
 7. 程序校验 Claim 引用与事实性结论的引用，随后输出答案并完成 Research Run。
 
@@ -205,7 +235,7 @@ sequenceDiagram
 ```json
 {
   "evidence_id": "E17",
-  "source": "kb://law/doc87/v4/section/12",
+  "source_ref": "source:law/doc87/v4#section-12:0-64",
   "quote": "原文短引文",
   "relation": "qualifies",
   "content_hash": "sha256:...",
@@ -226,7 +256,7 @@ sequenceDiagram
 }
 ```
 
-证据摘要只用于导航。最终事实性结论须能回到原文地址。
+证据摘要只用于导航。最终事实性结论须经 Evidence 的 `source_ref` 回到固定版本原文。
 
 ## 7. 输入边界
 
@@ -246,26 +276,26 @@ sequenceDiagram
 借鉴 RLM 的外置状态与符号句柄思想，但首版不提供开放 Python REPL。模型使用窄工具 API：
 
 ```text
-list_index
-search_index
 list_sources
-read_document
+search_sources
+read_source
+verify_quote
 propose_plan
 propose_evidence
 propose_claim
 propose_answer
 ```
 
-所有参数经 schema、权限和长度校验。文档内容一律视为不可信数据，不得执行其中指令。
+前四项由 Source Interface 实现；后四项只提交候选对象。所有参数经 schema、权限和长度校验。文档内容一律视为不可信数据，不得执行其中指令。
 
 ## 9. 证据、审计与安全
 
 程序确定性保证：
 
-1. 证据地址存在；
+1. `source_ref` 存在且可按固定版本读取；
 2. 用户有读取权限；
 3. 文档版本和内容哈希匹配；
-4. 引文确实存在于对应原文；
+4. 引文确实存在于 `source_ref` 对应原文；
 5. 每次读取、模型调用及状态修改均留痕。
 
 Trace 保存外显研究链，而非模型隐藏思维链：
@@ -294,6 +324,7 @@ API Service
 Thin Research Runtime
 ├─ Run / Task 状态机
 ├─ Dispatch / Resume / Cancel
+├─ Source Interface
 ├─ Evidence / Claim 模块
 └─ Audit 模块
 
@@ -305,7 +336,7 @@ Model / Worker Service
 └─ 强模型与廉价模型 Worker
 ```
 
-Evidence、Claim 与 Retrieval 首期为边界清晰的模块，不因名称不同便拆成独立服务；仅在独立扩容、权限隔离、故障隔离或团队所有权出现后拆分。
+Source Interface、Evidence 与 Claim 首期为边界清晰的同进程模块，不因名称不同便拆成独立服务。Source 契约保持与传输无关；仅当出现多个独立消费者、独立权限域、独立扩容、故障隔离或团队所有权时，才在契约外加 HTTP 或 RPC 适配器并拆为服务。
 
 短操作可同步调用；模型推理、检索等长操作使用异步任务和完成事件。消息只传 `event_id`、`run_id`、`task_id`、状态及 `result_ref`，正文进入 PostgreSQL 或对象存储。消费者按 `event_id` 幂等，Run 更新以 `revision` 防止并发覆盖。
 
@@ -334,9 +365,9 @@ Object Storage
 - 一个专业领域；
 - 一个强模型档位；
 - 一种廉价模型档位；
-- 带普通导航索引的版本化文档库；
+- 带普通导航索引的版本化文档库及四操作 Source Interface；
 - API Service、Thin Research Runtime、Model / Worker Service；
-- Runtime 内部的 Evidence、Claim 与 Audit 模块；
+- Runtime 内部的 Source、Evidence、Claim 与 Audit 模块；
 - 带引用答案和原文查看；
 - 完整 Trace。
 
@@ -344,7 +375,7 @@ Object Storage
 
 - 默认知识图谱；
 - 开放代码执行；
-- Evidence、Claim、Retrieval 等细粒度独立服务；
+- Source、Evidence、Claim 等细粒度独立服务；
 - 常驻多 Agent；
 - 独立路由或验证 Agent；
 - 无限递归研究；

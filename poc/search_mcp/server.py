@@ -1,17 +1,18 @@
-"""Web Search MCP server — PoC 阶段 0。
+"""Web Search MCP server — 架构 B 的 Source 契约实现。
 
 三工具映射架构 B 的 Source 契约：
     search_candidates(query, k) -> 有界候选集（仅导航，非证据）
     open_source(candidate_id)   -> 抓取并固化网页快照，返回 source_ref + content_hash
-    read_source(source_ref)     -> 读取快照正文单元
+    read_source(source_ref)     -> 读取快照正文
 
 设计要点：
 - 候选注册表按 candidate_id 记账；open 只接受本次会话产生的候选，拒绝集合外 URL。
 - open 时抓取正文、写快照、算哈希、生成稳定 source_ref；快照落 snapshots/。
 - 阻断内网地址、非 HTTP(S)、超大响应，网页内容视为不可信数据。
-- 传输 stdio，直接挂 Claude Desktop / Cline 等客户端。
+- 传输 stdio，既可挂 Claude Desktop / Cline 等客户端，也可被 run.py 进程内直接 import。
 
-ponytail: 阶段 0 只验素材质量与答案提升，未做逐字取证/审计回放；确认好用后按 validation-poc.md 阶段 1 补 run.py。
+逐字取证与审计回放由 run.py 环路（validation-poc.md §5）承担：cheap 模型只在
+固化快照内摘引文，程序校验 hash 匹配、引文逐字命中、Claim 有据。
 """
 from __future__ import annotations
 

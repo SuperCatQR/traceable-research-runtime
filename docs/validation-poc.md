@@ -46,7 +46,7 @@ poc/
    └─ score.py           # 指标计算
 ```
 
-模型经 New API 别名调用，PoC 不感知具体供应商：
+模型调用经统一入口，PoC 不在业务逻辑里绑定具体供应商。阶段 1 为直测方便直连 DeepSeek 官方 API（`run.py` 的 `CONFIGS` 写死 `deepseek-v4-flash` / `deepseek-v4-pro` 四配置），New API 别名（`research-strong` / `research-cheap`）抽象留待后续拆分运行时时接入：
 
 ```text
 research-strong  → 生成搜索词、选候选、生成 Claim 与带引用答案
@@ -60,7 +60,7 @@ B 的 Source 契约 `list_candidates / open / read` 直接映射为三个 MCP to
 ```text
 search_candidates(query, k)      → [{candidate_id, title, snippet, url}]   # 仅导航，非证据
 open_source(candidate_id)        → {source_ref, source_uri, fetched_at, content_hash}  # 抓取并固化快照
-read_source(source_ref)          → [{unit_id, section_path, offset, text, content_hash}]
+read_source(source_ref, max_chars)  → {source_ref, source_uri, content_hash, truncated, text}  # 读取快照正文
 ```
 
 server 内确定性职责：
@@ -170,7 +170,7 @@ sequenceDiagram
 | ---------- | ------------------------------------ | ------------------ |
 | 引用忠实度      | 事实性句子中，引文确实逐字存在于对应快照的比例              | 程序校验（已在环路第 7 步内建）  |
 | 事实准确率      | 答案关键事实与参考答案一致的比例                     | 强模型判分 + 人工抽检       |
-| 来源覆盖率      | `authoritative_sources` 被检索并成功固化快照的比例 | 程序比对               |
+| 来源覆盖率      | 成功作答（固化到权威原文、取到逐字证据并产出带引用答案）的题数 / 总题数 | 程序统计               |
 | 必答点命中率     | `must_cite_facts` 在答案中出现且有引用支撑的比例    | 程序 + 人工            |
 | Trace 完整率  | 每条最终 Claim 可回放到 Evidence→快照→原文的比例    | 程序遍历 trace         |
 | 单次成本       | 每问的强/廉模型 token 与调用次数                 | New API 用量统计       |

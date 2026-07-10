@@ -1,6 +1,6 @@
 """单进程受控环路 — PoC 阶段 1（validation-poc.md §5）。
 
-10 步环路：strong 生成搜索词→选候选→open 固化→cheap 逐字取证→程序强校验→
+10 步环路：strong 生成搜索词→选候选→open 存档→cheap 逐字取证→程序强校验→
 strong 生成 Claim+带引用答案→校验 Claim 均指向已验证 Evidence→输出+trace。
 
 关键：所有校验由程序执行（candidate_id 属本 run、hash 匹配、引文逐字命中、
@@ -56,7 +56,7 @@ CHEAP_MODEL = "deepseek-v4-flash"
 
 MAX_QUERIES = 3        # 有界搜索词
 MAX_CANDIDATES = 5     # 每词候选上限
-MAX_OPEN = 4           # 全 run 最多固化快照数，控成本
+MAX_OPEN = 4           # 全 run 最多存档快照数，控成本
 
 
 # ---------- 基础设施 ----------
@@ -165,7 +165,7 @@ def run_once(question: str, strong_cfg: dict | None = None) -> dict:
     picked = [cid for cid in _extract_json(raw) if cid in seen_cid][:MAX_OPEN]
     lp.log("picked", picked=picked)
 
-    # 5. open 固化快照
+    # 5. open 存档快照
     opened: list[dict] = []
     for cid in picked:
         res = _tool(server.open_source, candidate_id=cid)
@@ -176,10 +176,10 @@ def run_once(question: str, strong_cfg: dict | None = None) -> dict:
         lp.log("opened", source_ref=res["source_ref"], uri=res["source_uri"],
                content_hash=res["content_hash"])
     if not opened:
-        lp.log("abort", reason="所有候选固化失败")
+        lp.log("abort", reason="所有候选存档失败")
         lp.close()
         return {"run_id": lp.run_id, "question": question,
-                "answer": "候选来源均无法固化快照（动态渲染/登录墙/反爬），无法作答。",
+                "answer": "候选来源均无法存档快照（动态渲染/登录墙/反爬），无法作答。",
                 "citations": [], "evidence": [],
                 "strong_calls": lp.strong_calls, "cheap_calls": lp.cheap_calls}
 

@@ -10,9 +10,9 @@
 
 | 工具 | 作用 | 关键返回 |
 | --- | --- | --- |
-| `search_candidates(query, k)` | 搜索，返回有界候选网页（仅导航，非证据） | `candidate_id` / title / url / snippet |
-| `open_source(candidate_id)` | 抓取正文、固化快照、算哈希 | `source_ref` / `content_hash` / char_len |
-| `read_source(source_ref, max_chars)` | 读取已固化快照正文 | text / `content_hash` |
+| `search_candidates(query, k)` | 搜索，返回有界结果网页（仅导航，非证据） | `candidate_id` / title / url / snippet |
+| `open_source(candidate_id)` | 抓取正文、存档快照、算哈希 | `source_ref` / `content_hash` / char_len |
+| `read_source(source_ref, max_chars)` | 读取已存档快照正文 | text / `content_hash` |
 
 约束：`open_source` 只接受本会话 `search_candidates` 产生的 `candidate_id`；阻断内网/环回地址与非 HTTP(S)；快照落 `snapshots/`（已 gitignore）。网页内容视为不可信数据。
 

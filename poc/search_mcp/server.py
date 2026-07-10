@@ -2,7 +2,7 @@
 
 三工具映射架构 B 的 Source 契约：
     search_candidates(query, k) -> 有界候选集（仅导航，非证据）
-    open_source(candidate_id)   -> 抓取并固化网页快照，返回 source_ref + content_hash
+    open_source(candidate_id)   -> 抓取并存档网页快照，返回 source_ref + content_hash
     read_source(source_ref)     -> 读取快照正文
 
 设计要点：
@@ -12,7 +12,7 @@
 - 传输 stdio，既可挂 Claude Desktop / Cline 等客户端，也可被 run.py 进程内直接 import。
 
 逐字取证与审计回放由 run.py 环路（validation-poc.md §5）承担：cheap 模型只在
-固化快照内摘引文，程序校验 hash 匹配、引文逐字命中、Claim 有据。
+存档快照内摘引文，程序校验 hash 匹配、引文逐字命中、Claim 有据。
 """
 from __future__ import annotations
 
@@ -41,7 +41,7 @@ FETCH_TIMEOUT = 20.0
 CRAWL_TIMEOUT = 120.0          # crawl4ai 带 JS 渲染，抓取较慢
 UA = "research-poc/0 (+local validation)"
 
-# 固化后端：crawl4ai 服务（服务器端抓取+渲染+正文抽取）。唯一后端，遇爬不了的资源再调整。
+# 存档后端：crawl4ai 服务（服务器端抓取+渲染+正文抽取）。唯一后端，遇爬不了的资源再调整。
 CRAWL4AI_BASE = os.environ.get("CRAWL4AI_BASE_URL", "").rstrip("/")
 CRAWL4AI_TOKEN = os.environ.get("CRAWL4AI_TOKEN", "")
 
@@ -127,9 +127,9 @@ def search_candidates(query: str, k: int = 6) -> str:
 
 @mcp.tool()
 def open_source(candidate_id: str) -> str:
-    """打开候选网页，抓取正文并固化快照，返回稳定 source_ref。
+    """打开候选网页，抓取正文并存档快照，返回稳定 source_ref。
 
-    只接受 search_candidates 本次会话返回过的 candidate_id；固化后方可作为可引用来源。
+    只接受 search_candidates 本次会话返回过的 candidate_id；存档后方可作为可引用来源。
 
     Args:
         candidate_id: search_candidates 返回的候选 ID。
@@ -146,7 +146,7 @@ def open_source(candidate_id: str) -> str:
         return json.dumps({"error": f"URL 校验失败: {why}", "url": url}, ensure_ascii=False)
     if not CRAWL4AI_BASE or not CRAWL4AI_TOKEN:
         return json.dumps({"error": "未配置 CRAWL4AI_BASE_URL / CRAWL4AI_TOKEN"}, ensure_ascii=False)
-    # 固化经 crawl4ai：服务器端抓取+JS 渲染+正文抽取，直接取 markdown。
+    # 存档经 crawl4ai：服务器端抓取+JS 渲染+正文抽取，直接取 markdown。
     try:
         with httpx.Client(timeout=CRAWL_TIMEOUT) as c:
             resp = c.post(f"{CRAWL4AI_BASE}/crawl",
@@ -197,7 +197,7 @@ def open_source(candidate_id: str) -> str:
 
 @mcp.tool()
 def read_source(source_ref: str, max_chars: int = 12000) -> str:
-    """读取已固化快照的正文。用于在授权来源内取证。
+    """读取已存档快照的正文。用于在授权来源内取证。
 
     Args:
         source_ref: open_source 返回的 source_ref。

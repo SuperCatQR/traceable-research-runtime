@@ -19,6 +19,7 @@ import hashlib
 import ipaddress
 import json
 import socket
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import urlparse
@@ -83,22 +84,34 @@ def search_candidates(query: str, k: int = 6) -> str:
     if not query:
         return json.dumps({"error": "query 为空"}, ensure_ascii=False)
     out = []
-    try:
-        with DDGS() as ddgs:
-            for r in ddgs.text(query, max_results=k):
-                url = r.get("href") or r.get("url") or ""
-                if not url:
-                    continue
-                cid = hashlib.sha1(f"{query}|{url}".encode()).hexdigest()[:12]
-                _candidates[cid] = {"url": url, "title": r.get("title", ""), "snippet": r.get("body", "")}
-                out.append({
-                    "candidate_id": cid,
-                    "title": r.get("title", ""),
-                    "url": url,
-                    "snippet": r.get("body", ""),
-                })
-    except Exception as e:
-        return json.dumps({"error": f"搜索失败: {e}", "query": query}, ensure_ascii=False)
+    # 免费搜索后端对密集请求限流（429）；指数退避重试，末次失败才报错。
+    results = None
+    last_err = None
+    for attempt in range(4):
+        try:
+            with DDGS() as ddgs:
+                results = list(ddgs.text(query, max_results=k))
+            break
+        except Exception as e:
+            last_err = e
+            if "429" in str(e) or "ratelimit" in str(e).lower():
+                time.sleep(2 ** attempt + 1)   # 1,3,5,9s 递增退避
+                continue
+            break
+    if results is None:
+        return json.dumps({"error": f"搜索失败: {last_err}", "query": query}, ensure_ascii=False)
+    for r in results:
+        url = r.get("href") or r.get("url") or ""
+        if not url:
+            continue
+        cid = hashlib.sha1(f"{query}|{url}".encode()).hexdigest()[:12]
+        _candidates[cid] = {"url": url, "title": r.get("title", ""), "snippet": r.get("body", "")}
+        out.append({
+            "candidate_id": cid,
+            "title": r.get("title", ""),
+            "url": url,
+            "snippet": r.get("body", ""),
+        })
     return json.dumps({"query": query, "count": len(out), "candidates": out},
                       ensure_ascii=False, indent=2)
 

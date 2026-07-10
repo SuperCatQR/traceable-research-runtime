@@ -30,7 +30,7 @@
 
 ### 2.2 状态外置
 
-问题定义、任务队列、证据、结论和审计日志均保存在 Research Runtime。模型上下文只是本轮工作缓存。
+问题定义、任务、证据、结论和审计日志均外置持久化，但不由 Research Runtime 独占：Runtime 只保存运行控制状态；Evidence、Claim 等领域对象由其所属模块维护。模型上下文只是本轮工作缓存。
 
 ### 2.3 原文按需读取
 
@@ -49,24 +49,23 @@
 ```mermaid
 flowchart TB
     U[用户] --> UI[Web UI / Tauri 壳]
-    UI --> API[Conversation API]
+    UI --> API[API Service]
     API --> G{简单问题?}
-    G -->|是| S[强模型直接回答]
-    G -->|否| R[Research Runtime]
+    G -->|是| MS[Model / Worker Service]
+    G -->|否| R[Thin Research Runtime]
 
-    R <--> M[Model Gateway]
-    M --> SM[强模型调用]
-    M --> CM[廉价模型调用]
+    R <-->|任务命令 / 完成事件| MS
+    MS --> SM[强模型]
+    MS --> CM[廉价模型]
 
-    R <--> I[Human Index]
-    R <--> D[Versioned Document Store]
-    R --> A[Trace / Audit Log]
+    R <--> I[Human Index 模块]
+    R <--> E[Evidence / Claim 模块]
+    E <--> D[Versioned Document Store]
+    R --> A[Trace / Audit]
 
-    SM --> R
-    CM --> R
-    S --> UI
-    R --> F[带引用的最终答案]
-    F --> UI
+    MS --> API
+    R --> API
+    API --> UI
 ```
 
 系统先作二级分流：
@@ -92,7 +91,7 @@ flowchart TB
 
 桌面端使用 Tauri 或等价 WebView 壳。移动端待 Web 产品成立后再封装。
 
-### 4.2 Conversation API
+### 4.2 API Service
 
 负责：
 
@@ -102,16 +101,15 @@ flowchart TB
 - Research Run 创建；
 - 流式事件和答案输出。
 
-### 4.3 Research Runtime
+### 4.3 Thin Research Runtime
 
-系统核心。它不作语义推理，只可靠保存、调度研究状态：
+薄控制面，不作语义推理，也不承载模型供应商、原文或领域账本。仅负责：
 
 ```text
-Question Spec   原问题、适用范围、研究目标
-Work Queue      待办、执行中、完成或失败的局部任务
-Evidence Store  版本锁定的证据卡
-Claim Ledger    结论、条件、例外及其证据关系
-Trace Log       所有外显研究动作和调用记录
+Research Run    创建、状态与版本
+Task State      依赖、派发、等待与完成
+Control         恢复、取消、截止时间、预算与轮次
+Transition      根据结构化结果执行确定性状态转移
 ```
 
 建议最小状态：
@@ -119,13 +117,17 @@ Trace Log       所有外显研究动作和调用记录
 ```json
 {
   "run_id": "R1",
-  "question_spec": {},
-  "work_queue": [],
-  "evidence_store": [],
-  "claim_ledger": [],
-  "status": "researching"
+  "status": "reviewing",
+  "revision": 8,
+  "pending_task_ids": ["T12", "T13"],
+  "active_plan_ref": "plan:P4",
+  "supplement_round": 1,
+  "budget_used": 3.72,
+  "deadline": "2026-07-10T13:00:00Z"
 }
 ```
+
+Evidence、Claim、模型输出和原文均以稳定 ID 或 `ref` 引用，不复制进 Runtime 状态。Runtime 不向其他服务暴露内部框架类型。
 
 ### 4.4 Human Index
 
@@ -168,18 +170,18 @@ ingested_at
 
 地址必须稳定；历史回答须能按当时版本重放。
 
-### 4.6 Model Gateway
+### 4.6 Model / Worker Service
 
-统一封装模型供应商、能力档位、token 预算、超时、重试、并发和调用日志。
+独立服务器，统一管理供应商适配、能力路由、模型版本、并发、限流、传输重试、故障转移、结构校验、流式适配和用量记录。Research Runtime 仅按能力发出任务，不依赖具体模型 SDK。
 
 仅保留两种逻辑角色：
 
 | 角色 | 职责 |
 |---|---|
-| 强模型 | 复杂度判断、研究规划、任务创建、证据审阅、Claim 形成、最终回答 |
+| 强模型 | 复杂度判断、研究规划、证据审阅、Claim 形成、最终回答 |
 | 廉价模型 | 单个局部任务中的索引导航、局部阅读、证据提取 |
 
-不设常驻路由 Agent；路由能力并入强模型，调度交给程序。
+不设常驻路由 Agent；模型选择由 Model Service 的确定性能力路由完成。传输失败由 Model Service 重试；证据不足、改用更强能力或追加研究由 Runtime 决策。稳定 `request_id` 保证同一模型任务幂等。
 
 ## 5. 复杂问题工作流
 
@@ -360,41 +362,53 @@ Trace 保存外显研究链，而非模型隐藏思维链：
 
 无效工具调用由程序校验、去重并使用确定性 fallback；超预算时基于现有证据回答或明确说明证据不足。
 
-## 11. 部署与数据层
+## 11. 部署、通信与数据层
 
-首版采用模块化单体：
+首版采用克制的微服务，仅按变化、扩缩容与故障边界拆分：
 
 ```text
-Backend
+API Service
 ├─ Auth
 ├─ Conversation
-├─ Research Runtime
-├─ Human Index
-├─ Documents
-├─ Model Gateway
-└─ Audit
+└─ SSE / WebSocket
+
+Thin Research Runtime
+├─ Run / Task 状态机
+├─ Budget / Deadline
+├─ Dispatch / Resume / Cancel
+├─ Human Index 模块
+├─ Evidence / Claim 模块
+└─ Audit 模块
+
+Model / Worker Service
+├─ Provider Adapters
+├─ Capability Routing
+├─ Rate Limit / Retry / Failover
+├─ Usage Accounting
+└─ 强模型与廉价模型 Worker
 ```
 
-数据层暂定：
+Evidence、Claim 与 Retrieval 首期为边界清晰的模块，不因名称不同便拆成独立服务；仅在独立扩容、权限隔离、故障隔离或团队所有权出现后拆分。
+
+短操作可同步调用；模型推理、检索等长操作使用异步任务和完成事件。消息只传 `event_id`、`run_id`、`task_id`、状态及 `result_ref`，正文进入 PostgreSQL 或对象存储。消费者按 `event_id` 幂等，Run 更新以 `revision` 防止并发覆盖。
+
+可共用一个 PostgreSQL 实例以降低运维成本，但表所有权唯一：API 写用户与会话，Runtime 写 Run、Task、Evidence、Claim、Index 与 Trace，Model Service 写 Model Execution 与 Usage；服务不得跨边界直接修改他方表。
 
 ```text
 PostgreSQL
-├─ 用户与会话
-├─ Research Run
-├─ Work Queue
-├─ Evidence
-├─ Claim
-├─ Index
-└─ Trace
+├─ API: 用户与会话
+├─ Runtime: Run / Task / Evidence / Claim / Index / Trace
+└─ Model Service: Model Execution / Usage
 
 Object Storage
 ├─ PDF
 ├─ 网页快照
 ├─ 结构化原文
+├─ 大型模型结果
 └─ 历史版本
 ```
 
-全文检索可先使用 PostgreSQL 原生能力。向量检索仅作补召回旁路。
+若 Model Service 已有可靠队列、幂等、重试、状态查询与完成通知，Runtime 不再引入第二套编排系统。否则优先考虑 DBOS；仅严格分布式 SLA 采用 Temporal，确有复杂动态图需求才在 Runtime 内部采用 LangGraph。全文检索可先使用 PostgreSQL 原生能力，向量检索仅作补召回旁路。
 
 ## 12. MVP 边界
 
@@ -405,8 +419,8 @@ Object Storage
 - 一种廉价模型档位；
 - 人工三级索引；
 - 版本化文档库；
-- Research Runtime；
-- Evidence Store 与 Claim Ledger；
+- API Service、Thin Research Runtime、Model / Worker Service；
+- Runtime 内部的 Evidence、Claim、Index 与 Audit 模块；
 - 带引用答案和原文查看；
 - 完整 Trace。
 
@@ -414,7 +428,7 @@ Object Storage
 
 - 默认知识图谱；
 - 开放代码执行；
-- 微服务；
+- Evidence、Claim、Retrieval 等细粒度独立服务；
 - 常驻多 Agent；
 - 独立路由或验证 Agent；
 - 无限递归研究；
@@ -455,4 +469,4 @@ Object Storage
 
 ---
 
-`ponytail:` 本文只定义 MVP 逻辑边界，不锁定编程语言、模型供应商或物理部署拓扑；待领域评测与流量数据出现后再定。
+`ponytail:` 本文锁定三个首期服务边界，不锁定编程语言、模型供应商、容器编排或服务实例数量；待领域评测与流量数据出现后再细拆。

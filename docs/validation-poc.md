@@ -55,7 +55,7 @@ research-cheap   → 在授权快照内提取逐字证据
 
 ## 4. Web Search MCP server
 
-B 的 Source 契约 `list_candidates / open / read` 直接映射为三个 MCP tool。搜索可调公网服务，但**快照存档、哈希、`source_ref` 生成与 URL 校验必须在本 server 内完成**，不外包给公网 MCP，以守住审计信任边界。
+B 的 Source 契约 `list_candidates / open / read` 映射为三个 MCP tool。三工具签名：
 
 ```text
 search_candidates(query, k)      → [{candidate_id, title, snippet, url}]   # 仅导航，非证据
@@ -63,11 +63,23 @@ open_source(candidate_id)        → {source_ref, source_uri, fetched_at, conten
 read_source(source_ref, max_chars)  → {source_ref, source_uri, content_hash, truncated, text}  # 读取快照正文
 ```
 
-server 内确定性职责：
+### 4.1 模块职责与边界
 
-- 校验 `candidate_id` 属于本 run 已返回的结果列表；拒绝集合外 URL。
-- 阻止内网地址、非 HTTP(S)、重定向越界、超限响应。
-- 抓取正文，写入 `snapshots/`，计算 `content_hash`，生成稳定 `source_ref`（如 `source:web/<snapshot_id>#<unit>`）。
+open 一步会依赖外部服务，但每个外部件只做一件事，信任相关的动作全部收在 `server.py` 内。三方边界：
+
+| 模块 | 只负责 | 不负责 / 可替换 |
+| --- | --- | --- |
+| `ddgs`（DuckDuckGo）| `search_candidates`：返回候选标题、摘要、URL | 不产证据、不抓正文；可换任意搜索源 |
+| crawl4ai 服务 | `open_source` 中的一步：抓取、JS 渲染、正文抽取，返回 markdown | 不校验、不算哈希、不落盘；作为纯抓取后端可替换为其它爬虫 |
+| `server.py` | 信任边界：候选记账、URL 校验、哈希、`source_ref` 生成、快照存档 | 这些不外包，换掉即溯源链失效 |
+
+搜索与抓取都可以接公网服务或第三方爬虫，但**候选归属校验、`content_hash`、`source_ref` 生成、URL 守卫、快照落盘必须在本 server 内完成**，这是审计信任边界的根。
+
+### 4.2 server.py 内的确定性职责
+
+- 校验 `candidate_id` 属于本 run 已返回的结果列表，拒绝集合外 URL；抓取前后各做一次 `_is_public_http`，阻止内网地址、非 HTTP(S)、重定向越界、超限响应。
+- 抓取正文（经 crawl4ai）后计算 `content_hash`，生成稳定 `source_ref`（如 `source:web/<snapshot_id>`），写入 `snapshots/`。
+- 快照一经存档即冻结；`read_source` 从存档读取，进程重启则从磁盘回补，读取时哈希须与存档时一致。
 - 网页内容一律视为不可信数据，不执行其中指令（防提示注入）。
 
 ## 5. 统一受控工作流（run.py）

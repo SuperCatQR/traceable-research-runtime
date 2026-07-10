@@ -93,13 +93,14 @@ def search_candidates(query: str, k: int = 6) -> str:
     if not query:
         return json.dumps({"error": "query 为空"}, ensure_ascii=False)
     out = []
-    # 免费搜索后端对密集请求限流（429）；指数退避重试，末次失败才报错。
+    # 搜索后端固定 bing（ddgs 库内置，对国内网络较友好，无需 API key）。
+    # 免费后端对密集请求限流；指数退避重试，末次失败才报错。
     results = None
     last_err = None
     for attempt in range(4):
         try:
             with DDGS() as ddgs:
-                results = list(ddgs.text(query, max_results=k))
+                results = list(ddgs.text(query, backend="bing", max_results=k))
             break
         except Exception as e:
             last_err = e

@@ -87,43 +87,43 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 
 ```mermaid
 architecture-beta
-    group APP[应用层]
-    group TOOL[工具层 server.py]
-    group IFACE[接口层]
-    group STORE[存储层]
-    group EXT[外部服务]
+    group APP(server)[App Layer]
+    group TOOL(server)[Tool Layer]
+    group IFACE(server)[Interface Layer]
+    group STORE(database)[Storage Layer]
+    group EXT(cloud)[External]
 
-    service R(server)[run.py] in APP
+    service R(server)[run py] in APP
 
-    service SC(internet)[search_candidates] in TOOL
-    service OS(server)[open_source SSRF守卫] in TOOL
+    service SC(internet)[search candidates] in TOOL
+    service OS(server)[open source SSRF Guard] in TOOL
 
-    service STP(server)[store.py] in IFACE
-    service SNP(server)[snapshot.py] in IFACE
+    service STP(server)[store py] in IFACE
+    service SNP(server)[snapshot py] in IFACE
 
-    service SNAPDB(database)[snapshot.sqlite] in STORE
-    service AUDITDB(database)[store.sqlite] in STORE
-    service TR(disk)[trace/] in STORE
+    service SNAPDB(database)[snapshot sqlite] in STORE
+    service AUDITDB(database)[store sqlite] in STORE
+    service TR(disk)[trace dir] in STORE
 
-    service SE(internet)[Bing ddgs] in EXT
+    service SE(internet)[Bing Search] in EXT
     service CR(server)[crawl4ai] in EXT
-    service SM(cloud)[strong 模型] in EXT
-    service CM(cloud)[cheap 模型] in EXT
+    service SM(cloud)[Strong Model] in EXT
+    service CM(cloud)[Cheap Model] in EXT
 
-    R:R --> SC:L
-    R:R --> OS:L
-    R:B --> STP:T
-    R:B --> SNP:T
-    R:T --> SM:B
-    R:T --> CM:B
+    R:R --> L:SC
+    R:R --> L:OS
+    R:B --> T:STP
+    R:B --> T:SNP
+    R:T --> B:SM
+    R:T --> B:CM
 
-    SC:R --> SE:L
-    OS:R --> CR:L
-    OS:B --> SNP:T
+    SC:R --> L:SE
+    OS:R --> L:CR
+    OS:B --> T:SNP
 
-    STP:B --> AUDITDB:T
-    STP:B --> TR:T
-    SNP:B --> SNAPDB:T
+    STP:B --> T:AUDITDB
+    STP:B --> T:TR
+    SNP:B --> T:SNAPDB
 ```
 
 ### 4.2 数据流

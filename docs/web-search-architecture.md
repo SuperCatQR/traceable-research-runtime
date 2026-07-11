@@ -81,9 +81,59 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 
 按 `source_ref` 从快照记录里读回正文，供廉价模型取证。读的是存档，不是原页。
 
-## 4. 受控工作流（`poc/run.py`）
+## 4. 系统架构总览
 
-一次问答是一个 `run`，走固定的单趟线性环路 `run_once(question, strong_cfg)`。当前为单趟（未迭代），迭代循环见 §8。
+```mermaid
+graph LR
+    U([用户])
+
+    subgraph 本地进程
+        R[run.py 环路]
+        subgraph server.py 工具函数
+            SC[search_candidates]
+            OS["open_source\n（含 SSRF 守卫）"]
+            RD[read_source]
+        end
+    end
+
+    subgraph 外部服务
+        SE["Bing\n（ddgs）"]
+        CR["crawl4ai\n（独立部署）"]
+        S["strong 模型\nDeepSeek v4"]
+        C["cheap 模型\nDeepSeek v4 flash"]
+    end
+
+    subgraph 持久化
+        SNAP[("snapshots/\n快照存档")]
+        DB[("store.sqlite\n审计 DB")]
+        TR[("trace/\n审计流水")]
+    end
+
+    U -->|问题| R
+    R -->|生成搜索词 / Claim + 答案| S
+    R -->|逐字取证| C
+    R --> SC
+    SC -->|backend=bing| SE
+    R --> OS
+    OS -->|守卫通过后抓取| CR
+    OS -->|写快照| SNAP
+    R --> RD
+    RD -->|读快照| SNAP
+    R -->|写运行状态 / Evidence / Claim| DB
+    R -->|写逐步流水| TR
+    R -->|带引用答案| U
+```
+
+组件边界说明：
+
+- **本地进程**：`run.py` 是唯一的控制流持有者，`server.py` 三函数进程内直调（非 MCP 服务）。
+- **外部服务**：Bing 只产导航候选、不产证据；crawl4ai 是唯一抓取后端，独立部署；两个模型经 OpenAI 兼容接口调用。
+- **持久化**：`snapshots/` 是不可变快照，取证唯一依据；`store.sqlite` + `trace/` 是双审计层，职责分离。
+- **SSRF 守卫**嵌在 `open_source` 内，抓取前校验 URL、抓取后对重定向落点复检，信任边界不可外包。
+
+## 5. 受控工作流（`poc/run.py`）
+
+一次问答是一个 `run`，走固定的单趟线性环路 `run_once(question, strong_cfg)`。当前为单趟（未迭代），迭代循环见 §9。
 
 ```mermaid
 sequenceDiagram
@@ -133,7 +183,7 @@ sequenceDiagram
 
 三处据实拒答（不臆测）：搜索无候选、所有候选都存档失败、无任何逐字命中的证据。任一发生就明确说明无法作答，而不是编。
 
-## 5. 四道程序校验
+## 6. 四道程序校验
 
 质量不靠模型自觉，靠程序在关键节点卡死。全部在 `run.py` 里执行：
 
@@ -144,7 +194,7 @@ sequenceDiagram
 
 四道全过的事实句才进最终答案；证据不足宁可拒答。
 
-## 6. 模型分工
+## 7. 模型分工
 
 两档模型，各司其职（DeepSeek v4，经 OpenAI 兼容接口调用）：
 
@@ -153,7 +203,7 @@ sequenceDiagram
 
 模型全程无状态，每次调用的输入都由持久对象重建；模型只产结构化候选，不碰控制流。
 
-## 7. 存储与审计
+## 8. 存储与审计
 
 两层持久化，职责分开：
 
@@ -164,18 +214,18 @@ sequenceDiagram
 
 Evidence、Claim、原文都以 `source_ref` / `content_hash` 引用，不把正文复制进运行态。
 
-## 8. 迭代循环（规划中，未落地）
+## 9. 迭代循环（规划中，未落地）
 
 结构化索引库靠"树的深度"深入，一层查不够就往下钻。网页没有可下降的层级，对应手段是**迭代查询**：用上一轮已验证的证据，反馈生成下一轮更精准的搜索词，固定轮数上限收敛（初步定 3 轮）。当前 PoC 是单趟线性、尚未实现迭代，这是 Web Search 相对索引库最需要专门解决的点，留待后续设计与验证。
 
-## 9. 安全边界
+## 10. 安全边界
 
 - **SSRF 守卫**：抓取前校验 URL，抓取后对重定向落点复检，拦内网/环回/非 http(s)/越界跳转。
 - **内容不可信**：网页正文一律当数据，不执行其中的任何指令（防提示注入）。
 - **有界资源**：搜索词 ≤3、每词候选 ≤5、全 run 抓取 ≤4、单页正文 ≤4MB，压住成本与被滥用面。
 - **凭据隔离**：crawl4ai 地址与 token 走环境变量（`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN`），不入库、不入仓。
 
-## 10. 边界与局限
+## 11. 边界与局限
 
 - crawl4ai 是唯一抓取后端，登录墙/付费墙类资源仍可能爬不动，按弃取处理，遇到再逐步调整。
 - 搜索后端 Bing 免费额度有限流，靠退避缓解，非彻底消除。
@@ -184,4 +234,4 @@ Evidence、Claim、原文都以 `source_ref` / `content_hash` 引用，不把正
 
 ***
 
-`ponytail:` 本文只描述网页这一层的取证链，贴合当前单趟 PoC；迭代循环（§8）与非 crawl4ai 抓取后端属未落地设计，落地时补。与结构化索引库（`architecture.md`）各自独立，不共用抽象。
+`ponytail:` 本文只描述网页这一层的取证链，贴合当前单趟 PoC；迭代循环（§9）与非 crawl4ai 抓取后端属未落地设计，落地时补。与结构化索引库（`architecture.md`）各自独立，不共用抽象。

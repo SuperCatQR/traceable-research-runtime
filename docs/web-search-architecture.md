@@ -88,41 +88,41 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 ```mermaid
 architecture-beta
     group APP(server)[App Layer]
-    group TOOL(server)[Tool Layer]
+    group SVCS(server)[Tool Layer]
     group IFACE(server)[Interface Layer]
     group STORE(database)[Storage Layer]
     group EXT(cloud)[External]
 
-    service RUN(server)[run py] in APP
+    service PROC(server)[run py] in APP
 
-    service SC(internet)[search candidates] in TOOL
-    service OS(server)[open source SSRF Guard] in TOOL
+    service SC(internet)[search candidates] in SVCS
+    service OS(server)[open source SSRF Guard] in SVCS
 
     service STP(server)[store py] in IFACE
     service SNP(server)[snapshot py] in IFACE
 
     service SNAPDB(database)[snapshot sqlite] in STORE
     service AUDITDB(database)[store sqlite] in STORE
-    service TRDIR(disk)[trace dir] in STORE
+    service FSLOG(database)[trace dir] in STORE
 
     service SE(internet)[Bing Search] in EXT
     service CR(server)[crawl4ai] in EXT
     service SMOL(cloud)[Strong Model] in EXT
     service CMOL(cloud)[Cheap Model] in EXT
 
-    RUN:R --> L:SC
-    RUN:R --> L:OS
-    RUN:B --> T:STP
-    RUN:B --> T:SNP
-    RUN:T --> B:SMOL
-    RUN:T --> B:CMOL
+    PROC:R --> L:SC
+    PROC:R --> L:OS
+    PROC:B --> T:STP
+    PROC:B --> T:SNP
+    PROC:T --> B:SMOL
+    PROC:T --> B:CMOL
 
     SC:R --> L:SE
     OS:R --> L:CR
     OS:B --> T:SNP
 
     STP:B --> T:AUDITDB
-    STP:B --> T:TRDIR
+    STP:B --> T:FSLOG
     SNP:B --> T:SNAPDB
 ```
 

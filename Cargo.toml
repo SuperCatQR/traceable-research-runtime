@@ -7,12 +7,14 @@ edition = "2024"
 # MCP surface (P5) — server over stdio
 rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
 # async runtime
-tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "io-std"] }
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "io-std", "net"] }
 # HTTP client: Bing scrape + crawl4ai (P3); native-tls = SChannel on Windows, no extra C toolchain
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
 # (de)serialization: domain types (P1), audit JSONL (P2), model I/O (P4)
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"
+# Bing RSS parsing; stdlib has no XML parser
+quick-xml = { version = "0.38.4", features = ["serialize"] }
 # dual persistence: snapshot.sqlite (P2); bundled = compile SQLite, no system dep
 rusqlite = { version = "0.40.1", features = ["bundled"] }
 # content addressing (P1 ID rules): sha1(query|url), sha256(text), sha1(final_url|hash)

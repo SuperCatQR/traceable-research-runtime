@@ -1,0 +1,17 @@
+FROM docker.io/unclecode/crawl4ai@sha256:c9e1b1217fdd04a013864482861db57fbf20d922fa55e3db3eb420ab0411a9af
+
+USER root
+RUN apt-get update -qq \
+ && apt-get install -y -qq --no-install-recommends iptables \
+ && rm -rf /var/lib/apt/lists/* \
+ && mkdir -p /opt/ms-playwright \
+ && cp -a /root/.cache/ms-playwright/. /opt/ms-playwright/ \
+ && chmod -R a+rX /opt/ms-playwright
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
+# ponytail: Upstream has no proxy-port setting; fail the build if its constructor changes.
+RUN python -c 'from pathlib import Path; p=Path("/app/server.py"); s=p.read_text(); old="app.state.egress_proxy = PinningProxy()"; assert s.count(old) == 1; p.write_text(s.replace(old, "app.state.egress_proxy = PinningProxy(port=39001)"))'
+COPY egress-entrypoint.sh /usr/local/bin/crawl4ai-egress
+RUN chmod 0755 /usr/local/bin/crawl4ai-egress
+
+ENTRYPOINT ["/usr/local/bin/crawl4ai-egress"]
+CMD ["bash", "/app/entrypoint.sh"]

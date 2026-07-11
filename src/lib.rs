@@ -9,6 +9,7 @@
 //! The crate is split lib + bin so the three pure functions (`plan_queries`,
 //! `select_sources`, `synthesize_answer`) stay fixture-testable without a runtime.
 
+pub mod adapters;
 pub mod error;
 pub mod snapshot;
 pub mod trace;
@@ -16,6 +17,7 @@ pub mod types;
 
 // Flat public surface: downstream phases import from the crate root, not deep
 // module paths.
+pub use adapters::{BingClient, CrawlClient, StrongClient, validate_public_url};
 pub use error::{ErrorClass, Result, SearchError};
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{

@@ -46,6 +46,10 @@ pub enum SearchError {
     #[error("SSRF guard blocked {url}: {reason}")]
     Ssrf { url: String, reason: String },
 
+    /// The strong model endpoint could not be reached or rejected the request.
+    #[error("model call failed: {message}")]
+    ModelCall { message: String },
+
     /// The strong model returned output that failed JSON/schema validation —
     /// a malformed query batch (§6 validation 1), selection, or answer.
     #[error("model output rejected: {message}")]
@@ -102,6 +106,7 @@ impl SearchError {
             Self::Search { .. }
             | Self::Fetch { .. }
             | Self::Ssrf { .. }
+            | Self::ModelCall { .. }
             | Self::ModelOutput { .. }
             | Self::RefNotInRun { .. }
             | Self::NoUsableSource => ErrorClass::External,

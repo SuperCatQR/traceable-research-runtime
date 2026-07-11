@@ -86,57 +86,49 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 ### 4.1 组件架构
 
 ```mermaid
-flowchart TB
-    U([用户])
+architecture-beta
+    group APP[应用层]
+    group TOOL[工具层 server.py]
+    group IFACE[接口层]
+    group STORE[存储层]
+    group EXT[外部服务]
 
-    subgraph APP["应用层"]
-        R["run.py<br/>主编排器"]
-    end
+    service R(server)[run.py] in APP
 
-    subgraph TOOL["工具层 — server.py"]
-        SC["search_candidates<br/>候选搜索"]
-        OS["open_source<br/>SSRF 守卫 + 抓取"]
-    end
+    service SC(internet)[search_candidates] in TOOL
+    service OS(server)[open_source SSRF守卫] in TOOL
 
-    subgraph IFACE["接口层"]
-        STP["store.py<br/>log_run / log_evidence<br/>log_claim / log_answer"]
-        SNP["snapshot.py<br/>make_writer() → writer<br/>make_reader() → reader"]
-    end
+    service STP(server)[store.py] in IFACE
+    service SNP(server)[snapshot.py] in IFACE
 
-    subgraph STORE["存储层"]
-        SNAPDB[("snapshot.sqlite<br/>不可变快照")]
-        AUDITDB[("store.sqlite<br/>审计 DB")]
-        TR[("trace/*.jsonl<br/>逐步流水")]
-    end
+    service SNAPDB(database)[snapshot.sqlite] in STORE
+    service AUDITDB(database)[store.sqlite] in STORE
+    service TR(disk)[trace/] in STORE
 
-    subgraph EXT["外部服务"]
-        SE["Bing / ddgs"]
-        CR["crawl4ai<br/>独立部署"]
-        SM["strong 模型"]
-        CM["cheap 模型"]
-    end
+    service SE(internet)[Bing ddgs] in EXT
+    service CR(server)[crawl4ai] in EXT
+    service SM(cloud)[strong 模型] in EXT
+    service CM(cloud)[cheap 模型] in EXT
 
-    U -- "问题 / 答案" --- R
+    R:R --> SC:L
+    R:R --> OS:L
+    R:B --> STP:T
+    R:B --> SNP:T
+    R:T --> SM:B
+    R:T --> CM:B
 
-    R -- "调用" --> SC
-    R -- "调用" --> OS
-    R -- "write-only" --> STP
-    R -- "reader 注入" --> SNP
-    R -- "生成词 / Claim / 答案" --> SM
-    R -- "逐字取证" --> CM
+    SC:R --> SE:L
+    OS:R --> CR:L
+    OS:B --> SNP:T
 
-    SC -- "搜索" --> SE
-    OS -- "抓取" --> CR
-    OS -- "writer 注入" --> SNP
-
-    STP -- "参数化写" --> AUDITDB
-    STP -- "追加" --> TR
-    SNP -- "upsert / query" --> SNAPDB
+    STP:B --> AUDITDB:T
+    STP:B --> TR:T
+    SNP:B --> SNAPDB:T
 ```
 
 ### 4.2 数据流
 
-
+```mermaid
 flowchart LR
     U([用户])
 

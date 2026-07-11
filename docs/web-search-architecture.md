@@ -54,16 +54,24 @@
 
 ### 3.2 抓取：crawl4ai
 
-搜索所得候选去重后全部进入 `archive_page`，不经过模型挑选：
+crawl4ai 是唯一抓取后端，但不是可信边界。职责边界一句话：crawl4ai 只把 DOM 变成结构化数据，`archive_page` 负责准入、判真伪、认边界和存档。
+
+**crawl4ai 能做（DOM 可达即可取）**：JS 渲染（Playwright，Chromium/Firefox/WebKit）、无限滚动 `scan_full_page`、懒加载、iframe 内容、clean/fit markdown 去噪，以及 `status_code`、`final_url`、`metadata`、links、media 等结构化字段。
+
+**crawl4ai 边界外（重试无益，只能记失败）**：正文不在 DOM（如正文在 OSS 的 `.docx/.ofd`，仅拿到 SPA 壳）、交互式登录墙、付费墙、CAPTCHA、强反爬（如 Cloudflare challenge）、被网络层封锁。且 `success=true` 不等于正文语义正确。
+
+**默认不主动对抗反爬**：crawl4ai 虽有 session/proxy/stealth 可硬闯登录与反爬，但这类内容本就在边界外，硬闯与“据实拒答、不伪装成功”的立场冲突。默认只开 JS 渲染和 `scan_full_page`（设滚动次数上限防卡死），保留 `raw_markdown` 与 `fit_markdown` 两份；不启用 stealth、代理或认证 profile 去绕过登录与反爬。
+
+抓取流程如下。搜索所得候选去重后全部进入 `archive_page`，不经过模型挑选：
 
 1. 由 `search_result_id` 取 URL；未知 id 拒绝。
 2. 抓取前 `_is_public_http` 校验 scheme、DNS 与所有解析地址，拦截内网、环回、link-local、保留和组播地址。
-3. `POST {CRAWL4AI_BASE}/crawl`，由 crawl4ai 完成请求、JS 渲染和正文抽取。
-4. 校验 `results[0].success`、正文非空及最低质量信号；失败记录 `archive_skip`，继续下一条。
+3. `archive_page` 装配抓取 config（默认 JS 渲染 + `scan_full_page` 上限，不对抗反爬），`POST {CRAWL4AI_BASE}/crawl`，由 crawl4ai 完成请求、JS 渲染和正文抽取。
+4. 校验 `results[0].success`、正文非空及最低质量信号；命中登录/付费/反爬/正文不在 DOM 等边界情形或校验不过，记 `archive_skip` 并继续下一条，不重试、不伪装成功。
 5. 对最终 URL 再执行 `_is_public_http`，防止重定向越界。
 6. 接收 crawl4ai 的结构化字段，而非只取一段 markdown：至少保留 `status_code`、`final_url`、页面 `metadata`、`raw_markdown` / `fit_markdown` 长度及实际采用的正文类型。
 
-crawl4ai 是唯一抓取后端，但不是可信边界。其失败不终止整轮；其返回必须由本地程序校验后才能存档。
+其失败不终止整轮；其返回必须由本地程序校验后才能存档。
 
 ### 3.3 存档：锁版本
 
@@ -285,9 +293,9 @@ sequenceDiagram
 
 ### 5.1 每轮探索
 
-1. **生成查询**（strong）：第 1 轮输入用户问题；第 2 轮起输入用户问题和目前已归档的全部原文。输出恰好 3 个查询词；应寻找新事实面，避免重复旧词。
+1. **生成查询**（strong）：第 1 轮输入用户问题；第 2 轮起输入用户问题和目前已归档的全部原文。用户问题是每轮不变的锚，单独存储于 trace run header（见 §8），每轮重放注入，是 strong 对照原文识别新主体、防止偏航的依据（识别项见步 4）。输出恰好 3 个查询词；应寻找新事实面，避免重复旧词。
 2. **搜索第一页**：每词取 Bing 前 10 条，记录排名，跨词、跨轮按规范化 URL 去重。
-3. **全量抓取**：所有新候选均尝试 `archive_page`；无模型候选选择。失败即记录并跳过。
+3. **全量抓取**：所有新候选均尝试 `archive_page`（无模型候选选择）。`archive_page` 装配默认 config（JS 渲染 + `scan_full_page` 上限，不对抗反爬）交 crawl4ai 抓取，再由本地校验成败与质量；命中登录/付费/反爬/正文不在 DOM 等边界或校验不过，记 `archive_skip` 并跳过，不重试、不伪装成功。
 4. **反馈深化**：下一轮 strong 从已读原文中识别新主体、术语、时间线、冲突点和证据缺口，据此生成新词。
 5. **固定收敛**：默认完整执行 3 轮；若达到 800k 输入预算、300 份快照或没有任何新 URL，程序提前结束探索并进入汇总。
 
@@ -354,7 +362,7 @@ N 轮结束后，为每份快照构造：
 ## 8. 存储与审计
 
 - **快照 DB** `snapshot.sqlite`：经 `snapshot.py` 写入标题、URL、原文、哈希、抓取凭证和时间。正文不可变；`retrieval_server.py` 只持 writer，`research_session.py` 只持 reader，`run.py` 均不持有。
-- **审计日志** `trace/<run_id>.jsonl`：单一 append-only 文件，每 run 一份，逐行记录 run、round、query、search_result、archive/archive_skip、excerpt、snapshot_selection、claim、answer 及预算变化，供回放与问题定位。`research_session.py` 直接追加写入，`run.py` 不写。
+- **审计日志** `trace/<run_id>.jsonl`：单一 append-only 文件，每 run 一份。首行为 `run header`，记 `run_id`、**原始用户问题**、启动时间与配置；原始用户问题在此单独、不可变地存储，是每轮重放注入 strong、识别新主体的锚，与 strong 生成的 `query` 行语义分离。其后逐行记录 round、query、search_result、archive/archive_skip、excerpt、snapshot_selection、claim、answer 及预算变化，供回放与问题定位。`research_session.py` 启动即写首行并追加后续，`run.py` 不写。
 
 `snapshot.py` 内部使用参数化 SQL、字段校验和事务，上层不直接执行 SQL；审计日志是纯 append-only 结构化 JSON，无独立数据库。密钥与正文不写审计日志，正文只以 `snapshot_ref/content_hash` 引用。
 

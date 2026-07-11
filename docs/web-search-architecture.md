@@ -34,7 +34,7 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 | --- | --- | --- | --- |
 | 搜索 | `search_candidates(query, k=6)` | 拿有界候选，仅供导航 | `[{candidate_id, title, url, snippet}]` |
 | 抓取+存档 | `open_source(candidate_id)` | 经 crawl4ai 抓正文（§3.2），再锁版本存快照（§3.3） | `{source_ref, source_uri, title, content_hash, char_len, fetched_at}` |
-| 读取 | `read_source(source_ref)` | 读回已存档的快照正文 | `{source_ref, source_uri, content_hash, truncated, text}` |
+| 读取 | `reader.get(source_ref)` | 由 `snapshot.make_reader()` 注入 `run.py`，读回已存档的快照正文 | `{source_ref, source_uri, content_hash, truncated, text}` |
 
 关键约束：`open_source` 只接受本次会话里 `search_candidates` 产生过的 `candidate_id`，拒绝任何集合外的 URL。模型不能凭空造 URL 让系统去抓。
 
@@ -77,9 +77,9 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 
 规划中的改进：把存档从"只留一段正文"扩成**抓取凭证**，记录 crawl4ai 的关键结构化输出（`status_code`、`final_url`、`metadata`、各 markdown 变体的长度对照）。有了长度对照，"抽取抽歪了"这类最常见错误就能一眼看出，且不必存原始 HTML——渲染态 HTML 只是某一时刻某一滚动位置的快照，要说清它是哪个状态还得引入页面状态判断，代价大而审计价值薄，不做。正文来源可从 `raw_markdown` 换成 `fit_markdown` 以提升正文质量，同时记下两者长度做对照。此项属未落地设计，落地时同步更新 §3.3。
 
-### 3.5 读取：`read_source`
+### 3.5 读取：`snapshot.reader.get()`
 
-按 `source_ref` 从快照记录里读回正文，供廉价模型取证。读的是存档，不是原页。
+`read_source` 函数已废弃（选 A）。`run.py` 启动时从 `snapshot.make_reader()` 获取 `reader` 能力对象，直接调 `reader.get(source_ref)` 按 `source_ref` 从 `snapshot.sqlite` 读回正文，供廉价模型取证。读的是存档，不是原页。`reader` 对象无 `.save()` 方法，无法写入。
 
 ## 4. 系统架构总览
 
@@ -92,10 +92,11 @@ graph LR
         subgraph server.py 工具函数
             SC[search_candidates]
             OS["open_source\n（含 SSRF 守卫）"]
-            RD[read_source]
         end
         ST["store.py\n接口层"]
         SN["snapshot.py\n接口层"]
+        SNW["snapshot.writer\n(make_writer → 注入 open_source)"]
+        SNR["snapshot.reader\n(make_reader → 注入 run.py)"]
     end
 
     subgraph 外部服务
@@ -118,11 +119,11 @@ graph LR
     SC -->|backend=bing| SE
     R --> OS
     OS -->|守卫通过后抓取| CR
-    OS -->|写快照| SN
-    SN -->|upsert| SNAPDB
-    R --> RD
-    RD -->|读快照| SN
-    SN -->|按 source_ref 只读| SNAPDB
+    OS -->|writer.save()| SNW
+    SNW -->|upsert| SN
+    SN -->|upsert / query| SNAPDB
+    R -->|reader.get()| SNR
+    SNR -->|按 source_ref 只读| SN
     R -->|写运行状态 / Evidence / Claim| ST
     ST -->|参数化写入| DB
     R -->|写逐步流水| TR
@@ -132,7 +133,7 @@ graph LR
 组件边界说明：
 
 - **本地进程**：`run.py` 是唯一的控制流持有者，`server.py` 三函数进程内直调（非 MCP 服务）。
-- **接口层**：`store.py` 是 `run.py` 写入审计 DB 的唯一通道；`snapshot.py` 是 `server.py` 读写快照 DB 的唯一通道。上层均不导入 `sqlite3`，不直接执行 SQL。
+- **接口层**：`store.py` 是 `run.py` 写入审计 DB 的唯一通道；`snapshot.py` 工厂提供两种能力对象——`make_writer()` 注入 `open_source`（只有 `.save()`），`make_reader()` 注入 `run.py`（只有 `.get()`）。持有 `writer` 的代码无法读，持有 `reader` 的代码无法写；误用在代码审查时可见，同进程内无需运行时强制。上层均不导入 `sqlite3`，不直接执行 SQL。
 - **外部服务**：Bing 只产导航候选、不产证据；crawl4ai 是唯一抓取后端，独立部署；两个模型经 OpenAI 兼容接口调用。
 - **持久化**：`snapshot.sqlite` 是不可变快照 DB，取证唯一依据；`store.sqlite` + `trace/` 是双审计层，职责分离。
 - **SSRF 守卫**嵌在 `open_source` 内，抓取前校验 URL、抓取后对重定向落点复检，信任边界不可外包。
@@ -167,7 +168,7 @@ sequenceDiagram
     CR-->>R: 快照 source_ref + content_hash
     R->>SNAP: 写快照
     R->>AUD: 记 opened / open_skip
-    R->>C: read_source 正文，逐字取证
+    R->>C: reader.get() 正文，逐字取证
     C-->>R: 逐字引文候选
     R->>R: 校验 hash 匹配 + 引文逐字命中
     R->>AUD: 记 verified evidence
@@ -194,7 +195,7 @@ sequenceDiagram
 质量不靠模型自觉，靠程序在关键节点卡死。全部在 `run.py` 里执行：
 
 1. **候选归属**：`open_source` 只接受本 run `search_candidates` 产生过的 `candidate_id`，杜绝模型自造 URL。
-2. **快照哈希匹配**：取证时校验 `read_source` 读回正文的 `content_hash` 与存档时一致，确保读的就是当初存的那份。
+2. **快照哈希匹配**：取证时校验 `reader.get()` 读回正文的 `content_hash` 与存档时一致，确保读的就是当初存的那份。
 3. **引文逐字命中**：`quote in text`——引文必须是快照正文里连续原样出现的片段，否则判不通过。
 4. **Claim 有据**：每条 Claim 的 `evidence_ids` 必须都指向已通过前三关的 Evidence，否则该 Claim 不成立。
 
@@ -213,7 +214,7 @@ sequenceDiagram
 
 两层持久化，各经专属接口写入，职责分开：
 
-- **快照 DB** `snapshot.sqlite`（经 `snapshot.py` 接口）：`open_source` 抓取后经 `snapshot.py.save()` 写入，`read_source` 经 `snapshot.py.get()` 按 `source_ref` 只读取出正文。以 `snap_id` 为唯一键 upsert，内容不可变，取证唯一依据。
+- **快照 DB** `snapshot.sqlite`（经 `snapshot.py` 接口）：`open_source` 持 `make_writer()` 注入的 `writer` 对象，调 `writer.save()` 写入；`run.py` 持 `make_reader()` 注入的 `reader` 对象，调 `reader.get(source_ref)` 只读取出正文。两种能力对象互不包含对方方法，误用在代码审查时可见。以 `snap_id` 为唯一键 upsert，内容不可变，取证唯一依据。
 - **审计 DB** `store.sqlite`（经 `store.py` 接口）：`run.py` 只能调有界函数——`log_run / log_evidence / log_claim / log_answer`，不直接执行 SQL，不能读表、不能删。接口内部做参数化查询、字段校验、事务封装。三表 `run / evidence / claim`。
 - **流水** `trace/<run_id>.jsonl`：逐步流水（question、queries、candidates、picked、opened/open_skip、evidence_check、claim、answer、abort），供事后回放与审计。
 

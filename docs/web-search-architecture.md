@@ -83,7 +83,60 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 
 ## 4. 系统架构总览
 
+### 4.1 组件架构
+
 ```mermaid
+flowchart TB
+    U([用户])
+
+    subgraph APP["应用层"]
+        R["run.py<br/>主编排器"]
+    end
+
+    subgraph TOOL["工具层 — server.py"]
+        SC["search_candidates<br/>候选搜索"]
+        OS["open_source<br/>SSRF 守卫 + 抓取"]
+    end
+
+    subgraph IFACE["接口层"]
+        STP["store.py<br/>log_run / log_evidence<br/>log_claim / log_answer"]
+        SNP["snapshot.py<br/>make_writer() → writer<br/>make_reader() → reader"]
+    end
+
+    subgraph STORE["存储层"]
+        SNAPDB[("snapshot.sqlite<br/>不可变快照")]
+        AUDITDB[("store.sqlite<br/>审计 DB")]
+        TR[("trace/*.jsonl<br/>逐步流水")]
+    end
+
+    subgraph EXT["外部服务"]
+        SE["Bing / ddgs"]
+        CR["crawl4ai<br/>独立部署"]
+        SM["strong 模型"]
+        CM["cheap 模型"]
+    end
+
+    U -- "问题 / 答案" --- R
+
+    R -- "调用" --> SC
+    R -- "调用" --> OS
+    R -- "write-only" --> STP
+    R -- "reader 注入" --> SNP
+    R -- "生成词 / Claim / 答案" --> SM
+    R -- "逐字取证" --> CM
+
+    SC -- "搜索" --> SE
+    OS -- "抓取" --> CR
+    OS -- "writer 注入" --> SNP
+
+    STP -- "参数化写" --> AUDITDB
+    STP -- "追加" --> TR
+    SNP -- "upsert / query" --> SNAPDB
+```
+
+### 4.2 数据流
+
+
 flowchart LR
     U([用户])
 

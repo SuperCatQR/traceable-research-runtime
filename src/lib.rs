@@ -10,8 +10,10 @@
 //! `select_sources`, `synthesize_answer`) stay fixture-testable without a runtime.
 
 pub mod adapters;
+pub mod backend;
 pub mod error;
 pub mod orchestration;
+pub mod server;
 pub mod snapshot;
 pub mod trace;
 pub mod types;
@@ -19,7 +21,9 @@ pub mod types;
 // Flat public surface: downstream phases import from the crate root, not deep
 // module paths.
 pub use adapters::{BingClient, CrawlClient, StrongClient, validate_public_url};
+pub use backend::{LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
 pub use error::{ErrorClass, Result, SearchError};
+pub use server::{ResearchRequest, SearchServer};
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{
     RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy, TraceWriter,

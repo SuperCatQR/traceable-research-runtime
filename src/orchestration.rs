@@ -178,7 +178,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
         Ok(&self.state)
     }
 
-    pub async fn synthesize_answer(&mut self, reader: &SnapshotReader) -> Result<Answer> {
+    pub async fn synthesize_answer(&mut self, reader: SnapshotReader) -> Result<Answer> {
         if self.archived.is_empty() {
             return Err(SearchError::NoUsableSource);
         }
@@ -235,6 +235,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             .iter()
             .map(|snapshot| snapshot.snapshot_ref.clone())
             .collect();
+        drop(reader);
         let raw = self.backend.synthesize(&self.question, &evidence).await?;
         let answer = synthesize_answer(&raw, &supplied)?;
         for claim in &answer.claims {
@@ -528,9 +529,19 @@ mod tests {
             _snapshots: &[Snapshot],
         ) -> impl Future<Output = Result<String>> {
             self.synthesize_calls += 1;
-            std::future::ready(Err(SearchError::ModelCall {
-                message: "unused in fixture".into(),
-            }))
+            std::future::ready(self.selected_ref.as_ref().map_or_else(
+                || {
+                    Err(SearchError::ModelCall {
+                        message: "unused in fixture".into(),
+                    })
+                },
+                |reference| {
+                    Ok(format!(
+                        r#"{{"answer":"2024 年诺贝尔物理学奖授予 John Hopfield 与 Geoffrey Hinton。","claims":[{{"text":"二人因机器学习基础性发现与发明获奖。","snapshot_refs":["{}"]}}]}}"#,
+                        reference.as_str()
+                    ))
+                },
+            ))
         }
     }
 
@@ -636,10 +647,71 @@ mod tests {
         let reader = SnapshotReader::open(&db.0).unwrap();
 
         assert!(matches!(
-            session.synthesize_answer(&reader).await,
+            session.synthesize_answer(reader).await,
             Err(SearchError::ModelOutput { .. })
         ));
         assert_eq!(session.backend.synthesize_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn nobel_fixture_runs_end_to_end_and_replays_audit_trace() {
+        let db = TempDb::new("nobel-e2e");
+        let mut session = session(&db);
+        session.question = "2024 年诺贝尔物理学奖颁给了谁？获奖理由是什么？".into();
+
+        session.explore().await.unwrap();
+        let selected = session.archived[0].snapshot_ref.clone();
+        session.backend.selected_ref = Some(selected.clone());
+        let answer = session
+            .synthesize_answer(SnapshotReader::open(&db.0).unwrap())
+            .await
+            .unwrap();
+
+        assert!(answer.answer.contains("John Hopfield"));
+        assert!(answer.answer.contains("Geoffrey Hinton"));
+        assert_eq!(answer.claims[0].snapshot_refs, vec![selected]);
+
+        let trace = String::from_utf8(session.trace.into_inner()).unwrap();
+        let events: Vec<TraceEvent> = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        let mut archived = HashSet::new();
+        for event in &events {
+            match event {
+                TraceEvent::Archive { snapshot_ref, .. } => {
+                    archived.insert(snapshot_ref.clone());
+                }
+                TraceEvent::Excerpt { snapshot_ref, .. } => {
+                    assert!(archived.contains(snapshot_ref));
+                }
+                TraceEvent::SnapshotSelection { selected } => {
+                    assert!(
+                        selected
+                            .iter()
+                            .all(|source| archived.contains(&source.snapshot_ref))
+                    );
+                }
+                TraceEvent::Claim { snapshot_refs, .. } => {
+                    assert!(
+                        snapshot_refs
+                            .iter()
+                            .all(|reference| archived.contains(reference))
+                    );
+                }
+                TraceEvent::Answer { claims, .. } => {
+                    assert!(
+                        claims
+                            .iter()
+                            .flat_map(|claim| &claim.snapshot_refs)
+                            .all(|reference| archived.contains(reference))
+                    );
+                }
+                _ => {}
+            }
+        }
+        assert!(matches!(events.first(), Some(TraceEvent::RunHeader { .. })));
+        assert!(matches!(events.last(), Some(TraceEvent::Answer { .. })));
     }
 
     #[test]

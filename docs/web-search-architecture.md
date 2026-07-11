@@ -17,17 +17,17 @@
 - **网页内容不可信**。正文可能含提示注入，一律只当数据，不执行其中指令。
 - **抓取会主动向外发请求**。必须在请求前和重定向后执行 SSRF 守卫。
 
-因此骨架是：**强模型提出查询 → Bing 每词取第一页 → 全量抓取并存快照 → 迭代 N 轮 → 弱模型生成导航摘要 → 强模型选择并阅读原文 → 带来源作答**。
+因此骨架是：**强模型提出查询 → Bing 每词取第一页 → 全量抓取并存快照 → 迭代 N 轮 → 程序摘录导航目录 → 强模型选择并阅读原文 → 带来源作答**。
 
-这里没有“模型先挑搜索候选”与“弱模型逐字取证”两步。搜索引擎已完成第一页排序，再让模型预选只会增加调用和黑箱判断；快照增长本身可接受。弱模型只压缩原文供最终导航，不提供事实证据。
+这里没有“模型先挑搜索候选”与“逐字取证”两步。搜索引擎已完成第一页排序，再让模型预选只会增加调用和黑箱判断；快照增长本身可接受。程序摘录只截取标题+首段供最终导航，不提供事实证据。
 
 ## 2. 产品目标
 
 - **探索有深度**：所有问题默认探索 `N > 1` 轮；暂定 `MAX_ROUNDS = 3`。
 - **高召回**：每轮每个查询词取 Bing 第一页，去重后全部尝试抓取，不做模型候选筛选。
-- **原文作答**：标题和弱模型摘要只导航；最终事实只能来自强模型实际读过的快照原文。
+- **原文作答**：标题和程序摘录只导航；最终事实只能来自强模型实际读过的快照原文。
 - **可溯源**：事实结论携带 `source_ref`，指向带哈希的不可变快照。
-- **可审计**：查询、搜索结果、抓取结果、摘要、原文选择理由、结论和模型调用均落 trace。
+- **可审计**：查询、搜索结果、抓取结果、摘录、原文选择理由、结论和模型调用均落 trace/<run_id>.jsonl。
 - **流程可控**：模型只返回约定 JSON；`run.py` 仅作薄入口，轮数、抓取、预算、校验与终止均由研究编排层控制。
 - **大上下文优先**：按强模型 1M token 上下文设计；输入预算设为 `MAX_STRONG_INPUT_TOKENS = 800_000`，预留输出和系统指令空间。
 
@@ -106,92 +106,103 @@ architecture-beta
     service SEARCH(internet)[search candidates] in SVCS
     service OPEN(server)[open source SSRF Guard] in SVCS
 
-    service STOREAPI(server)[store py] in IFACE
     service SNAPAPI(server)[snapshot py] in IFACE
 
     service SNAPDB(database)[snapshot sqlite] in STORE
-    service AUDITDB(database)[store sqlite] in STORE
-    service FSLOG(database)[trace dir] in STORE
+    service FSLOG(database)[trace jsonl audit] in STORE
 
     service ENGINE(internet)[Bing Search] in EXT
     service CRAWL(server)[crawl4ai] in EXT
     service STRONG(cloud)[Strong Model] in EXT
-    service CHEAP(cloud)[Cheap Model] in EXT
 
     PROC:B --> T:SESSION
 
     SESSION:R --> L:SEARCH
     SESSION:R --> L:OPEN
-    SESSION:B --> T:STOREAPI
     SESSION:B --> T:SNAPAPI
     SESSION:T --> B:STRONG
-    SESSION:T --> B:CHEAP
+    SESSION:B --> T:FSLOG
 
     SEARCH:R --> L:ENGINE
     OPEN:R --> L:CRAWL
     OPEN:B --> T:SNAPAPI
 
-    STOREAPI:B --> T:AUDITDB
-    STOREAPI:B --> T:FSLOG
     SNAPAPI:B --> T:SNAPDB
 ```
 
 ### 4.2 数据流
 
+数据流按两阶段分别绘制，避免单图过载。`run.py` 只在两端透传、不变换数据，故数据流图省略，仅在架构图作入口保留。
+
+Explore（固定 N 轮）：
+
 ```mermaid
 flowchart LR
-    U([用户])
-
-    subgraph P["本地进程"]
-        R["run.py<br/>薄入口"]
+    subgraph P1["本地进程"]
         X["research_session.py<br/>N轮状态机与预算"]
         SC["search_candidates"]
         OS["open_source<br/>SSRF与质量检查"]
-        ST["store.py<br/>审计接口"]
         SW["snapshot.writer"]
-        SR["snapshot.reader"]
+        SRr["snapshot.reader"]
     end
 
-    subgraph E["外部服务"]
-        S["strong 模型<br/>查询规划与原文作答"]
-        C["cheap 模型<br/>页面摘要"]
+    subgraph E1["外部服务"]
+        S["strong 模型<br/>查询规划"]
         B["Bing<br/>每词第一页"]
         CR["crawl4ai<br/>结构化抓取"]
     end
 
-    subgraph D["持久化"]
+    subgraph D1["持久化"]
         SD[("snapshot.sqlite<br/>标题+抓取凭证+原文")]
-        AD[("store.sqlite<br/>摘要+选择+结论")]
-        TR[("trace/<br/>逐步流水")]
+        LG[("trace/&lt;run_id&gt;.jsonl<br/>append-only 审计")]
     end
 
-    U -->|问题| R
-    R -->|启动会话| X
+    X -->|上轮既有原文回喂| SRr --> SD
     X -->|问题+既有原文，生成3词| S
+    S -->|3查询词| X
     X --> SC --> B
     X -->|全部去重候选| OS --> CR
     OS --> SW --> SD
-    X --> SR --> SD
-    X -->|N轮后逐页摘要| C
-    C -->|描述，仅导航| X
-    X -->|全部标题+描述| S
-    S -->|source_ref+选择理由| X
-    X -->|选中原文| S
-    S -->|带source_ref答案| X
-    X --> ST --> AD
-    ST --> TR
-    X -->|研究结果| R
-    R --> U
+    X -->|query/candidate/open/skip| LG
+```
+
+Synthesize（N 轮后一次）：
+
+```mermaid
+flowchart LR
+    subgraph P2["本地进程"]
+        X2["research_session.py"]
+        EX["excerpt<br/>程序摘录 标题+首段+URL"]
+        SRr2["snapshot.reader"]
+    end
+
+    subgraph E2["外部服务"]
+        S2["strong 模型<br/>选源与原文作答"]
+    end
+
+    subgraph D2["持久化"]
+        SD2[("snapshot.sqlite")]
+        LG2[("trace/&lt;run_id&gt;.jsonl")]
+    end
+
+    X2 --> SRr2 --> SD2
+    SRr2 -->|标题+正文| EX
+    EX -->|全部 标题+摘录+source_ref| S2
+    S2 -->|选中 source_ref+理由| X2
+    X2 -->|读选中原文| SRr2
+    X2 -->|选中原文| S2
+    S2 -->|带source_ref答案+claims| X2
+    X2 -->|excerpt/选择/claim/答案| LG2
 ```
 
 组件边界：
 
 - `run.py` 是薄入口：接收问题、读取配置、启动 `ResearchSession`、返回结果；不理解 N 轮细节，不持有快照读写能力。
 - `research_session.py` 独占研究控制流，内部只有 Explore 与 Synthesize 两阶段；模型不能改变轮数、直接触网或访问 DB。
-- Bing 的标题和 snippet、cheap 的摘要都只用于导航。
+- Bing 的标题和 snippet、程序摘录都只用于导航。
 - crawl4ai 是不可信外部抓取器；`open_source` 保留 SSRF 与质量检查责任。
-- `snapshot.sqlite` 保存不可变网页版本；`store.sqlite + trace/` 保存派生摘要、选择理由、Claim 和答案。
-- 三层资料是逻辑视图：**标题**来自搜索/页面 metadata，**描述**来自 cheap 摘要，**原文**来自快照。描述不覆盖原文，也不升级为证据。
+- `snapshot.sqlite` 保存不可变网页版本；`trace/<run_id>.jsonl`（append-only 审计日志）保存派生摘录、选择理由、Claim 和答案。
+- 三层资料是逻辑视图：**标题**来自搜索/页面 metadata，**描述**来自程序摘录（标题+首段+URL），**原文**来自快照。描述不覆盖原文，也不升级为证据。
 
 ### 4.3 研究编排层
 
@@ -204,9 +215,9 @@ result = ResearchSession(question, policy).run()
 内部只含两阶段：
 
 1. **Explore**：生成查询、搜索、去重、全量抓取、归档快照，重复 N 轮。
-2. **Synthesize**：生成导航摘要、选择相关原文、读取原文、形成可引用答案。
+2. **Synthesize**：程序摘录每页、选择相关原文、读取原文、形成可引用答案。
 
-`ResearchSession` 仅维护 `run_id`、轮次、已见查询与 URL、`source_ref`、预算和停止原因。它调用既有工具与接口，不自行实现搜索、抓取或 SQLite 访问；暂不拆分 planner、selector、synthesizer 等子组件。
+`ResearchSession` 仅维护 `run_id`、轮次、已见查询与 URL、`source_ref`、预算和停止原因。它调用既有工具与接口，不自行实现搜索或抓取；快照经 `snapshot.reader` 读取，审计经 append-only `trace/<run_id>.jsonl` 直接落盘，两者都不经手写 SQL。暂不拆分 planner、selector、synthesizer 等子组件。
 
 ## 5. N 轮探索与最终作答
 
@@ -221,8 +232,7 @@ sequenceDiagram
     participant O as open_source
     participant C as crawl4ai
     participant P as snapshot.sqlite
-    participant W as cheap 模型
-    participant A as store.sqlite + trace
+    participant A as trace jsonl 审计
 
     U->>R: 问题
     R->>X: ResearchSession(question, policy).run()
@@ -257,11 +267,10 @@ sequenceDiagram
     loop 每份成功快照
         X->>P: reader.get(source_ref)
         P-->>X: title + 原文
-        X->>W: 针对用户问题生成页面摘要
-        W-->>X: description JSON
-        X->>A: 记 source_summary
+        X->>X: 程序摘录 标题+首段+URL
+        X->>A: 记 excerpt
     end
-    X->>S: 全部 title + description + source_ref
+    X->>S: 全部 title + 摘录 + source_ref
     S-->>X: 相关 source_ref + 选择理由
     X->>X: 校验 source_ref 归属与原文预算
     X->>P: 读取选中原文
@@ -290,7 +299,7 @@ N 轮结束后，为每份快照构造：
 {
   "source_ref": "source:web/…",
   "title": "页面标题",
-  "description": "cheap 模型针对用户问题生成的导航摘要",
+  "description": "程序摘录：标题+首段+URL，仅导航",
   "original": "snapshot.sqlite 中的不可变正文"
 }
 ```
@@ -298,10 +307,10 @@ N 轮结束后，为每份快照构造：
 三层用途严格分离：
 
 - `title`：粗定位。
-- `description`：帮助 strong 在大量页面中筛选；可能漂移，不作证据。
+- `description`：程序确定性摘录（标题+首段+URL），帮助 strong 在大量页面中筛选；不作证据。
 - `original`：最终回答的唯一事实来源。
 
-摘要不修改快照正文，作为派生记录经 `store.log_source_summary()` 写审计 DB；记录 `source_ref`、模型、prompt 版本和输入 `content_hash`。
+摘录由程序生成，不修改快照正文，作为派生记录追加写入 `trace/<run_id>.jsonl`；记录 `source_ref` 和输入 `content_hash`。
 
 ### 5.3 最终选择与作答
 
@@ -310,7 +319,7 @@ N 轮结束后，为每份快照构造：
 3. strong 读取选中原文后回答；每条事实 Claim 必须列出一个或多个 `source_ref`。
 4. 程序只接受引用已实际送入最终调用、且哈希匹配的 source_ref。
 
-默认 `MAX_FINAL_SOURCES = 100`，最终原文输入仍受 800k token 总预算约束。选择上限刻意偏高，以降低漏选；若标题和摘要目录本身超过预算，先停止继续探索，不在终局静默丢页。
+默认 `MAX_FINAL_SOURCES = 100`，最终原文输入仍受 800k token 总预算约束。选择上限刻意偏高，以降低漏选；若标题和摘录目录本身超过预算，先停止继续探索，不在终局静默丢页。
 
 ## 6. 程序校验
 
@@ -323,30 +332,31 @@ N 轮结束后，为每份快照构造：
 5. **选择归属**：strong 选择的每个 source_ref 必须属于本 run，并把选择理由落 trace。
 6. **Claim 有源**：每条 Claim 只能引用已送入最终 strong 调用的原文 source_ref。
 
-不再做 `quote in text` 的“逐字取证”校验。它只能证明字符串存在，不能证明引文足以支持 Claim；新流程把弱模型摘要降为导航材料，让 strong 对实际原文负责。代价是 Claim 与原文之间的语义蕴含仍依赖 strong，程序只能验证“读过并引用了哪份原文”，不能机械证明结论正确。
+不再做 `quote in text` 的“逐字取证”校验。它只能证明字符串存在，不能证明引文足以支持 Claim；新流程把程序摘录降为导航材料，让 strong 对实际原文负责。代价是 Claim 与原文之间的语义蕴含仍依赖 strong，程序只能验证“读过并引用了哪份原文”，不能机械证明结论正确。
 
 以下情况据实拒答：搜索无结果、所有页面都抓取失败、最终没有可用原文、或 strong 判断原文不足以回答。
 
-## 7. 模型分工
+## 7. 模型职责
 
-- **strong**：每轮分析问题与既有原文、生成 3 个新查询；N 轮后阅读标题和摘要目录、选择原文；最终阅读原文并回答。假设 1M token 上下文，单次输入预算 800k。
-- **cheap**：仅在 N 轮结束后逐页生成与问题相关的简短描述。摘要只导航，不允许成为 Claim 来源。
+系统只用一个 strong 模型；导航摘录由程序完成，不引入第二个模型。
 
-模型调用无状态；每次输入由 `research_session.py` 从问题、快照与审计对象重建。模型返回结构化 JSON，不持有控制流。
+- **strong**：每轮分析问题与既有原文、生成 3 个新查询；N 轮后阅读标题和摘录目录、选择原文；最终阅读原文并回答。假设 1M token 上下文，单次输入预算 800k。
+- **程序摘录**：N 轮结束后逐页确定性截取标题+首段+URL，仅供 strong 导航选页，不允许成为 Claim 来源。
+
+模型调用无状态；每次输入由 `research_session.py` 从问题、快照与审计日志重建。模型返回结构化 JSON，不持有控制流。
 
 ### 三个已知模型风险
 
 1. **查询偏航**：后续轮可能沿错误方向继续搜索。缓解：每次都重放原始问题，要求输出“新查询覆盖的证据缺口”，并记录 query rationale。
-2. **摘要漂移或漏点**：会影响终局选页召回。缓解：摘要明确标注“仅导航”，选择上限偏高；最终答案禁用摘要作证据。
+2. **摘录不足**：程序摘录确定性生成、不漂移，但首段可能未覆盖页面关键信息，影响终局选页召回。缓解：摘录含标题+首段+URL，选择上限偏高；strong 最终仍读完整原文作最后核验。
 3. **原文选择黑箱**：strong 可能漏选关键页面。缓解：返回 source_ref、选择理由和相关性等级并完整审计；允许选多，不以压缩快照为目标。此风险无法被程序完全消除。
 
 ## 8. 存储与审计
 
 - **快照 DB** `snapshot.sqlite`：经 `snapshot.py` 写入标题、URL、原文、哈希、抓取凭证和时间。正文不可变；`server.py` 只持 writer，`research_session.py` 只持 reader，`run.py` 均不持有。
-- **审计 DB** `store.sqlite`：经 `store.py` 记录 run、round、query、candidate、open/open_skip、source_summary、source_selection、claim、answer。`research_session.py` 与 `run.py` 均不导入 `sqlite3`。
-- **流水** `trace/<run_id>.jsonl`：记录每一步结构化输入输出和预算变化，供回放与问题定位。
+- **审计日志** `trace/<run_id>.jsonl`：单一 append-only 文件，每 run 一份，逐行记录 run、round、query、candidate、open/open_skip、excerpt、source_selection、claim、answer 及预算变化，供回放与问题定位。`research_session.py` 直接追加写入，`run.py` 不写。
 
-`store.py` 与 `snapshot.py` 内部使用参数化 SQL、字段校验和事务；上层不直接执行 SQL。密钥与正文不写 trace，正文只以 `source_ref/content_hash` 引用。
+`snapshot.py` 内部使用参数化 SQL、字段校验和事务，上层不直接执行 SQL；审计日志是纯 append-only 结构化 JSON，无独立数据库。密钥与正文不写审计日志，正文只以 `source_ref/content_hash` 引用。
 
 ## 9. 实现状态与迁移
 
@@ -356,14 +366,15 @@ N 轮结束后，为每份快照构造：
 2. 把单轮控制改为固定 N 轮，后续轮输入已有快照原文。
 3. `search_candidates` 默认每词取 10 条；删除 strong 候选选择和 `MAX_OPEN = 4`。
 4. 所有去重候选直接进入 `open_source`；补 crawl4ai 结构化字段存档与质量检查。
-5. 删除 cheap 逐字取证；改为 N 轮后逐页摘要，并保存派生摘要审计记录。
+5. 删除 cheap 逐字取证；改为 N 轮后程序确定性摘录（标题+首段+URL），并把摘录追加进审计日志。
 6. 新增“目录选择原文”和“基于所选原文作答”两次 strong 调用。
 7. 删除引文 substring 校验，改为 source_ref 归属、哈希和 Claim 引用范围校验。
+8. 移除 `store.sqlite` 审计 DB 与 `store.py`；审计统一写 `trace/<run_id>.jsonl`。
 
 ## 10. 安全与资源边界
 
 - **SSRF**：请求前及重定向后检查；仅允许公网 http(s)。
-- **提示注入**：网页正文、标题、snippet、摘要均是不可信数据；模型系统指令明确禁止执行页面内指令。
+- **提示注入**：网页正文、标题、snippet、程序摘录均是不可信数据；模型系统指令明确禁止执行页面内指令。
 - **抓取边界**：默认 3 轮 × 3 词 × 每词第一页 10 条；URL 去重；高位上限 300 份来源。
 - **上下文边界**：按 1M 模型窗口设计，单次输入最多 800k token；达到预算即停止扩展，不静默截掉终局目录。
 - **页面边界**：单页存档最多 4MB；超限明确标记截断，不能伪装成完整原文。
@@ -374,7 +385,7 @@ N 轮结束后，为每份快照构造：
 - crawl4ai 不能保证抓到登录墙、付费墙、强反爬、滚动加载或特殊媒体内容；当前策略是记录失败并依靠同轮其他结果，而非假装成功。
 - crawl4ai 的 `success=true` 不等于正文正确；结构化字段、正文长度和 raw/fit 对照只能发现部分异常，不能证明语义完整。
 - Bing 第一页优先级提高了平均质量，但不保证权威、无偏或覆盖全部观点。
-- cheap 摘要可能漂移或遗漏；因其只导航，风险主要是漏选页面，而不是直接污染事实答案。
+- 程序摘录只截首段，可能遗漏页面关键段落；但它确定性生成、不漂移，且仅导航，风险主要是漏选页面，而非直接污染事实答案，strong 最终仍读完整原文。
 - strong 的查询规划、页面选择和 Claim 推理仍是模型判断，审计能使黑箱可见，不能使其成为形式证明。
 - 1M 是目标模型假设；换用更小上下文模型时，必须重新降低轮数、每页数量或引入可验证的分层压缩，不可静默裁剪。
 - SSRF 守卫与本地 fake-ip 代理模式冲突；验证与跑测需关闭该代理或提供可信解析通道。

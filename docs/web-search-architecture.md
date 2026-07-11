@@ -1,85 +1,91 @@
 # Web Search 架构设计
 
-> 状态：Draft
+> 状态：Target Design（当前 PoC 尚未完全实现）
 >
-> 日期：2026-07-10
+> 日期：2026-07-11
 >
-> 目的：为 Web Search 单独建模。公网网页与结构化索引库是两类不同的原文世界，本文不复用索引库那套"逐层下降选枝"的抽象，而是按网页自身的规律描述系统。内容贴合当前 PoC 代码（`poc/run.py` 与 `poc/search_mcp/server.py`）。
+> 目的：为 Web Search 单独建模。公网网页与结构化索引库是两类不同的原文世界，本文不复用索引库的“逐层下降选枝”抽象，而是按网页自身规律描述系统。目标流程以固定多轮探索、全量抓取、分层阅读和原文作答为核心；当前实现差距见 §9。
 
 ## 1. 为什么单独设计
 
-结构化索引库有一棵干净的树：目录、章节、条文层层可导航，命中即权威，版本由库自己锁定。公网网页没有这些前提，套用同一套抽象只会把网页的真实难点藏起来。网页的现实是：
+结构化索引库有一棵干净的树：目录、章节、条文层层可导航，命中即权威，版本由库自己锁定。公网网页没有这些前提：
 
-- **没有干净的导航树**。入口只有搜索引擎的排序结果，混着广告、转载、过期页和低质内容，权威性得由模型逐条判断，而不是顺着结构下降。
-- **抓取失败是常态，不是异常**。登录墙、付费墙、反爬、JS 动态渲染、页面失效，任何一条候选都可能打不开。系统必须把"打不开就换下一条"当作正常路径，而非错误分支。
-- **网页没有版本号**。同一 URL 今天和明天可能不同，原页随时会变或消失。唯一可靠的版本锁定手段是"抓下来的那一刻存一份快照 + 内容哈希"，之后一切引用都指向快照，不再回访原页。
-- **网页内容不可信**。正文里可能夹带针对模型的注入指令，必须一律当数据处理，不执行。
-- **抓取会主动向外发请求**。URL 由搜索结果和模型给出，存在打到内网、被重定向越界的风险，需要 SSRF 守卫。
+- **没有干净的导航树**。入口只有搜索引擎排序结果，混着广告、转载、过期页和低质内容。
+- **问题深度事前未知**。首轮结果常会暴露新术语、新主体或新争议，需要把已读原文反馈给强模型，再生成下一轮查询。
+- **抓取失败是常态**。登录墙、付费墙、反爬、JS 动态渲染和页面失效都可能使候选打不开；失败必须成为可记录、可跳过的正常路径。
+- **网页没有版本号**。同一 URL 会变化或消失；抓取时必须存不可变快照和内容哈希，之后不再回访原页。
+- **网页内容不可信**。正文可能含提示注入，一律只当数据，不执行其中指令。
+- **抓取会主动向外发请求**。必须在请求前和重定向后执行 SSRF 守卫。
 
-因此 Web Search 的骨架是：**搜索拿候选 → 存档抓快照 → 只在快照里逐字取证 → 程序校验 → 带引用作答**。这条链只有一层（网页），不存在索引库的多层树。
+因此骨架是：**强模型提出查询 → Bing 每词取第一页 → 全量抓取并存快照 → 迭代 N 轮 → 弱模型生成导航摘要 → 强模型选择并阅读原文 → 带来源作答**。
+
+这里没有“模型先挑搜索候选”与“弱模型逐字取证”两步。搜索引擎已完成第一页排序，再让模型预选只会增加调用和黑箱判断；快照增长本身可接受。弱模型只压缩原文供最终导航，不提供事实证据。
 
 ## 2. 产品目标
 
-- **高质量**：答案基于抓取存档的网页原文，不靠模型记忆或摘要相似度。
-- **可溯源**：每条事实结论都能定位到一份带哈希的快照中的逐字原文。
-- **可审计**：搜索、选择、抓取、取证、结论、模型调用全过程逐步落 trace，可回放。
-- **可控**：模型只产出结构化候选（搜索词、candidate_id、引文、Claim），系统控制流由程序把持，模型不决定流程。
-- **低成本**：有界的搜索词数、候选数、抓取数，加上强/廉两档模型分工，压住调用量。
+- **探索有深度**：所有问题默认探索 `N > 1` 轮；暂定 `MAX_ROUNDS = 3`。
+- **高召回**：每轮每个查询词取 Bing 第一页，去重后全部尝试抓取，不做模型候选筛选。
+- **原文作答**：标题和弱模型摘要只导航；最终事实只能来自强模型实际读过的快照原文。
+- **可溯源**：事实结论携带 `source_ref`，指向带哈希的不可变快照。
+- **可审计**：查询、搜索结果、抓取结果、摘要、原文选择理由、结论和模型调用均落 trace。
+- **流程可控**：模型只返回约定 JSON；轮数、抓取、预算、校验与终止均由 `run.py` 控制。
+- **大上下文优先**：按强模型 1M token 上下文设计；输入预算设为 `MAX_STRONG_INPUT_TOKENS = 800_000`，预留输出和系统指令空间。
 
-## 3. 网页取证的三个动作
+## 3. 网页获取的三个动作
 
-Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/server.py`。它们用 FastMCP 声明（`@mcp.tool()`），因此既能作为 MCP 工具挂到 Claude Desktop / Cline 等客户端，也能被 `run.py` 在进程内直接 `import` 调用。PoC 阶段走的是后者——进程内直调，不启 stdio。
+网页获取收敛为三个受控动作，实现在 `poc/search_mcp/server.py`。它们以 FastMCP 声明，也可由 `run.py` 进程内直调；PoC 走后者。
 
 | 动作 | 签名 | 职责 | 返回 |
 | --- | --- | --- | --- |
-| 搜索 | `search_candidates(query, k=6)` | 拿有界候选，仅供导航 | `[{candidate_id, title, url, snippet}]` |
-| 抓取+存档 | `open_source(candidate_id)` | 经 crawl4ai 抓正文（§3.2），再锁版本存快照（§3.3） | `{source_ref, source_uri, title, content_hash, char_len, fetched_at}` |
-| 读取 | `reader.get(source_ref)` | 由 `snapshot.make_reader()` 注入 `run.py`，读回已存档的快照正文 | `{source_ref, source_uri, content_hash, truncated, text}` |
+| 搜索 | `search_candidates(query, k=10)` | 取 Bing 第一页导航结果 | `[{candidate_id, query, rank, title, url, snippet}]` |
+| 抓取+存档 | `open_source(candidate_id)` | SSRF 校验、crawl4ai 抓取、结构检查、锁版本 | `{source_ref, source_uri, title, content_hash, char_len, fetched_at, crawl_meta}` |
+| 读取 | `reader.get(source_ref)` | 从 `snapshot.sqlite` 读取指定快照原文及抓取字段 | `{source_ref, source_uri, title, content_hash, crawl_meta, text}` |
 
-关键约束：`open_source` 只接受本次会话里 `search_candidates` 产生过的 `candidate_id`，拒绝任何集合外的 URL。模型不能凭空造 URL 让系统去抓。
+`open_source` 只接受当前 run 中 `search_candidates` 登记过的 `candidate_id`。模型不能提交任意 URL。
 
 ### 3.1 搜索：`search_candidates`
 
-- 后端固定 Bing（经 `ddgs` 库，`backend="bing"`），对国内网络友好、无需 API key。搜索源可换，因为它只产导航结果，不产证据。
-- 免费后端对密集请求会限流。命中 429 / ratelimit 时按 `1, 3, 5, 9s` 指数退避重试，最多 4 次，末次仍失败才报错。
-- 每条候选按 `sha1(query|url)` 生成 12 位 `candidate_id`，登记进会话内候选表 `_candidates`。
-- 标题和摘要**只用于让模型判断该不该打开，绝不能当事实证据**。证据只能来自存档后的快照正文。
+- 后端固定 Bing（`ddgs`，`backend="bing"`）；搜索结果仅导航，不作证据。
+- `MAX_QUERIES_PER_ROUND = 3`，每词 `RESULTS_PER_QUERY = 10`，即第一页规模。
+- 每轮理论候选最多 30 条；按规范化 URL 去重。三轮理论上限约 90 条，重复 URL 通常会使实际数量更少。
+- 每条结果记录 `query`、页内 `rank`、`title`、`snippet` 和 URL，便于回放 Bing 当时如何排序。
+- `candidate_id = sha1(query|url)[:12]`，登记进 run 内候选表。
+- 429 / ratelimit 按 `1, 3, 5, 9s` 退避，最多 4 次。
 
-`open_source` 一个调用里其实做了两件不同性质的事：先**向不可信的外部世界抓一次**（crawl4ai 负责），再**把抓回来的东西存成不可变版本**（我们自己负责）。这两件事信任边界不同、失败原因不同，下面分开讲。
+### 3.2 抓取：crawl4ai
 
-### 3.2 抓取：crawl4ai（向外，最易出错的一步）
+搜索所得候选去重后全部进入 `open_source`，不经过模型挑选：
 
-这一步是整个架构里唯一"主动向公网发请求"的动作，也是最容易出错的一步：抓什么、抓没抓到、抓回来的是不是正文，全在这里决定。信任边界就在这：crawl4ai 是外部服务，它的返回是不可信输入。
+1. 由 `candidate_id` 取 URL；未知 id 拒绝。
+2. 抓取前 `_is_public_http` 校验 scheme、DNS 与所有解析地址，拦截内网、环回、link-local、保留和组播地址。
+3. `POST {CRAWL4AI_BASE}/crawl`，由 crawl4ai 完成请求、JS 渲染和正文抽取。
+4. 校验 `results[0].success`、正文非空及最低质量信号；失败记录 `open_skip`，继续下一条。
+5. 对最终 URL 再执行 `_is_public_http`，防止重定向越界。
+6. 接收 crawl4ai 的结构化字段，而非只取一段 markdown：至少保留 `status_code`、`final_url`、页面 `metadata`、`raw_markdown` / `fit_markdown` 长度及实际采用的正文类型。
 
-1. 用 `candidate_id` 取出 URL；未知 id 直接拒绝（越过候选表就没有抓取）。
-2. **抓取前 SSRF 守卫** `_is_public_http`：解析 URL，只允许 http(s)，DNS 解析后逐个地址检查，拦掉内网、环回、link-local、保留、组播地址。
-3. 经 crawl4ai 抓取：`POST {CRAWL4AI_BASE}/crawl`，带 `Bearer` token，body `{"urls": [url]}`。crawl4ai 在服务器端完成抓取、JS 渲染（无头浏览器）、正文抽取。crawl4ai 是唯一抓取后端；遇到它也爬不动的资源（登录墙/付费墙），按"弃取"处理，不硬扛。
-4. 判 `results[0].success`。不成功即视为反爬或失效，放弃这条候选，换下一个。
-5. **抓取后重定向复检**：对最终落点 URL 再跑一次 `_is_public_http`，防止跳转越界打到内网。
+crawl4ai 是唯一抓取后端，但不是可信边界。其失败不终止整轮；其返回必须由本地程序校验后才能存档。
 
-抓取的产物是 crawl4ai 的结构化返回，正文取其 markdown（当前取 `raw_markdown`）。抓取阶段只负责"拿到、且确认拿到了"，不做版本锁定。
+### 3.3 存档：锁版本
 
-### 3.3 存档：锁版本（向内，产物不可变）
+抓取成功后经 `snapshot.writer.save()` 写 `snapshot.sqlite`：
 
-抓取成功后才进存档，这一步纯本地、确定性：
+1. 正文为空或低于质量下限则不存；单页最大 `MAX_BYTES = 4_000_000`。
+2. `content_hash = "sha256:" + sha256(text)`。
+3. `snap_id = sha1(final_url|content_hash)[:16]`，`source_ref = "source:web/<snap_id>"`。
+4. 保存 URL、标题、正文、内容哈希、抓取时间及 §3.2 的结构化抓取凭证。
+5. `snap_id` 唯一；相同版本不重复写。正文与抓取凭证一经写入即不可变。
 
-1. 取 markdown 正文，截到 `MAX_BYTES = 4_000_000`。正文为空视为动态渲染失败或登录墙，放弃。
-2. **锁版本**：`content_hash = "sha256:" + sha256(text)`，`snap_id = sha1(final_url|content_hash)[:16]`，`source_ref = "source:web/<snap_id>"`。
-3. 经 `snapshot.py` 接口写入 `snapshot.sqlite`，含 url、title、正文、哈希、抓取时间；以 `snap_id` 为唯一键做 upsert，防重复写入。
+快照膨胀不是正常流程中的筛选理由；真正的约束是磁盘配额和模型上下文预算。默认三轮约 90 页，另设高位安全阈值 `MAX_TOTAL_SOURCES = 300`，防止配置错误造成无界抓取。
 
-存档之后，这份快照就是不可变的原文版本。后续取证、校验、引用全部只认 `source_ref` 和 `content_hash`，不再触网。
+### 3.4 读取：`snapshot.reader`
 
-### 3.4 抓取可审计性（规划中，未落地）
+`run.py` 只持有 `snapshot.make_reader()` 返回的 reader；`server.py` 的 `open_source` 只持有 writer。二者均不直接访问 SQLite：
 
-抓取是最易出错的一步，却也是当前最不可审计的一步。现状：存档只保留最终 markdown 正文，crawl4ai 返回的其余结构化字段——`status_code`、最终响应头、页面 `metadata`、以及 `fit_markdown`（去噪正文）等 markdown 变体——都未入档。
+- `reader.get(source_ref)`：读取一份原文。
+- `reader.list_run_sources(run_id)`：列出本 run 已归档的标题、哈希和抓取元数据，供组装模型输入。
+- reader 无 `.save()`；writer 无 `.get()`。
 
-后果：正文一旦抽歪（该有的正文没了、或截断切错），无法回溯是**抓取端**（crawl4ai 抓错、反爬返回了空壳页）还是**本地处理**（取错 markdown 变体、截断位置不对）导致的。"crawl4ai 到底抓了什么"查不到。
-
-规划中的改进：把存档从"只留一段正文"扩成**抓取凭证**，记录 crawl4ai 的关键结构化输出（`status_code`、`final_url`、`metadata`、各 markdown 变体的长度对照）。有了长度对照，"抽取抽歪了"这类最常见错误就能一眼看出，且不必存原始 HTML——渲染态 HTML 只是某一时刻某一滚动位置的快照，要说清它是哪个状态还得引入页面状态判断，代价大而审计价值薄，不做。正文来源可从 `raw_markdown` 换成 `fit_markdown` 以提升正文质量，同时记下两者长度做对照。此项属未落地设计，落地时同步更新 §3.3。
-
-### 3.5 读取：`snapshot.reader.get()`
-
-`read_source` 函数已废弃（选 A）。`run.py` 启动时从 `snapshot.make_reader()` 获取 `reader` 能力对象，直接调 `reader.get(source_ref)` 按 `source_ref` 从 `snapshot.sqlite` 读回正文，供廉价模型取证。读的是存档，不是原页。`reader` 对象无 `.save()` 方法，无法写入。
+这是能力对象隔离，不是 Python 沙箱。安全边界来自接口最小化、数据库文件权限与进程部署，而非可绕过的调用栈白名单。
 
 ## 4. 系统架构总览
 
@@ -95,35 +101,35 @@ architecture-beta
 
     service PROC(server)[run py] in APP
 
-    service SC(internet)[search candidates] in SVCS
-    service OS(server)[open source SSRF Guard] in SVCS
+    service SEARCH(internet)[search candidates] in SVCS
+    service OPEN(server)[open source SSRF Guard] in SVCS
 
-    service STP(server)[store py] in IFACE
-    service SNP(server)[snapshot py] in IFACE
+    service STOREAPI(server)[store py] in IFACE
+    service SNAPAPI(server)[snapshot py] in IFACE
 
     service SNAPDB(database)[snapshot sqlite] in STORE
     service AUDITDB(database)[store sqlite] in STORE
     service FSLOG(database)[trace dir] in STORE
 
-    service SE(internet)[Bing Search] in EXT
-    service CR(server)[crawl4ai] in EXT
-    service SMOL(cloud)[Strong Model] in EXT
-    service CMOL(cloud)[Cheap Model] in EXT
+    service ENGINE(internet)[Bing Search] in EXT
+    service CRAWL(server)[crawl4ai] in EXT
+    service STRONG(cloud)[Strong Model] in EXT
+    service CHEAP(cloud)[Cheap Model] in EXT
 
-    PROC:R --> L:SC
-    PROC:R --> L:OS
-    PROC:B --> T:STP
-    PROC:B --> T:SNP
-    PROC:T --> B:SMOL
-    PROC:T --> B:CMOL
+    PROC:R --> L:SEARCH
+    PROC:R --> L:OPEN
+    PROC:B --> T:STOREAPI
+    PROC:B --> T:SNAPAPI
+    PROC:T --> B:STRONG
+    PROC:T --> B:CHEAP
 
-    SC:R --> L:SE
-    OS:R --> L:CR
-    OS:B --> T:SNP
+    SEARCH:R --> L:ENGINE
+    OPEN:R --> L:CRAWL
+    OPEN:B --> T:SNAPAPI
 
-    STP:B --> T:AUDITDB
-    STP:B --> T:FSLOG
-    SNP:B --> T:SNAPDB
+    STOREAPI:B --> T:AUDITDB
+    STOREAPI:B --> T:FSLOG
+    SNAPAPI:B --> T:SNAPDB
 ```
 
 ### 4.2 数据流
@@ -133,164 +139,219 @@ flowchart LR
     U([用户])
 
     subgraph P["本地进程"]
-        R["run.py 环路"]
-        subgraph SRV["server.py 工具函数"]
-            SC[search_candidates]
-            OS["open_source<br/>含 SSRF 守卫"]
-        end
-        ST["store.py<br/>接口层"]
-        SN["snapshot.py<br/>接口层"]
-        SNW["snapshot.writer<br/>注入 open_source"]
-        SNR["snapshot.reader<br/>注入 run.py"]
+        R["run.py<br/>N轮控制与预算"]
+        SC["search_candidates"]
+        OS["open_source<br/>SSRF与质量检查"]
+        ST["store.py<br/>审计接口"]
+        SW["snapshot.writer"]
+        SR["snapshot.reader"]
     end
 
-    subgraph EXT["外部服务"]
-        SE["Bing<br/>ddgs"]
-        CR["crawl4ai<br/>独立部署"]
-        S["strong 模型<br/>DeepSeek v4"]
-        C["cheap 模型<br/>DeepSeek v4 flash"]
+    subgraph E["外部服务"]
+        S["strong 模型<br/>查询规划与原文作答"]
+        C["cheap 模型<br/>页面摘要"]
+        B["Bing<br/>每词第一页"]
+        CR["crawl4ai<br/>结构化抓取"]
     end
 
-    subgraph DB_LAYER["持久化"]
-        SNAPDB[("snapshot.sqlite<br/>快照 DB")]
-        AUDITDB[("store.sqlite<br/>审计 DB")]
-        TR[("trace/<br/>审计流水")]
+    subgraph D["持久化"]
+        SD[("snapshot.sqlite<br/>标题+抓取凭证+原文")]
+        AD[("store.sqlite<br/>摘要+选择+结论")]
+        TR[("trace/<br/>逐步流水")]
     end
 
     U -->|问题| R
-    R -->|生成搜索词| S
-    R -->|逐字取证| C
-    R --> SC
-    SC -->|backend=bing| SE
-    R --> OS
-    OS -->|守卫通过后抓取| CR
-    OS -->|writer.save| SNW
-    SNW -->|upsert| SN
-    SN -->|upsert-query| SNAPDB
-    R -->|reader.get| SNR
-    SNR -->|source_ref 只读| SN
-    R -->|写 Evidence-Claim| ST
-    ST -->|参数化写入| AUDITDB
-    R -->|写逐步流水| TR
-    R -->|带引用答案| U
+    R -->|问题+既有原文，生成3词| S
+    R --> SC --> B
+    R -->|全部去重候选| OS --> CR
+    OS --> SW --> SD
+    R --> SR --> SD
+    R -->|N轮后逐页摘要| C
+    C -->|描述，仅导航| R
+    R -->|全部标题+描述| S
+    S -->|source_ref+选择理由| R
+    R -->|选中原文| S
+    S -->|带source_ref答案| R
+    R --> ST --> AD
+    ST --> TR
+    R --> U
 ```
 
-组件边界说明：
+组件边界：
 
-- **本地进程**：`run.py` 是唯一的控制流持有者，`server.py` 三函数进程内直调（非 MCP 服务）。
-- **接口层**：`store.py` 是 `run.py` 写入审计 DB 的唯一通道；`snapshot.py` 工厂提供两种能力对象——`make_writer()` 注入 `open_source`（只有 `.save()`），`make_reader()` 注入 `run.py`（只有 `.get()`）。持有 `writer` 的代码无法读，持有 `reader` 的代码无法写；误用在代码审查时可见，同进程内无需运行时强制。上层均不导入 `sqlite3`，不直接执行 SQL。
-- **外部服务**：Bing 只产导航候选、不产证据；crawl4ai 是唯一抓取后端，独立部署；两个模型经 OpenAI 兼容接口调用。
-- **持久化**：`snapshot.sqlite` 是不可变快照 DB，取证唯一依据；`store.sqlite` + `trace/` 是双审计层，职责分离。
-- **SSRF 守卫**嵌在 `open_source` 内，抓取前校验 URL、抓取后对重定向落点复检，信任边界不可外包。
+- `run.py` 独占控制流；模型不能改变轮数、直接触网或访问 DB。
+- Bing 的标题和 snippet、cheap 的摘要都只用于导航。
+- crawl4ai 是不可信外部抓取器；`open_source` 保留 SSRF 与质量检查责任。
+- `snapshot.sqlite` 保存不可变网页版本；`store.sqlite + trace/` 保存派生摘要、选择理由、Claim 和答案。
+- 三层资料是逻辑视图：**标题**来自搜索/页面 metadata，**描述**来自 cheap 摘要，**原文**来自快照。描述不覆盖原文，也不升级为证据。
 
-## 5. 受控工作流（`poc/run.py`）
-
-一次问答是一个 `run`，走固定的单趟线性环路 `run_once(question, strong_cfg)`。当前为单趟（未迭代），迭代循环见 §9。
+## 5. N 轮探索与最终作答
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor U as 用户
-    participant R as run.py 环路
+    participant R as run.py
     participant S as strong 模型
-    participant C as cheap 模型
-    participant SE as Bing（ddgs）
-    participant OS as open_source 含守卫
-    participant CR as crawl4ai 抓取服务
-    participant SNAP as 快照 DB snapshot.sqlite
-    participant AUD as 审计存档 store.sqlite + trace/
+    participant B as Bing
+    participant O as open_source
+    participant C as crawl4ai
+    participant P as snapshot.sqlite
+    participant W as cheap 模型
+    participant A as store.sqlite + trace
 
     U->>R: 问题
-    R->>AUD: 记 question
-    R->>S: 生成搜索词（≤3）
-    S-->>R: 搜索词
-    R->>SE: search_candidates(query, k=5)
-    SE-->>R: 候选（仅导航）
-    R->>AUD: 记 candidates
-    R->>S: 候选清单（title+snippet）
-    S-->>R: 选中的 candidate_id（≤4）
-    R->>R: 校验 candidate_id 属本 run
-    R->>OS: open_source(candidate_id)
-    OS->>OS: SSRF 守卫校验 URL
-    OS->>CR: 抓取
-    CR-->>OS: 页面正文
-    OS->>OS: 重定向落点复检
-    OS->>SNAP: writer.save() 写快照
-    SNAP-->>OS: source_ref + content_hash
-    OS-->>R: source_ref + content_hash
-    R->>AUD: 记 opened / open_skip
-    R->>SNAP: reader.get(source_ref)
-    SNAP-->>R: 快照正文
-    R->>C: 快照正文，逐字取证
-    C-->>R: 逐字引文候选
-    R->>R: 校验 hash 匹配 + 引文逐字命中
-    R->>AUD: 记 verified evidence
-    R->>S: 已验证证据 → Claim + 带引用答案
-    S-->>R: answer + claims[evidence_ids]
-    R->>R: 校验每条 Claim 指向已验证 Evidence
-    R->>AUD: 记 claim + answer
-    R-->>U: 带引用答案（或据实拒答）
+    R->>A: 记 question
+    loop 固定 N 轮，默认 N=3
+        R->>P: reader 读取本 run 既有原文
+        P-->>R: 标题 + 原文 + source_ref
+        R->>S: 用户问题 + 既有原文
+        S-->>R: 3 个新搜索词 JSON
+        R->>R: 格式、数量、去重、预算校验
+        loop 每个搜索词
+            R->>B: 取第一页，约 10 条
+            B-->>R: title + snippet + URL + rank
+        end
+        R->>A: 记 queries + candidates
+        loop 全部去重候选，无模型预选
+            R->>O: open_source(candidate_id)
+            O->>O: 抓取前 SSRF 校验
+            O->>C: 结构化抓取
+            C-->>O: metadata + markdown + status
+            O->>O: 重定向复检 + 内容质量检查
+            alt 抓取有效
+                O->>P: writer.save 不可变快照
+                P-->>R: source_ref + content_hash
+                R->>A: 记 opened
+            else 抓取失败或正文无效
+                O-->>R: open_skip + reason
+                R->>A: 记 open_skip
+            end
+        end
+    end
+    loop 每份成功快照
+        R->>P: reader.get(source_ref)
+        P-->>R: title + 原文
+        R->>W: 针对用户问题生成页面摘要
+        W-->>R: description JSON
+        R->>A: 记 source_summary
+    end
+    R->>S: 全部 title + description + source_ref
+    S-->>R: 相关 source_ref + 选择理由
+    R->>R: 校验 source_ref 归属与原文预算
+    R->>P: 读取选中原文
+    P-->>R: 不可变原文 + content_hash
+    R->>S: 用户问题 + 选中原文
+    S-->>R: answer + claims[source_refs]
+    R->>R: 校验每条 Claim 引用已读原文
+    R->>A: 记选择、Claim、答案
+    R-->>U: 带来源答案或据实拒答
 ```
 
-步骤要点：
+### 5.1 每轮探索
 
-1. **生成搜索词**（strong）：输出 JSON 数组，最多 `MAX_QUERIES = 3` 个，覆盖问题的关键事实点。
-2. **搜索取候选**：每个词调 `search_candidates(k=MAX_CANDIDATES=5)`，候选按 `candidate_id` 去重汇总。
-3. **选候选**（strong）：从候选清单里选最可能含权威依据的，最多 `MAX_OPEN = 4` 个，只能从给定 id 里选。
-4. **存档快照**：逐个 `open_source`。**打不开就跳过**（`open_skip`，记原因），继续下一个——这是网页架构的正常路径。
-5. **逐字取证**（cheap）：对每份快照正文，只摘"能回答问题的、正文里连续原样出现的"引文片段，不改写、不拼接、不翻译。
-6. **形成 Claim + 带引用答案**（strong）：只依据已验证证据作答，每条事实句必须挂至少一个 `evidence_id`。
+1. **生成查询**（strong）：第 1 轮输入用户问题；第 2 轮起输入用户问题和目前已归档的全部原文。输出恰好 3 个查询词；应寻找新事实面，避免重复旧词。
+2. **搜索第一页**：每词取 Bing 前 10 条，记录排名，跨词、跨轮按规范化 URL 去重。
+3. **全量抓取**：所有新候选均尝试 `open_source`；无模型候选选择。失败即记录并跳过。
+4. **反馈深化**：下一轮 strong 从已读原文中识别新主体、术语、时间线、冲突点和证据缺口，据此生成新词。
+5. **固定收敛**：默认完整执行 3 轮；若达到 800k 输入预算、300 份快照或没有任何新 URL，程序提前结束探索并进入汇总。
 
-三处据实拒答（不臆测）：搜索无候选、所有候选都存档失败、无任何逐字命中的证据。任一发生就明确说明无法作答，而不是编。
+### 5.2 三层资料
 
-## 6. 四道程序校验
+N 轮结束后，为每份快照构造：
 
-质量不靠模型自觉，靠程序在关键节点卡死。全部在 `run.py` 里执行：
+```json
+{
+  "source_ref": "source:web/…",
+  "title": "页面标题",
+  "description": "cheap 模型针对用户问题生成的导航摘要",
+  "original": "snapshot.sqlite 中的不可变正文"
+}
+```
 
-1. **候选归属**：`open_source` 只接受本 run `search_candidates` 产生过的 `candidate_id`，杜绝模型自造 URL。
-2. **快照哈希匹配**：取证时校验 `reader.get()` 读回正文的 `content_hash` 与存档时一致，确保读的就是当初存的那份。
-3. **引文逐字命中**：`quote in text`——引文必须是快照正文里连续原样出现的片段，否则判不通过。
-4. **Claim 有据**：每条 Claim 的 `evidence_ids` 必须都指向已通过前三关的 Evidence，否则该 Claim 不成立。
+三层用途严格分离：
 
-四道全过的事实句才进最终答案；证据不足宁可拒答。
+- `title`：粗定位。
+- `description`：帮助 strong 在大量页面中筛选；可能漂移，不作证据。
+- `original`：最终回答的唯一事实来源。
+
+摘要不修改快照正文，作为派生记录经 `store.log_source_summary()` 写审计 DB；记录 `source_ref`、模型、prompt 版本和输入 `content_hash`。
+
+### 5.3 最终选择与作答
+
+1. strong 一次读入全部 `title + description + source_ref`，返回相关 `source_ref` 和逐项选择理由。
+2. `run.py` 校验 source_ref 属本 run，随后从 snapshot reader 读取这些原文。
+3. strong 读取选中原文后回答；每条事实 Claim 必须列出一个或多个 `source_ref`。
+4. 程序只接受引用已实际送入最终调用、且哈希匹配的 source_ref。
+
+默认 `MAX_FINAL_SOURCES = 100`，最终原文输入仍受 800k token 总预算约束。选择上限刻意偏高，以降低漏选；若标题和摘要目录本身超过预算，先停止继续探索，不在终局静默丢页。
+
+## 6. 程序校验
+
+质量不能只靠模型自觉，`run.py` 至少执行六道校验：
+
+1. **查询输出**：JSON schema 正确、每轮至多 3 词、长度有界、轮内和历史去重。
+2. **候选归属**：`open_source` 只接收本 run Bing 返回的 `candidate_id`。
+3. **抓取有效**：HTTP/crawl 状态、最终 URL、正文非空、最小正文长度和结构化字段通过检查。
+4. **快照一致**：每次 reader 读出的 `content_hash` 与存档记录一致。
+5. **选择归属**：strong 选择的每个 source_ref 必须属于本 run，并把选择理由落 trace。
+6. **Claim 有源**：每条 Claim 只能引用已送入最终 strong 调用的原文 source_ref。
+
+不再做 `quote in text` 的“逐字取证”校验。它只能证明字符串存在，不能证明引文足以支持 Claim；新流程把弱模型摘要降为导航材料，让 strong 对实际原文负责。代价是 Claim 与原文之间的语义蕴含仍依赖 strong，程序只能验证“读过并引用了哪份原文”，不能机械证明结论正确。
+
+以下情况据实拒答：搜索无结果、所有页面都抓取失败、最终没有可用原文、或 strong 判断原文不足以回答。
 
 ## 7. 模型分工
 
-两档模型，各司其职（DeepSeek v4，经 OpenAI 兼容接口调用）：
+- **strong**：每轮分析问题与既有原文、生成 3 个新查询；N 轮后阅读标题和摘要目录、选择原文；最终阅读原文并回答。假设 1M token 上下文，单次输入预算 800k。
+- **cheap**：仅在 N 轮结束后逐页生成与问题相关的简短描述。摘要只导航，不允许成为 Claim 来源。
 
-- **strong**（规划与综合）：生成搜索词、选候选、写 Claim 和带引用答案。有 4 个待对比配置：`{flash, pro} × {思考, 非思考}`，默认 `flash-nothink`。同一 model id 靠 `extra_body.thinking` 切思考模式；非思考模式设 `temperature = 0` 求可复现。
-- **cheap**（逐字取证）：只在授权快照里摘原文引文。这是机械活，思考无增益且更贵，固定 `deepseek-v4-flash` 非思考。
+模型调用无状态；每次输入由 `run.py` 从问题、快照与审计对象重建。模型返回结构化 JSON，不持有控制流。
 
-模型全程无状态，每次调用的输入都由持久对象重建；模型只产结构化候选，不碰控制流。
+### 三个已知模型风险
+
+1. **查询偏航**：后续轮可能沿错误方向继续搜索。缓解：每次都重放原始问题，要求输出“新查询覆盖的证据缺口”，并记录 query rationale。
+2. **摘要漂移或漏点**：会影响终局选页召回。缓解：摘要明确标注“仅导航”，选择上限偏高；最终答案禁用摘要作证据。
+3. **原文选择黑箱**：strong 可能漏选关键页面。缓解：返回 source_ref、选择理由和相关性等级并完整审计；允许选多，不以压缩快照为目标。此风险无法被程序完全消除。
 
 ## 8. 存储与审计
 
-两层持久化，各经专属接口写入，职责分开：
+- **快照 DB** `snapshot.sqlite`：经 `snapshot.py` 写入标题、URL、原文、哈希、抓取凭证和时间。正文不可变；`server.py` 只持 writer，`run.py` 只持 reader。
+- **审计 DB** `store.sqlite`：经 `store.py` 记录 run、round、query、candidate、open/open_skip、source_summary、source_selection、claim、answer。run.py 不导入 `sqlite3`。
+- **流水** `trace/<run_id>.jsonl`：记录每一步结构化输入输出和预算变化，供回放与问题定位。
 
-- **快照 DB** `snapshot.sqlite`（经 `snapshot.py` 接口）：`open_source` 持 `make_writer()` 注入的 `writer` 对象，调 `writer.save()` 写入；`run.py` 持 `make_reader()` 注入的 `reader` 对象，调 `reader.get(source_ref)` 只读取出正文。两种能力对象互不包含对方方法，误用在代码审查时可见。以 `snap_id` 为唯一键 upsert，内容不可变，取证唯一依据。
-- **审计 DB** `store.sqlite`（经 `store.py` 接口）：`run.py` 只能调有界函数——`log_run / log_evidence / log_claim / log_answer`，不直接执行 SQL，不能读表、不能删。接口内部做参数化查询、字段校验、事务封装。三表 `run / evidence / claim`。
-- **流水** `trace/<run_id>.jsonl`：逐步流水（question、queries、candidates、picked、opened/open_skip、evidence_check、claim、answer、abort），供事后回放与审计。
+`store.py` 与 `snapshot.py` 内部使用参数化 SQL、字段校验和事务；上层不直接执行 SQL。密钥与正文不写 trace，正文只以 `source_ref/content_hash` 引用。
 
-接口层约束：`run.py` 不导入 `sqlite3`，`server.py` 不导入 `sqlite3`；DB 连接由各自接口层持有，上层只见函数调用。Evidence、Claim、原文都以 `source_ref` / `content_hash` 引用，不把正文复制进运行态。
+## 9. 实现状态与迁移
 
-## 9. 迭代循环（规划中，未落地）
+本文描述目标态。当前 PoC 仍是单轮流程，并含“strong 先选候选、cheap 逐字取证、程序校验逐字引文”的旧实现。迁移按最短路径进行：
 
-结构化索引库靠"树的深度"深入，一层查不够就往下钻。网页没有可下降的层级，对应手段是**迭代查询**：用上一轮已验证的证据，反馈生成下一轮更精准的搜索词，固定轮数上限收敛（初步定 3 轮）。当前 PoC 是单趟线性、尚未实现迭代，这是 Web Search 相对索引库最需要专门解决的点，留待后续设计与验证。
+1. 把单轮控制改为固定 N 轮，后续轮输入已有快照原文。
+2. `search_candidates` 默认每词取 10 条；删除 strong 候选选择和 `MAX_OPEN = 4`。
+3. 所有去重候选直接进入 `open_source`；补 crawl4ai 结构化字段存档与质量检查。
+4. 删除 cheap 逐字取证；改为 N 轮后逐页摘要，并保存派生摘要审计记录。
+5. 新增“目录选择原文”和“基于所选原文作答”两次 strong 调用。
+6. 删除引文 substring 校验，改为 source_ref 归属、哈希和 Claim 引用范围校验。
 
-## 10. 安全边界
+## 10. 安全与资源边界
 
-- **SSRF 守卫**：抓取前校验 URL，抓取后对重定向落点复检，拦内网/环回/非 http(s)/越界跳转。
-- **内容不可信**：网页正文一律当数据，不执行其中的任何指令（防提示注入）。
-- **有界资源**：搜索词 ≤3、每词候选 ≤5、全 run 抓取 ≤4、单页正文 ≤4MB，压住成本与被滥用面。
-- **凭据隔离**：crawl4ai 地址与 token 走环境变量（`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN`），不入库、不入仓。
+- **SSRF**：请求前及重定向后检查；仅允许公网 http(s)。
+- **提示注入**：网页正文、标题、snippet、摘要均是不可信数据；模型系统指令明确禁止执行页面内指令。
+- **抓取边界**：默认 3 轮 × 3 词 × 每词第一页 10 条；URL 去重；高位上限 300 份来源。
+- **上下文边界**：按 1M 模型窗口设计，单次输入最多 800k token；达到预算即停止扩展，不静默截掉终局目录。
+- **页面边界**：单页存档最多 4MB；超限明确标记截断，不能伪装成完整原文。
+- **凭据隔离**：`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN` 走环境变量，不入库、不入仓。
 
 ## 11. 边界与局限
 
-- crawl4ai 是唯一抓取后端，登录墙/付费墙类资源仍可能爬不动，按弃取处理，遇到再逐步调整。
-- 搜索后端 Bing 免费额度有限流，靠退避缓解，非彻底消除。
-- 迭代循环未实现，深度不足的问题当前靠单趟多候选近似。
-- SSRF 守卫与本地 fake-ip 代理模式冲突（会把公网域名解析到 `198.18.x.x` 而被误拦），验证与跑测需关闭该类代理。
+- crawl4ai 不能保证抓到登录墙、付费墙、强反爬、滚动加载或特殊媒体内容；当前策略是记录失败并依靠同轮其他结果，而非假装成功。
+- crawl4ai 的 `success=true` 不等于正文正确；结构化字段、正文长度和 raw/fit 对照只能发现部分异常，不能证明语义完整。
+- Bing 第一页优先级提高了平均质量，但不保证权威、无偏或覆盖全部观点。
+- cheap 摘要可能漂移或遗漏；因其只导航，风险主要是漏选页面，而不是直接污染事实答案。
+- strong 的查询规划、页面选择和 Claim 推理仍是模型判断，审计能使黑箱可见，不能使其成为形式证明。
+- 1M 是目标模型假设；换用更小上下文模型时，必须重新降低轮数、每页数量或引入可验证的分层压缩，不可静默裁剪。
+- SSRF 守卫与本地 fake-ip 代理模式冲突；验证与跑测需关闭该代理或提供可信解析通道。
 
 ***
 
-`ponytail:` 本文只描述网页这一层的取证链，贴合当前单趟 PoC；迭代循环（§9）与非 crawl4ai 抓取后端属未落地设计，落地时补。与结构化索引库（`architecture.md`）各自独立，不共用抽象。
+`ponytail:` 暂只保留 crawl4ai 单抓取后端与固定 N 轮；多后端降级、动态停止和摘要交叉校验，待真实失败率或上下文成本证明必要时再加。

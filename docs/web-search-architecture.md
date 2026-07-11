@@ -93,7 +93,7 @@ architecture-beta
     group STORE(database)[Storage Layer]
     group EXT(cloud)[External]
 
-    service R(server)[run py] in APP
+    service RUN(server)[run py] in APP
 
     service SC(internet)[search candidates] in TOOL
     service OS(server)[open source SSRF Guard] in TOOL
@@ -103,26 +103,26 @@ architecture-beta
 
     service SNAPDB(database)[snapshot sqlite] in STORE
     service AUDITDB(database)[store sqlite] in STORE
-    service TR(disk)[trace dir] in STORE
+    service TRDIR(disk)[trace dir] in STORE
 
     service SE(internet)[Bing Search] in EXT
     service CR(server)[crawl4ai] in EXT
-    service SM(cloud)[Strong Model] in EXT
-    service CM(cloud)[Cheap Model] in EXT
+    service SMOL(cloud)[Strong Model] in EXT
+    service CMOL(cloud)[Cheap Model] in EXT
 
-    R:R --> L:SC
-    R:R --> L:OS
-    R:B --> T:STP
-    R:B --> T:SNP
-    R:T --> B:SM
-    R:T --> B:CM
+    RUN:R --> L:SC
+    RUN:R --> L:OS
+    RUN:B --> T:STP
+    RUN:B --> T:SNP
+    RUN:T --> B:SMOL
+    RUN:T --> B:CMOL
 
     SC:R --> L:SE
     OS:R --> L:CR
     OS:B --> T:SNP
 
     STP:B --> T:AUDITDB
-    STP:B --> T:TR
+    STP:B --> T:TRDIR
     SNP:B --> T:SNAPDB
 ```
 

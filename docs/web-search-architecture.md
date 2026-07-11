@@ -89,14 +89,14 @@ graph LR
 
     subgraph 本地进程
         R[run.py 环路]
-        subgraph server.py 工具函数
+        subgraph "server.py 工具函数"
             SC[search_candidates]
             OS["open_source\n（含 SSRF 守卫）"]
         end
         ST["store.py\n接口层"]
         SN["snapshot.py\n接口层"]
-        SNW["snapshot.writer\n(make_writer → 注入 open_source)"]
-        SNR["snapshot.reader\n(make_reader → 注入 run.py)"]
+        SNW["snapshot.writer\n注入 open_source"]
+        SNR["snapshot.reader\n注入 run.py"]
     end
 
     subgraph 外部服务

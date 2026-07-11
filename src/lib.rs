@@ -8,3 +8,14 @@
 //!
 //! The crate is split lib + bin so the three pure functions (`plan_queries`,
 //! `select_sources`, `synthesize_answer`) stay fixture-testable without a runtime.
+
+pub mod error;
+pub mod types;
+
+// Flat public surface: downstream phases import from the crate root, not deep
+// module paths. The frozen P1 contract is exactly what's re-exported here.
+pub use error::{ErrorClass, Result, SearchError};
+pub use types::{
+    content_hash, search_result_id, snapshot_id, snapshot_ref, Answer, Claim, CrawlMeta, Excerpt,
+    Query, SearchResult, Snapshot, SnapshotRef,
+};

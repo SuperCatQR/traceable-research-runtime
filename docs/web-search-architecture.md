@@ -84,48 +84,48 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 ## 4. 系统架构总览
 
 ```mermaid
-graph LR
+flowchart LR
     U([用户])
 
-    subgraph 本地进程
-        R[run.py 环路]
-        subgraph "server.py 工具函数"
+    subgraph P["本地进程"]
+        R["run.py 环路"]
+        subgraph SRV["server.py 工具函数"]
             SC[search_candidates]
-            OS["open_source\n（含 SSRF 守卫）"]
+            OS["open_source<br/>含 SSRF 守卫"]
         end
-        ST["store.py\n接口层"]
-        SN["snapshot.py\n接口层"]
-        SNW["snapshot.writer\n注入 open_source"]
-        SNR["snapshot.reader\n注入 run.py"]
+        ST["store.py<br/>接口层"]
+        SN["snapshot.py<br/>接口层"]
+        SNW["snapshot.writer<br/>注入 open_source"]
+        SNR["snapshot.reader<br/>注入 run.py"]
     end
 
-    subgraph 外部服务
-        SE["Bing\n（ddgs）"]
-        CR["crawl4ai\n（独立部署）"]
-        S["strong 模型\nDeepSeek v4"]
-        C["cheap 模型\nDeepSeek v4 flash"]
+    subgraph EXT["外部服务"]
+        SE["Bing<br/>ddgs"]
+        CR["crawl4ai<br/>独立部署"]
+        S["strong 模型<br/>DeepSeek v4"]
+        C["cheap 模型<br/>DeepSeek v4 flash"]
     end
 
-    subgraph 持久化
-        SNAPDB[("snapshot.sqlite\n快照 DB")]
-        DB[("store.sqlite\n审计 DB")]
-        TR[("trace/\n审计流水")]
+    subgraph DB_LAYER["持久化"]
+        SNAPDB[("snapshot.sqlite<br/>快照 DB")]
+        AUDITDB[("store.sqlite<br/>审计 DB")]
+        TR[("trace/<br/>审计流水")]
     end
 
     U -->|问题| R
-    R -->|生成搜索词 / Claim + 答案| S
+    R -->|生成搜索词| S
     R -->|逐字取证| C
     R --> SC
     SC -->|backend=bing| SE
     R --> OS
     OS -->|守卫通过后抓取| CR
-    OS -->|writer.save()| SNW
+    OS -->|writer.save| SNW
     SNW -->|upsert| SN
-    SN -->|upsert / query| SNAPDB
-    R -->|reader.get()| SNR
-    SNR -->|按 source_ref 只读| SN
-    R -->|写运行状态 / Evidence / Claim| ST
-    ST -->|参数化写入| DB
+    SN -->|upsert-query| SNAPDB
+    R -->|reader.get| SNR
+    SNR -->|source_ref 只读| SN
+    R -->|写 Evidence-Claim| ST
+    ST -->|参数化写入| AUDITDB
     R -->|写逐步流水| TR
     R -->|带引用答案| U
 ```

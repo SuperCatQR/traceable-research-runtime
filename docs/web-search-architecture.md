@@ -150,6 +150,7 @@ sequenceDiagram
     participant S as strong 模型
     participant C as cheap 模型
     participant SE as Bing（ddgs）
+    participant OS as open_source 含守卫
     participant CR as crawl4ai 抓取服务
     participant SNAP as 快照 DB snapshot.sqlite
     participant AUD as 审计存档 store.sqlite + trace/
@@ -164,11 +165,18 @@ sequenceDiagram
     R->>S: 候选清单（title+snippet）
     S-->>R: 选中的 candidate_id（≤4）
     R->>R: 校验 candidate_id 属本 run
-    R->>CR: open_source（守卫→抓取→重定向复检）
-    CR-->>R: 快照 source_ref + content_hash
-    R->>SNAP: 写快照
+    R->>OS: open_source(candidate_id)
+    OS->>OS: SSRF 守卫校验 URL
+    OS->>CR: 抓取
+    CR-->>OS: 页面正文
+    OS->>OS: 重定向落点复检
+    OS->>SNAP: writer.save() 写快照
+    SNAP-->>OS: source_ref + content_hash
+    OS-->>R: source_ref + content_hash
     R->>AUD: 记 opened / open_skip
-    R->>C: reader.get() 正文，逐字取证
+    R->>SNAP: reader.get(source_ref)
+    SNAP-->>R: 快照正文
+    R->>C: 快照正文，逐字取证
     C-->>R: 逐字引文候选
     R->>R: 校验 hash 匹配 + 引文逐字命中
     R->>AUD: 记 verified evidence

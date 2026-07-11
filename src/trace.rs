@@ -10,9 +10,9 @@ use std::{
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Claim, ErrorClass, Result, SearchError, SnapshotRef};
+use crate::{Claim, ErrorClass, PipelineStage, Result, SearchError, SnapshotRef};
 
-pub const TRACE_SCHEMA_VERSION: u32 = 1;
+pub const TRACE_SCHEMA_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TracePolicy {
@@ -32,11 +32,10 @@ pub struct RunHeader {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceSelection {
     pub snapshot_ref: SnapshotRef,
-    pub relevance: String,
     pub reason: String,
 }
 
-/// Stable v1 trace contract. New fields/variants may be appended; old ones stay.
+/// Stable v2 trace contract. New fields/variants may be appended; old ones stay.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
@@ -86,6 +85,11 @@ pub enum TraceEvent {
     Answer {
         answer: String,
         claims: Vec<Claim>,
+    },
+    RunFailed {
+        error_class: ErrorClass,
+        stage: PipelineStage,
+        message: String,
     },
 }
 
@@ -212,6 +216,70 @@ mod tests {
         assert_eq!(lines[1]["type"], "query");
         assert_eq!(lines[2]["type"], "archive_skip");
         assert_eq!(lines[2]["error_class"], "external");
+    }
+
+    #[test]
+    fn snapshot_selection_trace_uses_exactly_two_fields() {
+        let event = TraceEvent::SnapshotSelection {
+            selected: vec![SourceSelection {
+                snapshot_ref: SnapshotRef("snapshot:web/own".into()),
+                reason: "direct evidence".into(),
+            }],
+        };
+        assert_eq!(
+            serde_json::to_value(event).unwrap(),
+            serde_json::json!({
+                "type": "snapshot_selection",
+                "selected": [{
+                    "snapshot_ref": "snapshot:web/own",
+                    "reason": "direct evidence"
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn v1_jsonl_events_remain_readable() {
+        let fixture = concat!(
+            r#"{"type":"run_header","schema_version":1,"run_id":"legacy","question":"q","started_at":"2026-07-11T10:00:00Z","policy":{"rounds":3,"input_budget":800000,"max_snapshots":300}}"#,
+            "\n",
+            r#"{"type":"snapshot_selection","selected":[{"snapshot_ref":"snapshot:web/legacy","reason":"evidence","relevance":"high"}]}"#,
+        );
+
+        let events = fixture
+            .lines()
+            .map(serde_json::from_str::<TraceEvent>)
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .unwrap();
+
+        assert_eq!(events.len(), 2);
+        assert!(matches!(
+            &events[0],
+            TraceEvent::RunHeader {
+                schema_version: 1,
+                ..
+            }
+        ));
+        assert!(matches!(&events[1], TraceEvent::SnapshotSelection { .. }));
+    }
+
+    #[test]
+    fn failed_run_has_a_structured_terminal_event_contract() {
+        let raw = r#"{"type":"run_failed","stage":"synthesis","error_class":"external","message":"invalid model output"}"#;
+        assert!(serde_json::from_str::<TraceEvent>(raw).is_ok());
+    }
+
+    #[test]
+    fn successful_run_has_no_failed_terminal_event() {
+        let mut writer = TraceWriter::new(Vec::new(), header("r-success")).unwrap();
+        writer
+            .append(&TraceEvent::Answer {
+                answer: "grounded".into(),
+                claims: Vec::new(),
+            })
+            .unwrap();
+        let trace = String::from_utf8(writer.into_inner()).unwrap();
+        assert!(!trace.contains("\"type\":\"run_failed\""));
     }
 
     #[test]

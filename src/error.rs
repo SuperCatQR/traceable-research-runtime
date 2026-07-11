@@ -22,12 +22,24 @@ pub enum ErrorClass {
     Internal,
 }
 
+/// Fatal boundary at which a pipeline error occurred.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PipelineStage {
+    Setup,
+    Planning,
+    Search,
+    Archive,
+    Selection,
+    Synthesis,
+    Trace,
+}
+
 /// Domain errors raised while researching a question.
 ///
-/// Startup and config failures stay in `anyhow` at the binary edge; this enum
-/// is only the research-pipeline domain. Every variant maps to a specific
-/// program validation (§6) or failure mode (§8.1), and `error_class` pins its
-/// attribution.
+/// Binary environment loading stays in `anyhow`; runtime setup and pipeline
+/// failures retain this typed form. Every variant maps to a specific program
+/// validation (§6) or failure mode (§8.1), and `error_class` pins its attribution.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
     /// Bing search itself failed: network, scrape parse, or an empty result
@@ -67,6 +79,10 @@ pub enum SearchError {
     #[error("no usable source to answer from")]
     NoUsableSource,
 
+    /// Runtime construction or configuration failed before the pipeline began.
+    #[error("setup failed: {message}")]
+    Setup { message: String },
+
     /// A snapshot read back from storage no longer hashes to its recorded
     /// `content_hash` (§6 validation 4). Our own store corrupted the body, so
     /// this is internal — not a dependency's fault.
@@ -95,9 +111,46 @@ pub enum SearchError {
     // appears later (e.g. reading a local fixture), split this variant then.
     #[error("trace write failed: {0}")]
     Trace(#[from] std::io::Error),
+
+    /// A fatal error annotated at its orchestration boundary.
+    #[error("{source}")]
+    Staged {
+        stage: PipelineStage,
+        #[source]
+        source: Box<SearchError>,
+    },
+
+    /// Recording `run_failed` itself failed. Both failures remain inspectable.
+    #[error("failed to record pipeline error ({original}): {trace}")]
+    FailureTrace {
+        original: Box<SearchError>,
+        trace: Box<SearchError>,
+    },
 }
 
 impl SearchError {
+    /// Attach the first (most specific) fatal pipeline boundary.
+    #[must_use]
+    pub fn at(self, stage: PipelineStage) -> Self {
+        if matches!(self, Self::Staged { .. } | Self::FailureTrace { .. }) {
+            self
+        } else {
+            Self::Staged {
+                stage,
+                source: Box::new(self),
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn stage(&self) -> Option<PipelineStage> {
+        match self {
+            Self::Staged { stage, .. } => Some(*stage),
+            Self::FailureTrace { .. } | Self::Trace(_) => Some(PipelineStage::Trace),
+            _ => None,
+        }
+    }
+
     /// Runtime attribution bucket for this error (§8.1). Exhaustive match, so
     /// any future variant forces an explicit classification here.
     #[must_use]
@@ -110,10 +163,13 @@ impl SearchError {
             | Self::ModelOutput { .. }
             | Self::RefNotInRun { .. }
             | Self::NoUsableSource => ErrorClass::External,
-            Self::HashMismatch { .. }
+            Self::Setup { .. }
+            | Self::HashMismatch { .. }
             | Self::InvalidSnapshot(_)
             | Self::Storage(_)
-            | Self::Trace(_) => ErrorClass::Internal,
+            | Self::Trace(_)
+            | Self::FailureTrace { .. } => ErrorClass::Internal,
+            Self::Staged { source, .. } => source.error_class(),
         }
     }
 }

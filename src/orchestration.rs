@@ -1,13 +1,13 @@
 //! Fixed-round Explore orchestration and pure strong-model output validation.
 
-use std::{collections::HashSet, future::Future, io::Write};
+use std::{collections::HashSet, future::Future, io::Write, path::Path};
 
 use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    Answer, Excerpt, Query, Result, SearchError, SearchResult, Snapshot, SnapshotReader,
-    SnapshotRef, SnapshotWriter, SourceSelection, TraceEvent, TraceWriter,
+    Answer, Excerpt, PipelineStage, Query, Result, SearchError, SearchResult, Snapshot,
+    SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection, TraceEvent, TraceWriter,
 };
 
 pub const EXPLORE_ROUNDS: u32 = 3;
@@ -90,6 +90,39 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
         }
     }
 
+    /// Runs the complete pipeline and records exactly one terminal failure event.
+    pub async fn run(&mut self, snapshot_path: impl AsRef<Path>) -> Result<Answer> {
+        let result = async {
+            self.explore()
+                .await
+                .map_err(|error| error.at(PipelineStage::Planning))?;
+            let reader = SnapshotReader::open(snapshot_path)
+                .map_err(|error| error.at(PipelineStage::Setup))?;
+            self.synthesize_answer(reader)
+                .await
+                .map_err(|error| error.at(PipelineStage::Synthesis))
+        }
+        .await;
+
+        match result {
+            Ok(answer) => Ok(answer),
+            Err(error) => {
+                let failure = TraceEvent::RunFailed {
+                    error_class: error.error_class(),
+                    stage: error.stage().unwrap_or(PipelineStage::Setup),
+                    message: error.to_string(),
+                };
+                match self.trace.append(&failure) {
+                    Ok(()) => Err(error),
+                    Err(trace) => Err(SearchError::FailureTrace {
+                        original: Box::new(error),
+                        trace: Box::new(trace.at(PipelineStage::Trace)),
+                    }),
+                }
+            }
+        }
+    }
+
     pub async fn explore(&mut self) -> Result<&ResearchState> {
         for round in 1..=EXPLORE_ROUNDS {
             self.state.round = round;
@@ -102,39 +135,53 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             let raw = self
                 .backend
                 .plan(&self.question, &self.archived, &self.previous_queries)
-                .await?;
-            let queries = plan_queries(&raw, &self.previous_queries)?;
+                .await
+                .map_err(|error| error.at(PipelineStage::Planning))?;
+            let queries = plan_queries(&raw, &self.previous_queries)
+                .map_err(|error| error.at(PipelineStage::Planning))?;
             for query in &queries {
-                self.trace.append(&TraceEvent::Query {
-                    round,
-                    query: query.query.clone(),
-                    gap: query.gap.clone(),
-                })?;
+                self.trace
+                    .append(&TraceEvent::Query {
+                        round,
+                        query: query.query.clone(),
+                        gap: query.gap.clone(),
+                    })
+                    .map_err(|error| error.at(PipelineStage::Trace))?;
             }
             self.previous_queries
                 .extend(queries.iter().map(|query| query.query.clone()));
 
             let mut new_results = Vec::new();
             for query in queries {
-                for result in self.backend.search(&query.query).await? {
-                    self.trace.append(&TraceEvent::SearchResult {
-                        search_result_id: result.search_result_id.clone(),
-                        title: result.title.clone(),
-                        url: result.url.clone(),
-                        snippet: result.snippet.clone(),
-                        rank: result.rank,
-                    })?;
+                let results = self
+                    .backend
+                    .search(&query.query)
+                    .await
+                    .map_err(|error| error.at(PipelineStage::Search))?;
+                for result in results {
+                    self.trace
+                        .append(&TraceEvent::SearchResult {
+                            search_result_id: result.search_result_id.clone(),
+                            title: result.title.clone(),
+                            url: result.url.clone(),
+                            snippet: result.snippet.clone(),
+                            rank: result.rank,
+                        })
+                        .map_err(|error| error.at(PipelineStage::Trace))?;
                     match normalized_url(&result.url) {
                         Ok(url) => {
                             if self.seen_urls.insert(url) {
                                 new_results.push(result);
                             }
                         }
-                        Err(error) => self.trace.append(&TraceEvent::ArchiveSkip {
-                            search_result_id: result.search_result_id,
-                            reason: error.to_string(),
-                            error_class: error.error_class(),
-                        })?,
+                        Err(error) => self
+                            .trace
+                            .append(&TraceEvent::ArchiveSkip {
+                                search_result_id: result.search_result_id,
+                                reason: error.to_string(),
+                                error_class: error.error_class(),
+                            })
+                            .map_err(|error| error.at(PipelineStage::Trace))?,
                     }
                 }
             }
@@ -151,21 +198,28 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 }
                 match self.backend.crawl(&result.url).await {
                     Ok(snapshot) => {
-                        self.snapshots.save(&snapshot)?;
-                        self.trace.append(&TraceEvent::Archive {
-                            snapshot_ref: snapshot.snapshot_ref.clone(),
-                            content_hash: snapshot.content_hash.clone(),
-                            final_url: snapshot.crawl.final_url.clone(),
-                            char_len: snapshot.body.chars().count(),
-                        })?;
+                        self.snapshots
+                            .save(&snapshot)
+                            .map_err(|error| error.at(PipelineStage::Archive))?;
+                        self.trace
+                            .append(&TraceEvent::Archive {
+                                snapshot_ref: snapshot.snapshot_ref.clone(),
+                                content_hash: snapshot.content_hash.clone(),
+                                final_url: snapshot.crawl.final_url.clone(),
+                                char_len: snapshot.body.chars().count(),
+                            })
+                            .map_err(|error| error.at(PipelineStage::Trace))?;
                         self.archived.push(snapshot);
                         self.state.archived_snapshots = self.archived.len();
                     }
-                    Err(error) => self.trace.append(&TraceEvent::ArchiveSkip {
-                        search_result_id: result.search_result_id,
-                        reason: error.to_string(),
-                        error_class: error.error_class(),
-                    })?,
+                    Err(error) => self
+                        .trace
+                        .append(&TraceEvent::ArchiveSkip {
+                            search_result_id: result.search_result_id,
+                            reason: error.to_string(),
+                            error_class: error.error_class(),
+                        })
+                        .map_err(|error| error.at(PipelineStage::Trace))?,
                 }
             }
             if self.state.stop_reason.is_some() {
@@ -180,40 +234,53 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
 
     pub async fn synthesize_answer(&mut self, reader: SnapshotReader) -> Result<Answer> {
         if self.archived.is_empty() {
-            return Err(SearchError::NoUsableSource);
+            return Err(SearchError::NoUsableSource.at(PipelineStage::Selection));
         }
 
         let excerpts: Vec<_> = self.archived.iter().map(make_excerpt).collect();
         for excerpt in &excerpts {
-            self.trace.append(&TraceEvent::Excerpt {
-                snapshot_ref: excerpt.snapshot_ref.clone(),
-                content_hash: excerpt.content_hash.clone(),
-                title: excerpt.title.clone(),
-                excerpt: excerpt.excerpt.clone(),
-            })?;
+            self.trace
+                .append(&TraceEvent::Excerpt {
+                    snapshot_ref: excerpt.snapshot_ref.clone(),
+                    content_hash: excerpt.content_hash.clone(),
+                    title: excerpt.title.clone(),
+                    excerpt: excerpt.excerpt.clone(),
+                })
+                .map_err(|error| error.at(PipelineStage::Trace))?;
         }
 
         let run_snapshots: HashSet<_> = excerpts
             .iter()
             .map(|excerpt| excerpt.snapshot_ref.clone())
             .collect();
-        let raw = self.backend.select(&self.question, &excerpts).await?;
-        let selected = select_sources(&raw, &run_snapshots)?;
+        let raw = self
+            .backend
+            .select(&self.question, &excerpts)
+            .await
+            .map_err(|error| error.at(PipelineStage::Selection))?;
+        let selected = select_sources(&raw, &run_snapshots)
+            .map_err(|error| error.at(PipelineStage::Selection))?;
         if selected.is_empty() {
-            return Err(SearchError::NoUsableSource);
+            return Err(SearchError::NoUsableSource.at(PipelineStage::Selection));
         }
-        self.trace.append(&TraceEvent::SnapshotSelection {
-            selected: selected.clone(),
-        })?;
+        self.trace
+            .append(&TraceEvent::SnapshotSelection {
+                selected: selected.clone(),
+            })
+            .map_err(|error| error.at(PipelineStage::Trace))?;
 
         let mut evidence = Vec::with_capacity(selected.len());
         for selection in &selected {
-            let snapshot = reader.get(&selection.snapshot_ref)?.ok_or_else(|| {
-                SearchError::InvalidSnapshot(format!(
-                    "selected snapshot missing from store: {}",
-                    selection.snapshot_ref.as_str()
-                ))
-            })?;
+            let snapshot = reader
+                .get(&selection.snapshot_ref)
+                .map_err(|error| error.at(PipelineStage::Selection))?
+                .ok_or_else(|| {
+                    SearchError::InvalidSnapshot(format!(
+                        "selected snapshot missing from store: {}",
+                        selection.snapshot_ref.as_str()
+                    ))
+                    .at(PipelineStage::Selection)
+                })?;
             let expected = excerpts
                 .iter()
                 .find(|excerpt| excerpt.snapshot_ref == selection.snapshot_ref)
@@ -223,31 +290,42 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                     reference: snapshot.snapshot_ref.0.clone(),
                     expected: expected.content_hash.clone(),
                     actual: snapshot.content_hash,
-                });
+                }
+                .at(PipelineStage::Selection));
             }
             evidence.push(snapshot);
         }
 
         if estimate_snapshot_tokens(&evidence) >= MAX_STRONG_INPUT_TOKENS {
-            return model_output("selected snapshot content reaches input budget");
+            return model_output("selected snapshot content reaches input budget")
+                .map_err(|error| error.at(PipelineStage::Selection));
         }
         let supplied: HashSet<_> = evidence
             .iter()
             .map(|snapshot| snapshot.snapshot_ref.clone())
             .collect();
         drop(reader);
-        let raw = self.backend.synthesize(&self.question, &evidence).await?;
-        let answer = synthesize_answer(&raw, &supplied)?;
+        let raw = self
+            .backend
+            .synthesize(&self.question, &evidence)
+            .await
+            .map_err(|error| error.at(PipelineStage::Synthesis))?;
+        let answer = synthesize_answer(&raw, &supplied)
+            .map_err(|error| error.at(PipelineStage::Synthesis))?;
         for claim in &answer.claims {
-            self.trace.append(&TraceEvent::Claim {
-                text: claim.text.clone(),
-                snapshot_refs: claim.snapshot_refs.clone(),
-            })?;
+            self.trace
+                .append(&TraceEvent::Claim {
+                    text: claim.text.clone(),
+                    snapshot_refs: claim.snapshot_refs.clone(),
+                })
+                .map_err(|error| error.at(PipelineStage::Trace))?;
         }
-        self.trace.append(&TraceEvent::Answer {
-            answer: answer.answer.clone(),
-            claims: answer.claims.clone(),
-        })?;
+        self.trace
+            .append(&TraceEvent::Answer {
+                answer: answer.answer.clone(),
+                claims: answer.claims.clone(),
+            })
+            .map_err(|error| error.at(PipelineStage::Trace))?;
         Ok(answer)
     }
 
@@ -310,7 +388,6 @@ struct SelectionOutput {
 #[serde(deny_unknown_fields)]
 struct SelectionJson {
     snapshot_ref: SnapshotRef,
-    relevance: String,
     reason: String,
 }
 
@@ -324,19 +401,20 @@ pub fn select_sources(
     }
     let mut seen = HashSet::new();
     if output.selected.iter().any(|selection| {
-        selection.relevance.trim().is_empty()
+        selection.snapshot_ref.as_str().trim().is_empty()
             || selection.reason.trim().is_empty()
             || !run_snapshots.contains(&selection.snapshot_ref)
             || !seen.insert(selection.snapshot_ref.clone())
     }) {
-        return model_output("selected snapshots must be unique and belong to this run");
+        return model_output(
+            "selected snapshots must be non-empty, unique, and belong to this run",
+        );
     }
     Ok(output
         .selected
         .into_iter()
         .map(|selection| SourceSelection {
             snapshot_ref: selection.snapshot_ref,
-            relevance: selection.relevance,
             reason: selection.reason,
         })
         .collect())
@@ -359,6 +437,7 @@ struct ClaimJson {
 pub fn synthesize_answer(raw: &str, supplied: &HashSet<SnapshotRef>) -> Result<Answer> {
     let output: AnswerJson = parse_model_json(raw)?;
     if output.answer.trim().is_empty()
+        || output.claims.is_empty()
         || output.claims.iter().any(|claim| {
             claim.text.trim().is_empty()
                 || claim.snapshot_refs.is_empty()
@@ -368,8 +447,11 @@ pub fn synthesize_answer(raw: &str, supplied: &HashSet<SnapshotRef>) -> Result<A
                     .any(|reference| !supplied.contains(reference))
         })
     {
-        return model_output("answer claims must be non-empty and cite supplied snapshots");
+        return model_output(
+            "answer, claims, claim text, and references must be non-empty and cite supplied snapshots",
+        );
     }
+
     Ok(Answer {
         answer: output.answer,
         claims: output
@@ -431,12 +513,17 @@ fn model_output<T>(message: &str) -> Result<T> {
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf, time::SystemTime};
+    use std::{
+        fs,
+        io::{self, Write},
+        path::PathBuf,
+        time::SystemTime,
+    };
 
     use chrono::Utc;
 
     use super::*;
-    use crate::{CrawlMeta, RunHeader, TracePolicy};
+    use crate::{CrawlMeta, ErrorClass, RunHeader, TracePolicy};
 
     #[derive(Default)]
     struct FixtureBackend {
@@ -445,6 +532,7 @@ mod tests {
         crawl_calls: u32,
         selected_ref: Option<SnapshotRef>,
         synthesize_calls: u32,
+        plan_error: bool,
     }
 
     impl ResearchBackend for FixtureBackend {
@@ -456,9 +544,15 @@ mod tests {
         ) -> impl Future<Output = Result<String>> {
             self.plan_calls += 1;
             let round = self.plan_calls;
-            std::future::ready(Ok(format!(
-                r#"{{"queries":[{{"query":"q{round}-0","gap":"g"}},{{"query":"q{round}-1","gap":"g"}},{{"query":"q{round}-2","gap":"g"}}]}}"#
-            )))
+            std::future::ready(if self.plan_error {
+                Err(SearchError::ModelCall {
+                    message: "fixture planning failure".into(),
+                })
+            } else {
+                Ok(format!(
+                    r#"{{"queries":[{{"query":"q{round}-0","gap":"g"}},{{"query":"q{round}-1","gap":"g"}},{{"query":"q{round}-2","gap":"g"}}]}}"#
+                ))
+            })
         }
 
         fn search(&mut self, query: &str) -> impl Future<Output = Result<Vec<SearchResult>>> {
@@ -516,7 +610,7 @@ mod tests {
                 },
                 |reference| {
                     Ok(format!(
-                        r#"{{"selected":[{{"snapshot_ref":"{}","relevance":"high","reason":"x"}}]}}"#,
+                        r#"{{"selected":[{{"snapshot_ref":"{}","reason":"x"}}]}}"#,
                         reference.as_str()
                     ))
                 },
@@ -542,6 +636,26 @@ mod tests {
                     ))
                 },
             ))
+        }
+    }
+
+    struct FailAfterHeader {
+        header_written: bool,
+    }
+
+    impl Write for FailAfterHeader {
+        fn write(&mut self, buffer: &[u8]) -> io::Result<usize> {
+            if self.header_written {
+                return Err(io::Error::other("fixture trace failure"));
+            }
+            if buffer.contains(&b'\n') {
+                self.header_written = true;
+            }
+            Ok(buffer.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
         }
     }
 
@@ -587,6 +701,102 @@ mod tests {
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
         )
+    }
+
+    #[tokio::test]
+    async fn run_records_external_selection_failure_as_the_only_terminal_event() {
+        let db = TempDb::new("run-selection-failure");
+        let mut session = session(&db);
+
+        let error = session.run(&db.0).await.unwrap_err();
+
+        assert_eq!(error.stage(), Some(PipelineStage::Selection));
+        assert_eq!(error.error_class(), ErrorClass::External);
+        let trace = String::from_utf8(session.trace.into_inner()).unwrap();
+        let events = trace
+            .lines()
+            .map(|line| serde_json::from_str::<TraceEvent>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, TraceEvent::RunFailed { .. }))
+                .count(),
+            1
+        );
+        assert!(matches!(
+            events.last(),
+            Some(TraceEvent::RunFailed {
+                error_class: ErrorClass::External,
+                stage: PipelineStage::Selection,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_records_internal_snapshot_setup_failure() {
+        let db = TempDb::new("run-setup-writer");
+        let missing = TempDb::new("run-setup-missing");
+        let mut session = session(&db);
+
+        let error = session.run(&missing.0).await.unwrap_err();
+
+        assert_eq!(error.stage(), Some(PipelineStage::Setup));
+        assert_eq!(error.error_class(), ErrorClass::Internal);
+        let trace = String::from_utf8(session.trace.into_inner()).unwrap();
+        let last = serde_json::from_str::<TraceEvent>(trace.lines().last().unwrap()).unwrap();
+        assert!(matches!(
+            last,
+            TraceEvent::RunFailed {
+                error_class: ErrorClass::Internal,
+                stage: PipelineStage::Setup,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn run_preserves_original_and_trace_failures() {
+        let db = TempDb::new("run-trace-failure");
+        let trace = TraceWriter::new(
+            FailAfterHeader {
+                header_written: false,
+            },
+            RunHeader {
+                run_id: "trace-failure".into(),
+                question: "question".into(),
+                started_at: Utc::now(),
+                policy: TracePolicy {
+                    rounds: EXPLORE_ROUNDS,
+                    input_budget: MAX_STRONG_INPUT_TOKENS as u32,
+                    max_snapshots: MAX_SNAPSHOTS as u32,
+                },
+            },
+        )
+        .unwrap();
+        let backend = FixtureBackend {
+            plan_error: true,
+            ..FixtureBackend::default()
+        };
+        let mut session = ResearchSession::new(
+            "question",
+            backend,
+            SnapshotWriter::open(&db.0).unwrap(),
+            trace,
+        );
+
+        let error = session.run(&db.0).await.unwrap_err();
+
+        match error {
+            SearchError::FailureTrace { original, trace } => {
+                assert_eq!(original.stage(), Some(PipelineStage::Planning));
+                assert_eq!(original.error_class(), ErrorClass::External);
+                assert_eq!(trace.stage(), Some(PipelineStage::Trace));
+                assert_eq!(trace.error_class(), ErrorClass::Internal);
+            }
+            other => panic!("expected both failures, got {other:?}"),
+        }
     }
 
     #[tokio::test]
@@ -646,9 +856,12 @@ mod tests {
         session.archived.push(snapshot);
         let reader = SnapshotReader::open(&db.0).unwrap();
 
+        let error = session.synthesize_answer(reader).await.unwrap_err();
+        assert_eq!(error.stage(), Some(PipelineStage::Selection));
         assert!(matches!(
-            session.synthesize_answer(reader).await,
-            Err(SearchError::ModelOutput { .. })
+            error,
+            SearchError::Staged { source, .. }
+                if matches!(*source, SearchError::ModelOutput { .. })
         ));
         assert_eq!(session.backend.synthesize_calls, 0);
     }
@@ -715,12 +928,83 @@ mod tests {
     }
 
     #[test]
+    fn prompt_shaped_two_field_selection_is_accepted() {
+        let reference = SnapshotRef("snapshot:web/own".into());
+        let run_snapshots = HashSet::from([reference.clone()]);
+        let raw = format!(
+            r#"{{"selected":[{{"snapshot_ref":"{}","reason":"direct evidence"}}]}}"#,
+            reference.as_str()
+        );
+
+        let selected = select_sources(&raw, &run_snapshots).unwrap();
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].snapshot_ref, reference);
+        assert_eq!(selected[0].reason, "direct evidence");
+    }
+
+    #[test]
+    fn legacy_three_field_selection_is_rejected() {
+        let reference = SnapshotRef("snapshot:web/own".into());
+        let run_snapshots = HashSet::from([reference.clone()]);
+        let raw = format!(
+            r#"{{"selected":[{{"snapshot_ref":"{}","relevance":"high","reason":"x"}}]}}"#,
+            reference.as_str()
+        );
+        assert!(matches!(
+            select_sources(&raw, &run_snapshots),
+            Err(SearchError::ModelOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn duplicate_and_empty_selection_refs_are_rejected() {
+        let reference = SnapshotRef("snapshot:web/own".into());
+        let duplicate = format!(
+            r#"{{"selected":[{{"snapshot_ref":"{0}","reason":"x"}},{{"snapshot_ref":"{0}","reason":"y"}}]}}"#,
+            reference.as_str()
+        );
+        assert!(matches!(
+            select_sources(&duplicate, &HashSet::from([reference])),
+            Err(SearchError::ModelOutput { .. })
+        ));
+
+        let empty = SnapshotRef(String::new());
+        assert!(matches!(
+            select_sources(
+                r#"{"selected":[{"snapshot_ref":"","reason":"x"}]}"#,
+                &HashSet::from([empty])
+            ),
+            Err(SearchError::ModelOutput { .. })
+        ));
+    }
+
+    #[test]
+    fn valid_single_claim_is_accepted() {
+        let own = SnapshotRef("snapshot:web/own".into());
+        let supplied = HashSet::from([own.clone()]);
+        let raw = format!(
+            r#"{{"answer":"supported","claims":[{{"text":"supported","snapshot_refs":["{}"]}}]}}"#,
+            own.as_str()
+        );
+        assert!(synthesize_answer(&raw, &supplied).is_ok());
+    }
+
+    #[test]
+    fn empty_claims_are_rejected() {
+        let supplied = HashSet::new();
+        assert!(matches!(
+            synthesize_answer(r#"{"answer":"unsupported","claims":[]}"#, &supplied),
+            Err(SearchError::ModelOutput { .. })
+        ));
+    }
+
+    #[test]
     fn model_output_cannot_escape_run_or_citation_set() {
         let own = SnapshotRef("snapshot:web/own".into());
         let foreign = SnapshotRef("snapshot:web/foreign".into());
         let run_snapshots = HashSet::from([own.clone()]);
         let selection = format!(
-            r#"{{"selected":[{{"snapshot_ref":"{}","relevance":"high","reason":"x"}}]}}"#,
+            r#"{{"selected":[{{"snapshot_ref":"{}","reason":"x"}}]}}"#,
             foreign.as_str()
         );
         assert!(matches!(
@@ -728,13 +1012,12 @@ mod tests {
             Err(SearchError::ModelOutput { .. })
         ));
 
-        let supplied = HashSet::from([own]);
         let answer = format!(
             r#"{{"answer":"x","claims":[{{"text":"x","snapshot_refs":["{}"]}}]}}"#,
             foreign.as_str()
         );
         assert!(matches!(
-            synthesize_answer(&answer, &supplied),
+            synthesize_answer(&answer, &HashSet::from([own])),
             Err(SearchError::ModelOutput { .. })
         ));
     }

@@ -421,7 +421,8 @@ impl StrongClient {
             })?;
         if !status.is_success() {
             return Err(SearchError::ModelCall {
-                message: format!("model returned HTTP {status}: {}", truncate(&body, 300)),
+                // Upstream bodies may echo secrets or prompts; status is diagnostic enough.
+                message: format!("model returned HTTP {status}"),
             });
         }
         let completion: ChatResponse =
@@ -441,10 +442,6 @@ impl StrongClient {
             message: format!("invalid JSON content: {error}"),
         })
     }
-}
-
-fn truncate(value: &str, max: usize) -> &str {
-    value.get(..max).unwrap_or(value)
 }
 
 #[derive(Serialize)]

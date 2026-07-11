@@ -22,7 +22,7 @@ pub mod types;
 // module paths.
 pub use adapters::{BingClient, CrawlClient, StrongClient, validate_public_url};
 pub use backend::{LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
-pub use error::{ErrorClass, Result, SearchError};
+pub use error::{ErrorClass, PipelineStage, Result, SearchError};
 pub use server::{ResearchRequest, SearchServer};
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{

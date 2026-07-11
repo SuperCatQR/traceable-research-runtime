@@ -11,10 +11,10 @@ use rmcp::{
     ErrorData as McpError, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
     model::{
-        CallToolResult, ContentBlock, GetPromptRequestParams, GetPromptResult, ListPromptsResult,
-        ListResourcesResult, PaginatedRequestParams, Prompt, PromptArgument, PromptMessage,
-        ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents, Role,
-        ServerCapabilities, ServerInfo,
+        CallToolResult, ContentBlock, ErrorCode, GetPromptRequestParams, GetPromptResult,
+        ListPromptsResult, ListResourcesResult, PaginatedRequestParams, Prompt, PromptArgument,
+        PromptMessage, ReadResourceRequestParams, ReadResourceResult, Resource, ResourceContents,
+        Role, ServerCapabilities, ServerInfo,
     },
     tool, tool_handler, tool_router,
 };
@@ -22,8 +22,8 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    BingClient, CrawlClient, LiveBackend, RunHeader, SnapshotReader, SnapshotWriter, StrongClient,
-    TracePolicy, TraceWriter,
+    BingClient, CrawlClient, ErrorClass, LiveBackend, PipelineStage, RunHeader, SearchError,
+    SnapshotWriter, StrongClient, TracePolicy, TraceWriter,
     orchestration::{EXPLORE_ROUNDS, MAX_SNAPSHOTS, MAX_STRONG_INPUT_TOKENS, ResearchSession},
 };
 
@@ -94,18 +94,37 @@ impl SearchServer {
         if question.is_empty() {
             return Err(McpError::invalid_params("question must not be empty", None));
         }
-        let answer = self
-            .run_research(question)
-            .await
-            .map_err(|error| McpError::internal_error(error.to_string(), None))?;
+        let answer = self.run_research(question).await.map_err(into_mcp_error)?;
         let content = ContentBlock::json(answer)
             .map_err(|error| McpError::internal_error(error.to_string(), None))?;
         Ok(CallToolResult::success(vec![content]))
     }
 }
 
+fn setup_error(error: impl std::fmt::Display) -> SearchError {
+    SearchError::Setup {
+        message: error.to_string(),
+    }
+}
+
+fn into_mcp_error(error: SearchError) -> McpError {
+    let code = match error.error_class() {
+        ErrorClass::External => ErrorCode(-32000),
+        ErrorClass::Internal => ErrorCode::INTERNAL_ERROR,
+    };
+    let stage = error.stage().unwrap_or(PipelineStage::Setup);
+    McpError::new(
+        code,
+        error.to_string(),
+        Some(serde_json::json!({
+            "error_class": error.error_class(),
+            "stage": stage,
+        })),
+    )
+}
+
 impl SearchServer {
-    async fn run_research(&self, question: &str) -> anyhow::Result<crate::Answer> {
+    async fn run_research(&self, question: &str) -> Result<crate::Answer, SearchError> {
         let run_id = format!(
             "{}-{}-{}",
             Utc::now().format("%Y%m%dT%H%M%S%3fZ"),
@@ -115,15 +134,17 @@ impl SearchServer {
         let store_path = self.config.data_dir.join("snapshots.sqlite");
         let trace_dir = self.config.data_dir.join("traces");
         let backend = LiveBackend::new(
-            BingClient::new()?,
-            CrawlClient::new(&self.config.crawl_base_url, self.config.crawl_token.clone())?,
+            BingClient::new().map_err(setup_error)?,
+            CrawlClient::new(&self.config.crawl_base_url, self.config.crawl_token.clone())
+                .map_err(setup_error)?,
             StrongClient::new(
                 &self.config.model_base_url,
                 self.config.model_api_key.clone(),
                 self.config.model.clone(),
-            )?,
+            )
+            .map_err(setup_error)?,
         );
-        let snapshots = SnapshotWriter::open(&store_path)?;
+        let snapshots = SnapshotWriter::open(&store_path).map_err(setup_error)?;
         let trace = TraceWriter::create(
             trace_dir,
             RunHeader {
@@ -136,11 +157,10 @@ impl SearchServer {
                     max_snapshots: MAX_SNAPSHOTS as u32,
                 },
             },
-        )?;
+        )
+        .map_err(setup_error)?;
         let mut session = ResearchSession::new(question, backend, snapshots, trace);
-        session.explore().await?;
-        let reader = SnapshotReader::open(store_path)?;
-        Ok(session.synthesize_answer(reader).await?)
+        session.run(store_path).await
     }
 }
 
@@ -219,12 +239,66 @@ impl ServerHandler for SearchServer {
 
 #[cfg(test)]
 mod tests {
-    use super::ResearchRequest;
+    use super::*;
 
     #[test]
     fn request_schema_requires_question() {
         let schema = schemars::schema_for!(ResearchRequest);
         let value = serde_json::to_value(schema).unwrap();
         assert_eq!(value["required"], serde_json::json!(["question"]));
+    }
+
+    #[test]
+    fn external_selection_error_keeps_protocol_semantics() {
+        let error = SearchError::ModelOutput {
+            message: "bad selection".into(),
+        }
+        .at(PipelineStage::Selection);
+        let value = serde_json::to_value(into_mcp_error(error)).unwrap();
+
+        assert_eq!(value["code"], -32000);
+        assert_eq!(
+            value["data"],
+            serde_json::json!({"error_class": "external", "stage": "selection"})
+        );
+    }
+
+    #[test]
+    fn internal_setup_error_keeps_protocol_semantics() {
+        let value = serde_json::to_value(into_mcp_error(SearchError::Setup {
+            message: "bad endpoint".into(),
+        }))
+        .unwrap();
+
+        assert_eq!(value["code"], -32603);
+        assert_eq!(
+            value["data"],
+            serde_json::json!({"error_class": "internal", "stage": "setup"})
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_question_remains_invalid_params() {
+        let server = SearchServer {
+            config: ServerConfig {
+                crawl_base_url: "http://localhost".into(),
+                crawl_token: String::new(),
+                model_base_url: "http://localhost".into(),
+                model_api_key: String::new(),
+                model: "test".into(),
+                data_dir: PathBuf::new(),
+            },
+            tool_router: SearchServer::tool_router(),
+        };
+        let error = server
+            .research_web(Parameters(ResearchRequest {
+                question: "  ".into(),
+            }))
+            .await
+            .unwrap_err();
+        let value = serde_json::to_value(error).unwrap();
+
+        assert_eq!(value["code"], -32602);
+        assert!(value.get("data").is_none());
     }
 }

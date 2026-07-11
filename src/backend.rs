@@ -76,3 +76,15 @@ impl ResearchBackend for LiveBackend {
         .await
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn select_prompt_names_exactly_the_required_selection_fields() {
+        assert!(SELECT_PROMPT.contains("snapshot_ref"));
+        assert!(SELECT_PROMPT.contains("reason"));
+        assert!(!SELECT_PROMPT.contains("relevance"));
+    }
+}

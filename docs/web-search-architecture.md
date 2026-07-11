@@ -435,6 +435,36 @@ N 轮结束后，为每份快照构造：
 - 1M 是目标模型假设；换用更小上下文模型时，必须重新降低轮数、每页数量或引入可验证的分层压缩，不可静默裁剪。
 - SSRF 守卫与本地 fake-ip 代理模式冲突；验证与跑测需关闭该代理或提供可信解析通道。
 
+## 12. 可维护性
+
+数据流图上箭头多，是“步骤宽”的线性流水线，不是“依赖深”的相互回调。宽度好追，深耦合才致命，而本设计把耦合压得很低。
+
+### 12.1 有利于定位问题的结构特征
+
+1. **控制流只有一个家**：`research_session.py` 独占编排；`run.py` 两端透传不变换数据；模型无状态、不改轮数、不触网、不碰 DB。流程 bug 只可能在这一个文件里。
+2. **模型调用无状态、可重放**：每次模型输入都由 session 从问题、快照与审计日志重建，无隐藏状态。复现 bug 等于用同样输入重放；模型本身不确定，但管道确定。
+3. **append-only trace 是主要调试手段**：`trace/<run_id>.jsonl` 逐行记全链（`run_header → query → search_result → archive/archive_skip → excerpt → snapshot_selection → claim → answer`）。一个 run 一个文件，打开即见当轮实况，无需插桩或复现环境。
+4. **六道校验各卡一个阶段**：校验失败即锁定阶段——schema 错对应查询步，哈希不符对应快照读取，ref 越权对应选源步。错误分类天然对应位置。
+5. **快照不可变加 content_hash**：排除“数据在脚下变了”这类最难查的 bug；损坏由校验机械发现。
+6. **单抓取后端、固定 N 轮、无并发**：从源头排除竞态与并行乱序类 heisenbug。
+
+### 12.2 定位一个 bug 的典型路径
+
+以“某问题答案漏掉关键页”为例：`grep` 该 `run_id` 的 jsonl，先看 `archive_skip` 行（抓取阶段丢的？），无 skip 再看 `snapshot_selection`（strong 没选？），选了却没进 `claim`（作答漏引？）。三跳定位到具体阶段，全程一个文件、无需重跑。
+
+### 12.3 已知风险与应对
+
+1. **编排单文件会随策略增长变胖**：Explore 与 Synthesize 现塞在一个文件，多研究路线或并发恢复后会臃肿。升级路径已在文末 `ponytail:` 记账（拆 planner/selector/synthesizer），属记账债务而非隐患。
+2. **trace 无 schema 版本、无查询工具**：单 run 调试极易，跨 run 找规律只能手工 grep。建议后续加 `schema_version` 字段与一个只读 jsonl 汇总脚本，成本低。
+3. **snapshot 全局、trace 按 run，调试需两跳**：“某快照由哪个 run 生成”要用快照时间戳与 trace 交叉查，可追但非一跳。
+4. **三个外部依赖需与自身 bug 区分**：多数线上异常其实是 crawl4ai 空壳成功、Bing 排名漂移或 strong 返回坏 JSON，分别由 `archive_skip`、校验 3、校验 1 兜住；但日志暂不自动标注“外部抖动”还是“我方 bug”，靠人读。
+
+### 12.4 运维负担
+
+小。一个进程、一个抓取后端、两份存储（`snapshot.sqlite` 与 `trace/<run_id>.jsonl`），无消息队列、worker 池或分布式状态。凭据走环境变量不入库。日常只需盯外部依赖健康度与快照磁盘增长（每 run 300 份上限已兜底）。
+
+结论：本设计为可审计牺牲了模型侧的简洁（单 strong、去掉 cheap 与逐字校验），换来的正是可维护性——trace 让黑箱可见。§12.3 四项均非结构性缺陷，是“长大了才需要”的增量项。
+
 ***
 
 `ponytail:` 编排层暂只用一个 `research_session.py`，不拆 planner/selector/synthesizer；待并发恢复、多研究策略或独立测试边界确有需要时再拆。抓取仍只保留 crawl4ai 单后端与固定 N 轮。

@@ -65,7 +65,7 @@ Web Search 的原文获取收敛成三个纯函数，实现在 `poc/search_mcp/s
 
 1. 取 markdown 正文，截到 `MAX_BYTES = 4_000_000`。正文为空视为动态渲染失败或登录墙，放弃。
 2. **锁版本**：`content_hash = "sha256:" + sha256(text)`，`snap_id = sha1(final_url|content_hash)[:16]`，`source_ref = "source:web/<snap_id>"`。
-3. 快照写入 `snapshots/<snap_id>.json`，含 url、title、正文、哈希、抓取时间。
+3. 经 `snapshot.py` 接口写入 `snapshot.sqlite`，含 url、title、正文、哈希、抓取时间；以 `snap_id` 为唯一键做 upsert，防重复写入。
 
 存档之后，这份快照就是不可变的原文版本。后续取证、校验、引用全部只认 `source_ref` 和 `content_hash`，不再触网。
 
@@ -94,6 +94,8 @@ graph LR
             OS["open_source\n（含 SSRF 守卫）"]
             RD[read_source]
         end
+        ST["store.py\n接口层"]
+        SN["snapshot.py\n接口层"]
     end
 
     subgraph 外部服务
@@ -104,7 +106,7 @@ graph LR
     end
 
     subgraph 持久化
-        SNAP[("snapshots/\n快照存档")]
+        SNAPDB[("snapshot.sqlite\n快照 DB")]
         DB[("store.sqlite\n审计 DB")]
         TR[("trace/\n审计流水")]
     end
@@ -116,10 +118,13 @@ graph LR
     SC -->|backend=bing| SE
     R --> OS
     OS -->|守卫通过后抓取| CR
-    OS -->|写快照| SNAP
+    OS -->|写快照| SN
+    SN -->|upsert| SNAPDB
     R --> RD
-    RD -->|读快照| SNAP
-    R -->|写运行状态 / Evidence / Claim| DB
+    RD -->|读快照| SN
+    SN -->|按 source_ref 只读| SNAPDB
+    R -->|写运行状态 / Evidence / Claim| ST
+    ST -->|参数化写入| DB
     R -->|写逐步流水| TR
     R -->|带引用答案| U
 ```
@@ -127,8 +132,9 @@ graph LR
 组件边界说明：
 
 - **本地进程**：`run.py` 是唯一的控制流持有者，`server.py` 三函数进程内直调（非 MCP 服务）。
+- **接口层**：`store.py` 是 `run.py` 写入审计 DB 的唯一通道；`snapshot.py` 是 `server.py` 读写快照 DB 的唯一通道。上层均不导入 `sqlite3`，不直接执行 SQL。
 - **外部服务**：Bing 只产导航候选、不产证据；crawl4ai 是唯一抓取后端，独立部署；两个模型经 OpenAI 兼容接口调用。
-- **持久化**：`snapshots/` 是不可变快照，取证唯一依据；`store.sqlite` + `trace/` 是双审计层，职责分离。
+- **持久化**：`snapshot.sqlite` 是不可变快照 DB，取证唯一依据；`store.sqlite` + `trace/` 是双审计层，职责分离。
 - **SSRF 守卫**嵌在 `open_source` 内，抓取前校验 URL、抓取后对重定向落点复检，信任边界不可外包。
 
 ## 5. 受控工作流（`poc/run.py`）
@@ -144,7 +150,7 @@ sequenceDiagram
     participant C as cheap 模型
     participant SE as Bing（ddgs）
     participant CR as crawl4ai 抓取服务
-    participant SNAP as 快照存档 snapshots/
+    participant SNAP as 快照 DB snapshot.sqlite
     participant AUD as 审计存档 store.sqlite + trace/
 
     U->>R: 问题
@@ -205,14 +211,13 @@ sequenceDiagram
 
 ## 8. 存储与审计
 
-两层持久化，职责分开：
+两层持久化，各经专属接口写入，职责分开：
 
-- **快照存档** `snapshots/<snap_id>.json`：抓下来的网页原文版本，取证和引用的唯一依据。
-- **审计存档**：
-  - `store.sqlite` 三表 `run / evidence / claim`：一次问答的状态与结论。
-  - `trace/<run_id>.jsonl`：逐步流水（question、queries、candidates、picked、opened/open_skip、evidence_check、claim、answer、abort），供事后回放与审计。
+- **快照 DB** `snapshot.sqlite`（经 `snapshot.py` 接口）：`open_source` 抓取后经 `snapshot.py.save()` 写入，`read_source` 经 `snapshot.py.get()` 按 `source_ref` 只读取出正文。以 `snap_id` 为唯一键 upsert，内容不可变，取证唯一依据。
+- **审计 DB** `store.sqlite`（经 `store.py` 接口）：`run.py` 只能调有界函数——`log_run / log_evidence / log_claim / log_answer`，不直接执行 SQL，不能读表、不能删。接口内部做参数化查询、字段校验、事务封装。三表 `run / evidence / claim`。
+- **流水** `trace/<run_id>.jsonl`：逐步流水（question、queries、candidates、picked、opened/open_skip、evidence_check、claim、answer、abort），供事后回放与审计。
 
-Evidence、Claim、原文都以 `source_ref` / `content_hash` 引用，不把正文复制进运行态。
+接口层约束：`run.py` 不导入 `sqlite3`，`server.py` 不导入 `sqlite3`；DB 连接由各自接口层持有，上层只见函数调用。Evidence、Claim、原文都以 `source_ref` / `content_hash` 引用，不把正文复制进运行态。
 
 ## 9. 迭代循环（规划中，未落地）
 

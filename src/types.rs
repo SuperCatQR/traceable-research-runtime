@@ -170,6 +170,7 @@ impl Snapshot {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Excerpt {
     pub snapshot_ref: SnapshotRef,
+    pub content_hash: String,
     pub title: String,
     pub excerpt: String,
 }

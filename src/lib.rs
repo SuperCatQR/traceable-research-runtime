@@ -11,6 +11,7 @@
 
 pub mod adapters;
 pub mod error;
+pub mod orchestration;
 pub mod snapshot;
 pub mod trace;
 pub mod types;

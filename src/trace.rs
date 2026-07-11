@@ -72,6 +72,7 @@ pub enum TraceEvent {
     },
     Excerpt {
         snapshot_ref: SnapshotRef,
+        content_hash: String,
         title: String,
         excerpt: String,
     },

@@ -10,12 +10,18 @@
 //! `select_sources`, `synthesize_answer`) stay fixture-testable without a runtime.
 
 pub mod error;
+pub mod snapshot;
+pub mod trace;
 pub mod types;
 
 // Flat public surface: downstream phases import from the crate root, not deep
-// module paths. The frozen P1 contract is exactly what's re-exported here.
+// module paths.
 pub use error::{ErrorClass, Result, SearchError};
+pub use snapshot::{SnapshotReader, SnapshotWriter};
+pub use trace::{
+    RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy, TraceWriter,
+};
 pub use types::{
-    content_hash, search_result_id, snapshot_id, snapshot_ref, Answer, Claim, CrawlMeta, Excerpt,
-    Query, SearchResult, Snapshot, SnapshotRef,
+    Answer, Claim, CrawlMeta, Excerpt, Query, SearchResult, Snapshot, SnapshotRef, content_hash,
+    search_result_id, snapshot_id, snapshot_ref,
 };

@@ -72,6 +72,25 @@ pub enum SearchError {
         expected: String,
         actual: String,
     },
+
+    /// A caller supplied a `Snapshot` whose public fields no longer satisfy
+    /// the frozen content-addressing formula.
+    #[error("invalid snapshot identity: {0}")]
+    InvalidSnapshot(String),
+
+    /// The snapshot store (rusqlite) failed on open, schema, or a query — our
+    /// own persistence layer misbehaved, so internal (§8.1). `#[from]` lets
+    /// every `?` on a SQL call fold into this without a manual map at each site.
+    #[error("snapshot store failed: {0}")]
+    Storage(#[from] rusqlite::Error),
+
+    /// Appending to the append-only trace log failed — file I/O, or serializing
+    /// one of our own events. Our audit layer, so internal (§8.1).
+    // ponytail: `#[from] io::Error` claims *every* crate io::Error as a trace
+    // failure. True in P2 (io only arises in trace.rs); if a non-trace io path
+    // appears later (e.g. reading a local fixture), split this variant then.
+    #[error("trace write failed: {0}")]
+    Trace(#[from] std::io::Error),
 }
 
 impl SearchError {
@@ -86,7 +105,10 @@ impl SearchError {
             | Self::ModelOutput { .. }
             | Self::RefNotInRun { .. }
             | Self::NoUsableSource => ErrorClass::External,
-            Self::HashMismatch { .. } => ErrorClass::Internal,
+            Self::HashMismatch { .. }
+            | Self::InvalidSnapshot(_)
+            | Self::Storage(_)
+            | Self::Trace(_) => ErrorClass::Internal,
         }
     }
 }

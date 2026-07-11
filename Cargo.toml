@@ -1,0 +1,29 @@
+[package]
+name = "traceable-search"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# MCP surface (P5) — server over stdio
+rmcp = { version = "2.2.0", features = ["server", "macros", "transport-io"] }
+# async runtime
+tokio = { version = "1.52.3", features = ["macros", "rt-multi-thread", "time", "io-std"] }
+# HTTP client: Bing scrape + crawl4ai (P3); native-tls = SChannel on Windows, no extra C toolchain
+reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
+# (de)serialization: domain types (P1), audit JSONL (P2), model I/O (P4)
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.150"
+# dual persistence: snapshot.sqlite (P2); bundled = compile SQLite, no system dep
+rusqlite = { version = "0.40.1", features = ["bundled"] }
+# content addressing (P1 ID rules): sha1(query|url), sha256(text), sha1(final_url|hash)
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+hex = "0.4.3"
+# URL normalize + SSRF host checks (P1/P3)
+url = "2.5.8"
+# timestamps: started_at / fetched_at (RFC3339)
+chrono = { version = "0.4.45", features = ["serde"] }
+# typed errors carrying error_class (P1)
+thiserror = "2.0.18"
+# non-domain error bubbling in main()/tests
+anyhow = "1.0.103"

@@ -225,7 +225,17 @@ result = ResearchSession(question, policy).run()
 1. **Explore**：生成查询、搜索、去重、全量抓取、归档快照，重复 N 轮。
 2. **Synthesize**：程序摘录每页、选择相关原文、读取原文、形成可引用答案。
 
-`ResearchSession` 仅维护 `run_id`、轮次、已见查询与 URL、`snapshot_ref`、预算和停止原因。它调用既有工具与接口，不自行实现搜索或抓取；快照经 `snapshot.reader` 读取，审计经 append-only `trace/<run_id>.jsonl` 直接落盘，两者都不经手写 SQL。暂不拆分 planner、selector、synthesizer 等子组件。
+`ResearchSession` 仅维护 `run_id`、轮次、已见查询与 URL、`snapshot_ref`、预算和停止原因。它调用既有工具与接口，不自行实现搜索或抓取；快照经 `snapshot.reader` 读取，审计经 append-only `trace/<run_id>.jsonl` 直接落盘，两者都不经手写 SQL。
+
+编排层保持单文件，但把三处模型判断抽成无副作用的纯函数，作为独立测试边界：
+
+```python
+plan_queries(question, archived_sources, previous_queries) -> list[Query]   # §5.1 步 1 生成查询
+select_sources(question, excerpts) -> list[snapshot_ref]                    # §5.3 选源
+synthesize_answer(question, original_texts) -> Answer                       # §5.3 作答
+```
+
+三者只接收纯数据、返回纯数据，不触网、不碰 DB、不写日志；抓取、快照读写、审计落盘与轮次控制仍由 `run()` 统一编排。收益是每处模型判断都能用固定 fixture 独立测试，而控制流不散到多文件。真出现并发或多研究策略时，再把纯函数提成独立模块，那时接缝已被测试固化。暂不拆分 planner、selector、synthesizer 为独立组件（见文末 `ponytail:`）。
 
 ## 5. N 轮探索与最终作答
 
@@ -403,6 +413,16 @@ N 轮结束后，为每份快照构造：
 
 `snapshot.py` 内部使用参数化 SQL、字段校验和事务，上层不直接执行 SQL；审计日志是纯 append-only 结构化 JSON，无独立数据库。密钥与正文不写审计日志，正文只以 `snapshot_ref/content_hash` 引用。
 
+### 8.1 审计事件契约
+
+`trace/<run_id>.jsonl` 每行是一个事件对象，字段契约固定，供回放与后续汇总脚本依赖：
+
+- `schema_version`：run header 记一次，日志格式演进时递增；读取方据此兼容旧 run。
+- `type`：事件类型枚举，取值 `run_header | query | search_result | archive | archive_skip | excerpt | snapshot_selection | claim | answer`。
+- `error_class`：失败类事件（如 `archive_skip`、查询或作答校验失败）标注归因，取 `external`（crawl4ai 空壳成功、Bing 排名漂移、strong 返回坏 JSON 等外部抖动）或 `internal`（本系统 bug）；让日志天然区分“锅在谁”，省去线上排查最费时的一步。
+
+字段只增不改：新增事件类型只扩 `type` 枚举、不改旧行；`schema_version` 保证读取方始终知道按哪版解析。
+
 ## 9. 实现状态与迁移
 
 本文描述目标态。当前 PoC 仍是单轮流程，并含“strong 先选候选、cheap 逐字取证、程序校验逐字引文”的旧实现。迁移按最短路径进行：
@@ -454,10 +474,10 @@ N 轮结束后，为每份快照构造：
 
 ### 12.3 已知风险与应对
 
-1. **编排单文件会随策略增长变胖**：Explore 与 Synthesize 现塞在一个文件，多研究路线或并发恢复后会臃肿。升级路径已在文末 `ponytail:` 记账（拆 planner/selector/synthesizer），属记账债务而非隐患。
-2. **trace 无 schema 版本、无查询工具**：单 run 调试极易，跨 run 找规律只能手工 grep。建议后续加 `schema_version` 字段与一个只读 jsonl 汇总脚本，成本低。
+1. **编排单文件会随策略增长变胖**：Explore 与 Synthesize 现塞在一个文件，多研究路线或并发恢复后会臃肿。§4.3 已把三处模型判断抽成纯函数（`plan_queries`/`select_sources`/`synthesize_answer`）固化测试边界，独立测试的收益不必靠拆文件即得；拆 planner/selector/synthesizer 为独立模块降为文末 `ponytail:` 记账的债务，待并发或多策略确有需要时再做，非隐患。
+2. **跨 run 找规律仍需汇总工具**：§8.1 已定 `schema_version` 与 `type` 枚举，日志格式稳定、机器可解析；单 run 调试极易。剩余缺口只是跨 run 聚合——目前多 run 找规律仍靠手工 grep，后续补一个只读 jsonl 汇总脚本即可，成本低，且已有稳定 schema 可依赖。
 3. **snapshot 全局、trace 按 run，调试需两跳**：“某快照由哪个 run 生成”要用快照时间戳与 trace 交叉查，可追但非一跳。
-4. **三个外部依赖需与自身 bug 区分**：多数线上异常其实是 crawl4ai 空壳成功、Bing 排名漂移或 strong 返回坏 JSON，分别由 `archive_skip`、校验 3、校验 1 兜住；但日志暂不自动标注“外部抖动”还是“我方 bug”，靠人读。
+4. **三个外部依赖需与自身 bug 区分**：多数线上异常其实是 crawl4ai 空壳成功、Bing 排名漂移或 strong 返回坏 JSON，分别由 `archive_skip`、校验 3、校验 1 兜住。§8.1 的 `error_class` 字段已要求失败事件标注 `external`（外部抖动）或 `internal`（我方 bug），日志天然区分归因，不再靠人逐行判读；汇总脚本据此可直接按 `error_class` 聚合。
 
 ### 12.4 运维负担
 
@@ -467,4 +487,4 @@ N 轮结束后，为每份快照构造：
 
 ***
 
-`ponytail:` 编排层暂只用一个 `research_session.py`，不拆 planner/selector/synthesizer；待并发恢复、多研究策略或独立测试边界确有需要时再拆。抓取仍只保留 crawl4ai 单后端与固定 N 轮。
+`ponytail:` 编排层暂只用一个 `research_session.py`，内部以三个纯函数（`plan_queries`/`select_sources`/`synthesize_answer`，见 §4.3）固化测试边界，不拆 planner/selector/synthesizer 为独立组件；待并发恢复或多研究策略确有需要时再提成独立模块。抓取仍只保留 crawl4ai 单后端与固定 N 轮。

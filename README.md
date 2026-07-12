@@ -18,8 +18,7 @@ MCP client ──stdio── traceable-search
 
 ## 前置条件
 
-- WSL2（本文以 Ubuntu 24.04 为例）
-- Podman
+- Podman 可运行的 Linux 环境（Windows 建议使用 WSL2；本文以 Ubuntu 24.04 为例）
 - Rust toolchain
 - Python 3.12 与 `pip`
 

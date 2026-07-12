@@ -1,5 +1,8 @@
 
 .reasonix/
+.codegraph/
+e2e-output/
+reasonix.toml
 
 .env
 !.env.example

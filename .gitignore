@@ -2,6 +2,7 @@
 .reasonix/
 
 .env
+!.env.example
 poc/.env
 poc/trace/
 poc/store.sqlite
@@ -19,4 +20,3 @@ __pycache__/
 /build_*.log
 /build_*.pid
 /test_*.log
-/deploy/crawl4ai/.api-token

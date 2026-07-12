@@ -22,7 +22,7 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 
 use crate::{
-    BingClient, CrawlClient, ErrorClass, LiveBackend, PipelineStage, RunHeader, SearchError,
+    CrawlClient, DdgsClient, ErrorClass, LiveBackend, PipelineStage, RunHeader, SearchError,
     SnapshotWriter, StrongClient, TracePolicy, TraceWriter,
     orchestration::{EXPLORE_ROUNDS, MAX_SNAPSHOTS, MAX_STRONG_INPUT_TOKENS, ResearchSession},
 };
@@ -30,7 +30,7 @@ use crate::{
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 const PROMPT_NAME: &str = "research_question";
 const ARCHITECTURE_URI: &str = "traceable-search://architecture";
-const ARCHITECTURE_TEXT: &str = "One research_web tool performs one bounded research run: Bing discovery, SSRF-guarded Crawl4AI retrieval, SQLite snapshots, JSONL audit trace, and citation-grounded synthesis.";
+const ARCHITECTURE_TEXT: &str = "One research_web tool performs one bounded research run: ddgs/Bing discovery, SSRF-guarded Crawl4AI retrieval, SQLite snapshots, JSONL audit trace, and citation-grounded synthesis.";
 
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct ResearchRequest {
@@ -134,7 +134,7 @@ impl SearchServer {
         let store_path = self.config.data_dir.join("snapshots.sqlite");
         let trace_dir = self.config.data_dir.join("traces");
         let backend = LiveBackend::new(
-            BingClient::new().map_err(setup_error)?,
+            DdgsClient::default(),
             CrawlClient::new(&self.config.crawl_base_url, self.config.crawl_token.clone())
                 .map_err(setup_error)?,
             StrongClient::new(

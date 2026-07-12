@@ -52,6 +52,8 @@ pub enum TraceEvent {
         gap: String,
     },
     SearchResult {
+        round: u32,
+        query: String,
         search_result_id: String,
         title: String,
         url: String,

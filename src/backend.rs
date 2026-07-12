@@ -3,7 +3,7 @@
 use serde_json::{Value, json};
 
 use crate::{
-    BingClient, CrawlClient, Excerpt, Result, SearchResult, Snapshot, StrongClient,
+    CrawlClient, DdgsClient, Excerpt, Result, SearchResult, Snapshot, StrongClient,
     orchestration::ResearchBackend,
 };
 
@@ -14,13 +14,13 @@ pub const SELECT_PROMPT: &str = r#"Return JSON only: {"selected":[{"snapshot_ref
 pub const SYNTHESIZE_PROMPT: &str = r#"Return JSON only: {"answer":"grounded answer","claims":[{"text":"verifiable claim","snapshot_refs":["snapshot:web/..."]}, ...]}. Every claim must cite at least one snapshot_ref present in snapshots. Do not cite absent sources."#;
 
 pub struct LiveBackend {
-    search: BingClient,
+    search: DdgsClient,
     crawl: CrawlClient,
     strong: StrongClient,
 }
 
 impl LiveBackend {
-    pub fn new(search: BingClient, crawl: CrawlClient, strong: StrongClient) -> Self {
+    pub fn new(search: DdgsClient, crawl: CrawlClient, strong: StrongClient) -> Self {
         Self {
             search,
             crawl,

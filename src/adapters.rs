@@ -1,7 +1,7 @@
-//! P3 external adapters: Bing RSS, crawl4ai, an OpenAI-compatible strong model,
+//! P3 external adapters: ddgs/Bing, crawl4ai, an OpenAI-compatible strong model,
 //! and the public-HTTP SSRF boundary shared by every page fetch.
 
-use std::{net::IpAddr, time::Duration};
+use std::{net::IpAddr, process::Stdio, time::Duration};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -110,19 +110,19 @@ fn http_client() -> Result<reqwest::Client> {
         })
 }
 
-/// Bing first-page search through its stable RSS representation; no API key or
-/// HTML selector is required.
-pub struct BingClient {
-    client: reqwest::Client,
-    endpoint: Url,
+const DDGS_SCRIPT: &str = "import json,sys; from ddgs import DDGS; print(json.dumps(DDGS().text(sys.argv[1], backend='bing', max_results=10)))";
+
+/// Official Python `ddgs` client, pinned by `requirements-search.txt`, with the
+/// backend fixed to Bing. The query is an argv value, never shell source.
+pub struct DdgsClient {
+    python: String,
 }
 
-impl BingClient {
-    pub fn new() -> Result<Self> {
-        Ok(Self {
-            client: http_client()?,
-            endpoint: Url::parse("https://www.bing.com/search").expect("constant URL is valid"),
-        })
+impl DdgsClient {
+    pub fn new(python: impl Into<String>) -> Self {
+        Self {
+            python: python.into(),
+        }
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
@@ -131,77 +131,60 @@ impl BingClient {
                 message: "query is empty".into(),
             });
         }
-        let mut url = self.endpoint.clone();
-        url.query_pairs_mut()
-            .append_pair("q", query)
-            .append_pair("format", "rss")
-            .append_pair("count", "10");
-        let response = self
-            .client
-            .get(url)
-            .send()
+        let output = tokio::process::Command::new(&self.python)
+            .args(["-c", DDGS_SCRIPT, query])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
             .await
-            .map_err(search_transport)?;
-        let status = response.status();
-        let body = response.text().await.map_err(search_transport)?;
-        if !status.is_success() {
+            .map_err(|error| SearchError::Search {
+                message: format!("failed to start ddgs: {error}"),
+            })?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
             return Err(SearchError::Search {
-                message: format!("Bing returned HTTP {status}"),
+                message: format!(
+                    "ddgs failed: {}",
+                    stderr.trim().chars().take(500).collect::<String>()
+                ),
             });
         }
-        parse_bing_rss(query, &body)
+        parse_ddgs_results(query, &output.stdout)
     }
 }
 
-fn search_transport(error: reqwest::Error) -> SearchError {
-    SearchError::Search {
-        message: error.to_string(),
+impl Default for DdgsClient {
+    fn default() -> Self {
+        Self::new("python")
     }
 }
 
 #[derive(Deserialize)]
-struct Rss {
-    channel: RssChannel,
-}
-
-#[derive(Deserialize)]
-struct RssChannel {
-    #[serde(rename = "item", default)]
-    items: Vec<RssItem>,
-}
-
-#[derive(Deserialize)]
-struct RssItem {
+struct DdgsResult {
     title: String,
-    link: String,
+    href: String,
     #[serde(default)]
-    description: String,
+    body: String,
 }
 
-fn parse_bing_rss(query: &str, body: &str) -> Result<Vec<SearchResult>> {
-    let rss: Rss = quick_xml::de::from_str(body).map_err(|error| SearchError::Search {
-        message: format!("invalid Bing RSS: {error}"),
-    })?;
-    let results: Vec<_> = rss
-        .channel
-        .items
+fn parse_ddgs_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
+    let raw: Vec<DdgsResult> =
+        serde_json::from_slice(body).map_err(|error| SearchError::Search {
+            message: format!("invalid ddgs JSON: {error}"),
+        })?;
+    let results: Vec<_> = raw
         .into_iter()
         .take(10)
         .enumerate()
-        .filter(|(_, item)| Url::parse(&item.link).is_ok())
+        .filter(|(_, item)| Url::parse(&item.href).is_ok())
         .map(|(index, item)| {
-            SearchResult::new(
-                query,
-                item.title,
-                item.description,
-                item.link,
-                index as u32 + 1,
-            )
+            SearchResult::new(query, item.title, item.body, item.href, index as u32 + 1)
         })
         .collect();
     if results.is_empty() {
         Err(SearchError::Search {
-            message: "Bing returned no valid result".into(),
+            message: "ddgs/Bing returned no valid result".into(),
         })
     } else {
         Ok(results)
@@ -505,11 +488,14 @@ mod tests {
     }
 
     #[test]
-    fn parses_bing_fixture_and_derives_ids() {
-        let rss = r#"<rss><channel><item><title>Alpha</title><link>https://example.com/a</link><description>One</description></item><item><title>Beta</title><link>https://example.com/b</link><description>Two</description></item></channel></rss>"#;
-        let results = parse_bing_rss("query", rss).unwrap();
+    fn ddgs_contract_fixes_bing_and_maps_results() {
+        assert!(DDGS_SCRIPT.contains("backend='bing'"));
+        assert!(DDGS_SCRIPT.contains("max_results=10"));
+        let json = br#"[{"title":"Alpha","href":"https://example.com/a","body":"One"},{"title":"Beta","href":"https://example.com/b","body":"Two"}]"#;
+        let results = parse_ddgs_results("query", json).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].rank, 1);
+        assert_eq!(results[0].snippet, "One");
         assert_eq!(
             results[0].search_result_id,
             crate::search_result_id("query", "https://example.com/a")

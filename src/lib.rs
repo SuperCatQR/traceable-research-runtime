@@ -20,7 +20,7 @@ pub mod types;
 
 // Flat public surface: downstream phases import from the crate root, not deep
 // module paths.
-pub use adapters::{BingClient, CrawlClient, StrongClient, validate_public_url};
+pub use adapters::{CrawlClient, DdgsClient, StrongClient, validate_public_url};
 pub use backend::{LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
 pub use error::{ErrorClass, PipelineStage, Result, SearchError};
 pub use server::{ResearchRequest, SearchServer};

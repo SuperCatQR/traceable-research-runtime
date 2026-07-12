@@ -94,7 +94,7 @@ pub struct Query {
     pub gap: String,
 }
 
-/// One Bing first-page hit (§3 web_search). `search_result_id` is derived from
+/// One ddgs/Bing first-page hit (§3 web_search). `search_result_id` is derived from
 /// the issuing query + URL, so archiving can be gated to this run (§6 v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {

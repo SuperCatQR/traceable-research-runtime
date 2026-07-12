@@ -20,7 +20,6 @@ const MAX_QUERY_CHARS: usize = 200;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StopReason {
     CompletedRounds,
-    NoNewUrls,
     InputBudget,
     SnapshotLimit,
 }
@@ -161,6 +160,8 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 for result in results {
                     self.trace
                         .append(&TraceEvent::SearchResult {
+                            round,
+                            query: query.query.clone(),
                             search_result_id: result.search_result_id.clone(),
                             title: result.title.clone(),
                             url: result.url.clone(),
@@ -184,11 +185,6 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                             .map_err(|error| error.at(PipelineStage::Trace))?,
                     }
                 }
-            }
-
-            if new_results.is_empty() {
-                self.state.stop_reason = Some(StopReason::NoNewUrls);
-                break;
             }
 
             for result in new_results {
@@ -533,6 +529,7 @@ mod tests {
         selected_ref: Option<SnapshotRef>,
         synthesize_calls: u32,
         plan_error: bool,
+        duplicate_urls: bool,
     }
 
     impl ResearchBackend for FixtureBackend {
@@ -562,14 +559,22 @@ mod tests {
                     query,
                     query.into(),
                     "first".into(),
-                    format!("https://example.com/{query}#first"),
+                    if self.duplicate_urls {
+                        "https://example.com/duplicate#first".into()
+                    } else {
+                        format!("https://example.com/{query}#first")
+                    },
                     1,
                 ),
                 SearchResult::new(
                     query,
                     query.into(),
                     "duplicate".into(),
-                    format!("https://example.com/{query}#duplicate"),
+                    if self.duplicate_urls {
+                        "https://example.com/duplicate#duplicate".into()
+                    } else {
+                        format!("https://example.com/{query}#duplicate")
+                    },
                     2,
                 ),
             ]))
@@ -814,6 +819,29 @@ mod tests {
         assert_eq!(session.archived.len(), 8);
         let trace = String::from_utf8(session.trace.into_inner()).unwrap();
         assert_eq!(trace.matches("\"type\":\"archive_skip\"").count(), 1);
+        let result: serde_json::Value = trace
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .find(|event: &serde_json::Value| event["type"] == "search_result")
+            .unwrap();
+        assert_eq!(result["round"], 1);
+        assert_eq!(result["query"], "q1-0");
+    }
+
+    #[tokio::test]
+    async fn explore_runs_all_rounds_when_every_search_repeats_the_same_url() {
+        let db = TempDb::new("duplicate-search-results");
+        let mut session = session(&db);
+        session.backend.duplicate_urls = true;
+
+        let state = session.explore().await.unwrap().clone();
+
+        assert_eq!(state.round, EXPLORE_ROUNDS);
+        assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
+        assert_eq!(session.backend.plan_calls, EXPLORE_ROUNDS);
+        assert_eq!(session.backend.search_calls, EXPLORE_ROUNDS * 3);
+        assert_eq!(session.backend.crawl_calls, 1);
+        assert_eq!(session.archived.len(), 1);
     }
 
     #[tokio::test]

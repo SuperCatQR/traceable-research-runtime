@@ -42,7 +42,7 @@ pub enum PipelineStage {
 /// validation (§6) or failure mode (§8.1), and `error_class` pins its attribution.
 #[derive(Debug, thiserror::Error)]
 pub enum SearchError {
-    /// Bing search itself failed: network, scrape parse, or an empty result
+    /// ddgs/Bing search itself failed: process, JSON parse, or an empty result
     /// set for the query.
     #[error("search failed: {message}")]
     Search { message: String },

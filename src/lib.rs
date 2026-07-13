@@ -13,6 +13,7 @@ pub mod adapters;
 pub mod app;
 pub mod backend;
 pub mod error;
+pub mod intake;
 pub mod orchestration;
 pub mod snapshot;
 pub mod trace;
@@ -25,6 +26,14 @@ pub use adapters::{CrawlClient, SearxngClient, StrongClient, validate_public_url
 pub use app::{AppConfig, PublicAnswer, PublicClaim, PublicError, PublicSource, ResearchService};
 pub use backend::{LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
 pub use error::{ErrorClass, PipelineStage, Result, SearchError};
+pub use intake::{
+    ClarificationAnswer, ClarificationQuestion, INTAKE_EVENT_SCHEMA_VERSION, IntakeError,
+    IntakeEvent, IntakeEventKind, IntakeLog, IntakeModelOutput, IntakeResult, IntakeSession,
+    IntakeSessionLocks, IntakeStatus, MAX_CLARIFICATION_ROUNDS, MAX_QUESTIONS_PER_ROUND,
+    MAX_TOTAL_QUESTIONS, ModelParseOutcome, cancellation_event, confirmation_event,
+    events_for_model_output, minimal_brief_event, parse_model_attempt, parse_model_output,
+    reduce_intake_event, replay_intake,
+};
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{
     RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy, TraceWriter,

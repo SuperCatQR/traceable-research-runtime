@@ -3,16 +3,18 @@
 use std::{
     ffi::OsStr,
     fs::{self, File, OpenOptions},
-    io::{BufWriter, Write},
+    io::{BufRead, BufReader, BufWriter, Write},
     path::Path,
 };
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
-use crate::{Claim, ErrorClass, PipelineStage, Result, SearchError, SnapshotRef};
+use crate::{
+    Claim, ConfirmedResearchBrief, ErrorClass, PipelineStage, Result, SearchError, SnapshotRef,
+};
 
-pub const TRACE_SCHEMA_VERSION: u32 = 2;
+pub const TRACE_SCHEMA_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TracePolicy {
@@ -23,6 +25,28 @@ pub struct TracePolicy {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RunHeader {
+    pub run_id: String,
+    pub clarification_id: String,
+    pub brief: ConfirmedResearchBrief,
+    pub started_at: DateTime<Utc>,
+    pub policy: TracePolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplayedRunHeader {
+    Legacy {
+        schema_version: u32,
+        run_id: String,
+        question: String,
+        started_at: DateTime<Utc>,
+        policy: TracePolicy,
+    },
+    V3(Box<RunHeader>),
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone)]
+pub(crate) struct LegacyRunHeader {
     pub run_id: String,
     pub question: String,
     pub started_at: DateTime<Utc>,
@@ -42,7 +66,12 @@ pub enum TraceEvent {
     RunHeader {
         schema_version: u32,
         run_id: String,
-        question: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        question: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        clarification_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        brief: Option<Box<ConfirmedResearchBrief>>,
         started_at: DateTime<Utc>,
         policy: TracePolicy,
     },
@@ -107,7 +136,25 @@ impl<W: Write> TraceWriter<W> {
         writer.write_event(&TraceEvent::RunHeader {
             schema_version: TRACE_SCHEMA_VERSION,
             run_id: header.run_id,
-            question: header.question,
+            question: None,
+            clarification_id: Some(header.clarification_id),
+            brief: Some(Box::new(header.brief)),
+            started_at: header.started_at,
+            policy: header.policy,
+        })?;
+        Ok(writer)
+    }
+
+    // ponytail: test-only bridge for generating v1/v2 fixtures to verify legacy replay.
+    #[cfg(test)]
+    pub(crate) fn new_legacy(sink: W, header: LegacyRunHeader) -> Result<Self> {
+        let mut writer = Self { sink };
+        writer.write_event(&TraceEvent::RunHeader {
+            schema_version: 2,
+            run_id: header.run_id,
+            question: Some(header.question),
+            clarification_id: None,
+            brief: None,
             started_at: header.started_at,
             policy: header.policy,
         })?;
@@ -148,6 +195,83 @@ impl TraceWriter<BufWriter<File>> {
             .open(path)?;
         Self::new(BufWriter::new(file), header)
     }
+
+    /// Reopens only the exact v3 trace created by the confirmation handshake.
+    pub(crate) fn resume(trace_dir: impl AsRef<Path>, header: &RunHeader) -> Result<Self> {
+        validate_run_id(&header.run_id)?;
+        let path = trace_dir.as_ref().join(format!("{}.jsonl", header.run_id));
+        match replay_run_header(&path)? {
+            ReplayedRunHeader::V3(existing) if existing.as_ref() == header => {}
+            _ => {
+                return Err(invalid_trace(
+                    "existing trace header does not match confirmed run",
+                ));
+            }
+        }
+        let file = OpenOptions::new().append(true).open(path)?;
+        Ok(Self {
+            sink: BufWriter::new(file),
+        })
+    }
+}
+
+pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
+    let mut first_line = String::new();
+    let bytes = BufReader::new(File::open(path)?).read_line(&mut first_line)?;
+    if bytes == 0 || !first_line.ends_with('\n') {
+        return Err(invalid_trace("missing or truncated run_header"));
+    }
+    let event: TraceEvent = serde_json::from_str(first_line.trim_end())
+        .map_err(|error| invalid_trace(error.to_string()))?;
+    let TraceEvent::RunHeader {
+        schema_version,
+        run_id,
+        question,
+        clarification_id,
+        brief,
+        started_at,
+        policy,
+    } = event
+    else {
+        return Err(invalid_trace("first trace event is not run_header"));
+    };
+    validate_run_id(&run_id)?;
+    match schema_version {
+        1 | 2 => match (question, clarification_id, brief) {
+            (Some(question), None, None) => Ok(ReplayedRunHeader::Legacy {
+                schema_version,
+                run_id,
+                question,
+                started_at,
+                policy,
+            }),
+            _ => Err(invalid_trace("invalid legacy run_header fields")),
+        },
+        TRACE_SCHEMA_VERSION => match (question, clarification_id, brief) {
+            (None, Some(clarification_id), Some(brief))
+                if clarification_id == brief.clarification_id() =>
+            {
+                Ok(ReplayedRunHeader::V3(Box::new(RunHeader {
+                    run_id,
+                    clarification_id,
+                    brief: *brief,
+                    started_at,
+                    policy,
+                })))
+            }
+            _ => Err(invalid_trace("invalid v3 run_header fields")),
+        },
+        version => Err(invalid_trace(format!(
+            "unsupported trace schema version {version}"
+        ))),
+    }
+}
+
+fn invalid_trace(message: impl Into<String>) -> SearchError {
+    SearchError::Trace(std::io::Error::new(
+        std::io::ErrorKind::InvalidData,
+        message.into(),
+    ))
 }
 
 fn validate_run_id(run_id: &str) -> Result<()> {
@@ -173,11 +297,32 @@ mod tests {
     use serde_json::Value;
 
     use super::*;
+    use crate::{RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief, ResearchScope};
 
     fn header(run_id: &str) -> RunHeader {
+        let brief = ResearchBrief {
+            schema_version: RESEARCH_BRIEF_SCHEMA_VERSION,
+            original_question: "original question".into(),
+            research_question: "focused question".into(),
+            desired_output: None,
+            scope: ResearchScope::default(),
+            source_constraints: Vec::new(),
+            accepted_assumptions: Vec::new(),
+        };
+        let content_hash = brief.content_hash().unwrap();
+        let confirmed_at = Utc.with_ymd_and_hms(2026, 7, 11, 9, 59, 0).unwrap();
+        let brief = ConfirmedResearchBrief::new(
+            brief,
+            "original question",
+            "clarification-test".into(),
+            &content_hash,
+            confirmed_at,
+        )
+        .unwrap();
         RunHeader {
             run_id: run_id.into(),
-            question: "original question".into(),
+            clarification_id: "clarification-test".into(),
+            brief,
             started_at: Utc.with_ymd_and_hms(2026, 7, 11, 10, 0, 0).unwrap(),
             policy: TracePolicy {
                 rounds: 3,
@@ -214,7 +359,10 @@ mod tests {
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[0]["type"], "run_header");
         assert_eq!(lines[0]["schema_version"], TRACE_SCHEMA_VERSION);
-        assert_eq!(lines[0]["question"], "original question");
+        assert_eq!(
+            lines[0]["brief"]["brief"]["original_question"],
+            "original question"
+        );
         assert_eq!(lines[1]["type"], "query");
         assert_eq!(lines[2]["type"], "archive_skip");
         assert_eq!(lines[2]["error_class"], "external");
@@ -311,12 +459,15 @@ mod tests {
     #[test]
     fn second_header_is_rejected() {
         let mut writer = TraceWriter::new(Vec::new(), header("r-test")).unwrap();
+        let unused = header("unused");
         let duplicate = TraceEvent::RunHeader {
             schema_version: TRACE_SCHEMA_VERSION,
             run_id: "r-other".into(),
-            question: "other".into(),
+            question: None,
+            clarification_id: Some(unused.clarification_id),
+            brief: Some(Box::new(unused.brief)),
             started_at: Utc::now(),
-            policy: header("unused").policy,
+            policy: unused.policy,
         };
         assert!(writer.append(&duplicate).is_err());
     }

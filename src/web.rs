@@ -12,11 +12,14 @@ use tokio::sync::RwLock;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::{
-    PublicAnswer, PublicError, ResearchService,
-    orchestration::{DEFAULT_EXPLORE_ROUNDS, MAX_EXPLORE_ROUNDS, MIN_EXPLORE_ROUNDS},
+    ClarificationAnswer, IntakeError, PublicAnswer, PublicError, ResearchBrief, ResearchService,
+    TracePolicy,
+    app::{IntakeCommandError, PrepareRunError},
 };
 
 const INDEX_HTML: &str = include_str!("web/index.html");
+const DEFAULT_INPUT_BUDGET: u32 = 200_000;
+const DEFAULT_MAX_SNAPSHOTS: u32 = 50;
 
 #[derive(Clone)]
 pub struct WebState {
@@ -37,22 +40,6 @@ enum JobStatus {
     Failed(PublicError),
 }
 
-#[derive(Deserialize)]
-struct CreateRequest {
-    question: String,
-    #[serde(default = "default_rounds")]
-    rounds: u32,
-}
-
-const fn default_rounds() -> u32 {
-    DEFAULT_EXPLORE_ROUNDS
-}
-
-#[derive(Serialize)]
-struct CreateResponse {
-    run_id: String,
-}
-
 #[derive(Serialize)]
 struct StatusResponse<'a> {
     run_id: &'a str,
@@ -61,6 +48,46 @@ struct StatusResponse<'a> {
     result: Option<&'a PublicAnswer>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a PublicError>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartIntakeRequest {
+    question: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReplyIntakeRequest {
+    revision: u32,
+    #[serde(default)]
+    answers: Vec<ClarificationAnswer>,
+    edited_brief: Option<ResearchBrief>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ConfirmIntakeRequest {
+    revision: u32,
+    content_hash: String,
+    rounds: u32,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CancelIntakeRequest {
+    revision: u32,
+}
+
+#[derive(Serialize)]
+struct ConfirmResponse {
+    run_id: String,
+}
+
+#[derive(Serialize)]
+struct ApiError {
+    error: &'static str,
+    message: String,
 }
 
 impl WebState {
@@ -75,55 +102,167 @@ impl WebState {
 pub fn router(service: ResearchService) -> Router {
     Router::new()
         .route("/", get(|| async { Html(INDEX_HTML) }))
-        .route("/api/research", post(create_research))
+        .route("/api/research/intakes", post(start_intake))
+        .route(
+            "/api/research/intakes/{clarification_id}/reply",
+            post(reply_intake),
+        )
+        .route(
+            "/api/research/intakes/{clarification_id}/confirm",
+            post(confirm_intake),
+        )
+        .route(
+            "/api/research/intakes/{clarification_id}/cancel",
+            post(cancel_intake),
+        )
         .route("/api/research/{run_id}", get(research_status))
         .route("/api/research/{run_id}/events", get(research_events))
         .with_state(WebState::new(service))
 }
 
-async fn create_research(
+async fn start_intake(
     State(state): State<WebState>,
-    Json(request): Json<CreateRequest>,
+    Json(request): Json<StartIntakeRequest>,
 ) -> Response {
-    let question = request.question.trim().to_owned();
-    if question.is_empty() {
-        return (StatusCode::BAD_REQUEST, "question must not be empty").into_response();
+    match state.service.start_intake(&request.question).await {
+        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Err(error) => intake_error_response(&error),
     }
-    if !(MIN_EXPLORE_ROUNDS..=MAX_EXPLORE_ROUNDS).contains(&request.rounds) {
-        return (StatusCode::BAD_REQUEST, "rounds must be between 3 and 5").into_response();
-    }
-    let rounds = request.rounds;
-    let mut job = state.job.write().await;
-    if job
-        .as_ref()
-        .is_some_and(|job| matches!(job.status, JobStatus::Running))
-    {
-        return (StatusCode::CONFLICT, "a research job is already running").into_response();
-    }
-    let run_id = state.service.new_run_id();
-    *job = Some(Job {
-        run_id: run_id.clone(),
-        status: JobStatus::Running,
-    });
-    drop(job);
+}
 
-    let background = state.clone();
-    let background_run_id = run_id.clone();
+async fn reply_intake(
+    State(state): State<WebState>,
+    Path(clarification_id): Path<String>,
+    Json(request): Json<ReplyIntakeRequest>,
+) -> Response {
+    match state
+        .service
+        .reply_intake(
+            &clarification_id,
+            request.revision,
+            request.answers,
+            request.edited_brief,
+        )
+        .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => intake_error_response(&error),
+    }
+}
+
+async fn confirm_intake(
+    State(state): State<WebState>,
+    Path(clarification_id): Path<String>,
+    Json(request): Json<ConfirmIntakeRequest>,
+) -> Response {
+    let policy = TracePolicy {
+        rounds: request.rounds,
+        input_budget: DEFAULT_INPUT_BUDGET,
+        max_snapshots: DEFAULT_MAX_SNAPSHOTS,
+    };
+    let prepared = match state
+        .service
+        .confirm_intake(
+            &clarification_id,
+            request.revision,
+            &request.content_hash,
+            policy,
+        )
+        .await
+    {
+        Ok(prepared) => prepared,
+        Err(error) => return intake_error_response(&error),
+    };
+    let run_id = prepared.run_id.clone();
+    {
+        let mut job = state.job.write().await;
+        if matches!(
+            job.as_ref().map(|job| &job.status),
+            Some(JobStatus::Running)
+        ) {
+            return api_error(
+                StatusCode::CONFLICT,
+                "research_running",
+                "a research run is already active",
+            );
+        }
+        *job = Some(Job {
+            run_id: run_id.clone(),
+            status: JobStatus::Running,
+        });
+    }
+    let task_state = state.clone();
+    let task_run_id = run_id.clone();
     tokio::spawn(async move {
-        let result = background
-            .service
-            .run(&question, rounds, background_run_id.clone())
-            .await;
-        let mut job = background.job.write().await;
-        if let Some(current) = job.as_mut().filter(|job| job.run_id == background_run_id) {
-            current.status = match result {
-                Ok(answer) => JobStatus::Completed(answer),
-                Err(error) => JobStatus::Failed(PublicError::from(&error)),
-            };
+        let status = match task_state.service.run(prepared).await {
+            Ok(answer) => JobStatus::Completed(answer),
+            Err(error) => JobStatus::Failed(PublicError::from(&error)),
+        };
+        let mut job = task_state.job.write().await;
+        if let Some(job) = job.as_mut().filter(|job| job.run_id == task_run_id) {
+            job.status = status;
         }
     });
+    (StatusCode::ACCEPTED, Json(ConfirmResponse { run_id })).into_response()
+}
 
-    (StatusCode::ACCEPTED, Json(CreateResponse { run_id })).into_response()
+async fn cancel_intake(
+    State(state): State<WebState>,
+    Path(clarification_id): Path<String>,
+    Json(request): Json<CancelIntakeRequest>,
+) -> Response {
+    match state
+        .service
+        .cancel_intake(&clarification_id, request.revision)
+        .await
+    {
+        Ok(session) => Json(session).into_response(),
+        Err(error) => intake_error_response(&error),
+    }
+}
+
+fn intake_error_response(error: &IntakeCommandError) -> Response {
+    let (status, code) = match error {
+        IntakeCommandError::Intake(
+            IntakeError::StaleBrief { .. } | IntakeError::StaleContentHash { .. },
+        )
+        | IntakeCommandError::Prepare(PrepareRunError::Intake(
+            IntakeError::StaleBrief { .. } | IntakeError::StaleContentHash { .. },
+        )) => (StatusCode::CONFLICT, "stale_brief"),
+        IntakeCommandError::Intake(IntakeError::InvalidTransition { .. })
+        | IntakeCommandError::Prepare(PrepareRunError::Intake(IntakeError::InvalidTransition {
+            ..
+        })) => (StatusCode::CONFLICT, "invalid_transition"),
+        IntakeCommandError::Intake(IntakeError::Io(source))
+        | IntakeCommandError::Prepare(PrepareRunError::Intake(IntakeError::Io(source)))
+            if source.kind() == std::io::ErrorKind::NotFound =>
+        {
+            (StatusCode::NOT_FOUND, "intake_not_found")
+        }
+        IntakeCommandError::Intake(
+            IntakeError::InvalidEvent(_)
+            | IntakeError::InvalidClarificationId
+            | IntakeError::Brief(_),
+        )
+        | IntakeCommandError::Prepare(PrepareRunError::Intake(
+            IntakeError::InvalidEvent(_)
+            | IntakeError::InvalidClarificationId
+            | IntakeError::Brief(_),
+        )) => (StatusCode::BAD_REQUEST, "invalid_request"),
+        _ => (StatusCode::INTERNAL_SERVER_ERROR, "intake_failed"),
+    };
+    api_error(status, code, error.to_string())
+}
+
+fn api_error(status: StatusCode, error: &'static str, message: impl Into<String>) -> Response {
+    (
+        status,
+        Json(ApiError {
+            error,
+            message: message.into(),
+        }),
+    )
+        .into_response()
 }
 
 async fn research_status(State(state): State<WebState>, Path(run_id): Path<String>) -> Response {
@@ -201,4 +340,119 @@ async fn research_events(State(state): State<WebState>, Path(run_id): Path<Strin
     Sse::new(ReceiverStream::new(receiver).map(|event| event))
         .keep_alive(axum::response::sse::KeepAlive::default())
         .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::PathBuf, time::SystemTime};
+
+    use chrono::Utc;
+
+    use super::*;
+    use crate::{AppConfig, IntakeEvent, IntakeEventKind, IntakeLog, minimal_brief_event};
+
+    fn test_state(name: &str) -> (WebState, PathBuf) {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let data_dir = std::env::temp_dir().join(format!(
+            "traceable-search-web-{name}-{}-{unique}",
+            std::process::id()
+        ));
+        let service = ResearchService::new(AppConfig::for_test(data_dir.clone()));
+        (WebState::new(service), data_dir)
+    }
+
+    fn ready_intake(data_dir: &std::path::Path, clarification_id: &str) -> (u32, String) {
+        let started = IntakeEvent::new(IntakeEventKind::IntakeStarted {
+            clarification_id: clarification_id.into(),
+            original_question: "What changed in Rust 2024?".into(),
+            revision: 0,
+            created_at: Utc::now(),
+        });
+        let mut log = IntakeLog::create(data_dir.join("intakes"), started).unwrap();
+        let revised = minimal_brief_event(log.session(), Utc::now()).unwrap();
+        log.append(&revised).unwrap();
+        (
+            log.session().revision,
+            log.session().content_hash.clone().unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn intake_endpoints_return_contract_statuses() {
+        let (state, data_dir) = test_state("statuses");
+
+        let bad = start_intake(
+            State(state.clone()),
+            Json(StartIntakeRequest {
+                question: "  ".into(),
+            }),
+        )
+        .await;
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+
+        let missing = reply_intake(
+            State(state.clone()),
+            Path("missing".into()),
+            Json(ReplyIntakeRequest {
+                revision: 0,
+                answers: Vec::new(),
+                edited_brief: None,
+            }),
+        )
+        .await;
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+        let created = start_intake(
+            State(state.clone()),
+            Json(StartIntakeRequest {
+                question: "What changed in Rust 2024?".into(),
+            }),
+        )
+        .await;
+        assert_eq!(created.status(), StatusCode::CREATED);
+
+        let clarification_id = "ready-for-confirm";
+        let (revision, content_hash) = ready_intake(&data_dir, clarification_id);
+        let stale = confirm_intake(
+            State(state.clone()),
+            Path(clarification_id.into()),
+            Json(ConfirmIntakeRequest {
+                revision,
+                content_hash: "stale".into(),
+                rounds: 1,
+            }),
+        )
+        .await;
+        assert_eq!(stale.status(), StatusCode::CONFLICT);
+
+        let accepted = confirm_intake(
+            State(state.clone()),
+            Path(clarification_id.into()),
+            Json(ConfirmIntakeRequest {
+                revision,
+                content_hash,
+                rounds: 1,
+            }),
+        )
+        .await;
+        assert_eq!(accepted.status(), StatusCode::ACCEPTED);
+
+        for _ in 0..100 {
+            if !matches!(
+                state.job.read().await.as_ref().map(|job| &job.status),
+                Some(JobStatus::Running)
+            ) {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(!matches!(
+            state.job.read().await.as_ref().map(|job| &job.status),
+            Some(JobStatus::Running)
+        ));
+        fs::remove_dir_all(data_dir).unwrap();
+    }
 }

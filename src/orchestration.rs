@@ -6,8 +6,9 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    Answer, Excerpt, PipelineStage, Query, Result, SearchError, SearchResult, Snapshot,
-    SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection, TraceEvent, TraceWriter,
+    Answer, ConfirmedResearchBrief, Excerpt, PipelineStage, Query, Result, SearchError,
+    SearchResult, Snapshot, SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection,
+    TraceEvent, TraceWriter,
 };
 
 pub const MIN_EXPLORE_ROUNDS: u32 = 3;
@@ -38,7 +39,7 @@ pub struct ResearchState {
 pub trait ResearchBackend {
     fn plan(
         &mut self,
-        question: &str,
+        brief: &ConfirmedResearchBrief,
         archived: &[Snapshot],
         previous_queries: &[String],
     ) -> impl Future<Output = Result<String>>;
@@ -49,13 +50,13 @@ pub trait ResearchBackend {
 
     fn select(
         &mut self,
-        question: &str,
+        brief: &ConfirmedResearchBrief,
         excerpts: &[Excerpt],
     ) -> impl Future<Output = Result<String>>;
 
     fn synthesize(
         &mut self,
-        question: &str,
+        brief: &ConfirmedResearchBrief,
         snapshots: &[Snapshot],
     ) -> impl Future<Output = Result<String>>;
 }
@@ -74,7 +75,7 @@ pub struct ResearchResult {
 }
 
 pub struct ResearchSession<B, W: Write> {
-    question: String,
+    brief: ConfirmedResearchBrief,
     rounds: u32,
     backend: B,
     snapshots: SnapshotWriter,
@@ -88,14 +89,14 @@ pub struct ResearchSession<B, W: Write> {
 impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     #[must_use]
     pub fn new(
-        question: impl Into<String>,
+        brief: ConfirmedResearchBrief,
         rounds: u32,
         backend: B,
         snapshots: SnapshotWriter,
         trace: TraceWriter<W>,
     ) -> Self {
         Self {
-            question: question.into(),
+            brief,
             rounds,
             backend,
             snapshots,
@@ -168,7 +169,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
 
             let raw = self
                 .backend
-                .plan(&self.question, &self.archived, &self.previous_queries)
+                .plan(&self.brief, &self.archived, &self.previous_queries)
                 .await
                 .map_err(|error| error.at(PipelineStage::Planning))?;
             let queries = plan_queries(&raw, &self.previous_queries)
@@ -286,7 +287,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             .collect();
         let raw = self
             .backend
-            .select(&self.question, &excerpts)
+            .select(&self.brief, &excerpts)
             .await
             .map_err(|error| error.at(PipelineStage::Selection))?;
         let selected = select_sources(&raw, &run_snapshots)
@@ -338,7 +339,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
         drop(reader);
         let raw = self
             .backend
-            .synthesize(&self.question, &evidence)
+            .synthesize(&self.brief, &evidence)
             .await
             .map_err(|error| error.at(PipelineStage::Synthesis))?;
         let answer = synthesize_answer(&raw, &supplied)
@@ -554,7 +555,9 @@ mod tests {
     use chrono::Utc;
 
     use super::*;
-    use crate::{CrawlMeta, ErrorClass, RunHeader, TracePolicy};
+    use crate::{
+        CrawlMeta, ErrorClass, RunHeader, TRACE_SCHEMA_VERSION, TracePolicy, trace::LegacyRunHeader,
+    };
 
     #[derive(Default)]
     struct FixtureBackend {
@@ -565,16 +568,20 @@ mod tests {
         synthesize_calls: u32,
         plan_error: bool,
         duplicate_urls: bool,
+        planned_briefs: Vec<ConfirmedResearchBrief>,
+        selected_brief: Option<ConfirmedResearchBrief>,
+        synthesized_brief: Option<ConfirmedResearchBrief>,
     }
 
     impl ResearchBackend for FixtureBackend {
         fn plan(
             &mut self,
-            _question: &str,
+            brief: &ConfirmedResearchBrief,
             _snapshots: &[Snapshot],
             _previous_queries: &[String],
         ) -> impl Future<Output = Result<String>> {
             self.plan_calls += 1;
+            self.planned_briefs.push(brief.clone());
             let round = self.plan_calls;
             std::future::ready(if self.plan_error {
                 Err(SearchError::ModelCall {
@@ -639,9 +646,10 @@ mod tests {
 
         fn select(
             &mut self,
-            _question: &str,
+            brief: &ConfirmedResearchBrief,
             _excerpts: &[Excerpt],
         ) -> impl Future<Output = Result<String>> {
+            self.selected_brief = Some(brief.clone());
             std::future::ready(self.selected_ref.as_ref().map_or_else(
                 || {
                     Err(SearchError::ModelCall {
@@ -659,10 +667,11 @@ mod tests {
 
         fn synthesize(
             &mut self,
-            _question: &str,
+            brief: &ConfirmedResearchBrief,
             _snapshots: &[Snapshot],
         ) -> impl Future<Output = Result<String>> {
             self.synthesize_calls += 1;
+            self.synthesized_brief = Some(brief.clone());
             std::future::ready(self.selected_ref.as_ref().map_or_else(
                 || {
                     Err(SearchError::ModelCall {
@@ -720,12 +729,35 @@ mod tests {
         }
     }
 
+    fn confirmed_brief() -> ConfirmedResearchBrief {
+        let brief = crate::ResearchBrief {
+            schema_version: crate::RESEARCH_BRIEF_SCHEMA_VERSION,
+            original_question: "question 原文".into(),
+            research_question: "focused research question".into(),
+            desired_output: Some("concise answer".into()),
+            scope: crate::ResearchScope::default(),
+            source_constraints: vec!["primary sources".into()],
+            accepted_assumptions: vec!["fixture assumption".into()],
+        };
+        let hash = brief.content_hash().unwrap();
+        ConfirmedResearchBrief::new(
+            brief,
+            "question 原文",
+            "clarification-fixture".into(),
+            &hash,
+            Utc::now(),
+        )
+        .unwrap()
+    }
+
     fn session_with_rounds(db: &TempDb, rounds: u32) -> ResearchSession<FixtureBackend, Vec<u8>> {
+        let brief = confirmed_brief();
         let trace = TraceWriter::new(
             Vec::new(),
             RunHeader {
                 run_id: "fixture".into(),
-                question: "question".into(),
+                clarification_id: brief.clarification_id().into(),
+                brief: brief.clone(),
                 started_at: Utc::now(),
                 policy: TracePolicy {
                     rounds,
@@ -736,7 +768,7 @@ mod tests {
         )
         .unwrap();
         ResearchSession::new(
-            "question",
+            brief,
             rounds,
             FixtureBackend::default(),
             SnapshotWriter::open(&db.0).unwrap(),
@@ -804,11 +836,11 @@ mod tests {
     #[tokio::test]
     async fn run_preserves_original_and_trace_failures() {
         let db = TempDb::new("run-trace-failure");
-        let trace = TraceWriter::new(
+        let trace = TraceWriter::new_legacy(
             FailAfterHeader {
                 header_written: false,
             },
-            RunHeader {
+            LegacyRunHeader {
                 run_id: "trace-failure".into(),
                 question: "question".into(),
                 started_at: Utc::now(),
@@ -825,7 +857,7 @@ mod tests {
             ..FixtureBackend::default()
         };
         let mut session = ResearchSession::new(
-            "question",
+            confirmed_brief(),
             DEFAULT_EXPLORE_ROUNDS,
             backend,
             SnapshotWriter::open(&db.0).unwrap(),
@@ -961,7 +993,6 @@ mod tests {
     async fn nobel_fixture_runs_end_to_end_and_replays_audit_trace() {
         let db = TempDb::new("nobel-e2e");
         let mut session = session(&db);
-        session.question = "2024 年诺贝尔物理学奖颁给了谁？获奖理由是什么？".into();
 
         session.explore().await.unwrap();
         let selected = session.archived[0].snapshot_ref.clone();
@@ -974,6 +1005,23 @@ mod tests {
         assert!(answer.answer.contains("John Hopfield"));
         assert!(answer.answer.contains("Geoffrey Hinton"));
         assert_eq!(answer.claims[0].snapshot_refs, vec![selected]);
+
+        let expected_brief = session.brief.clone();
+        assert!(
+            session
+                .backend
+                .planned_briefs
+                .iter()
+                .all(|brief| brief == &expected_brief)
+        );
+        assert_eq!(
+            session.backend.selected_brief.as_ref(),
+            Some(&expected_brief)
+        );
+        assert_eq!(
+            session.backend.synthesized_brief.as_ref(),
+            Some(&expected_brief)
+        );
 
         let trace = String::from_utf8(session.trace.into_inner()).unwrap();
         let events: Vec<TraceEvent> = trace
@@ -1014,7 +1062,20 @@ mod tests {
                 _ => {}
             }
         }
-        assert!(matches!(events.first(), Some(TraceEvent::RunHeader { .. })));
+        match events.first() {
+            Some(TraceEvent::RunHeader {
+                schema_version,
+                clarification_id: Some(clarification_id),
+                brief: Some(header_brief),
+                ..
+            }) => {
+                assert_eq!(*schema_version, TRACE_SCHEMA_VERSION);
+                assert_eq!(clarification_id, expected_brief.clarification_id());
+                assert_eq!(header_brief.as_ref(), &expected_brief);
+                assert_eq!(header_brief.content_hash(), expected_brief.content_hash());
+            }
+            event => panic!("expected v3 run header, got {event:?}"),
+        }
         assert!(matches!(events.last(), Some(TraceEvent::Answer { .. })));
     }
 

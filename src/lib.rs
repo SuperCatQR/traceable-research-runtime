@@ -24,7 +24,7 @@ pub mod web;
 // module paths.
 pub use adapters::{CrawlClient, SearxngClient, StrongClient, validate_public_url};
 pub use app::{AppConfig, PublicAnswer, PublicClaim, PublicError, PublicSource, ResearchService};
-pub use backend::{LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
+pub use backend::{INTAKE_PROMPT, LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
 pub use error::{ErrorClass, PipelineStage, Result, SearchError};
 pub use intake::{
     ClarificationAnswer, ClarificationQuestion, INTAKE_EVENT_SCHEMA_VERSION, IntakeError,
@@ -36,7 +36,8 @@ pub use intake::{
 };
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{
-    RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy, TraceWriter,
+    ReplayedRunHeader, RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy,
+    TraceWriter, replay_run_header,
 };
 pub use types::{
     Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlMeta, Excerpt, Query,

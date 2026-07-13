@@ -30,7 +30,8 @@ pub use trace::{
     RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy, TraceWriter,
 };
 pub use types::{
-    Answer, Claim, CrawlMeta, Excerpt, Query, SearchResult, Snapshot, SnapshotRef, content_hash,
-    search_result_id, snapshot_id, snapshot_ref,
+    Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlMeta, Excerpt, Query,
+    RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief, ResearchScope, SearchResult, Snapshot,
+    SnapshotRef, content_hash, search_result_id, snapshot_id, snapshot_ref,
 };
 pub use web::router;

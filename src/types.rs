@@ -57,7 +57,268 @@ pub fn snapshot_ref(snapshot_id: &str) -> String {
 }
 
 // ---------------------------------------------------------------------------
-// Domain types
+// Research Intake domain types
+// ---------------------------------------------------------------------------
+
+pub const RESEARCH_BRIEF_SCHEMA_VERSION: u32 = 1;
+pub const MAX_QUESTION_CHARS: usize = 10_000;
+pub const MAX_BRIEF_STRING_CHARS: usize = 4_000;
+pub const MAX_BRIEF_ARRAY_ITEMS: usize = 32;
+pub const MAX_BRIEF_ARRAY_ITEM_CHARS: usize = 2_000;
+
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResearchScope {
+    pub time_range: Option<String>,
+    pub geography: Option<String>,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ResearchBrief {
+    pub schema_version: u32,
+    pub original_question: String,
+    pub research_question: String,
+    pub desired_output: Option<String>,
+    pub scope: ResearchScope,
+    pub source_constraints: Vec<String>,
+    pub accepted_assumptions: Vec<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum BriefValidationError {
+    #[error("unsupported research brief schema version {0}")]
+    UnsupportedSchemaVersion(u32),
+    #[error("{0} must not be empty")]
+    Empty(&'static str),
+    #[error("{field} exceeds {max} characters")]
+    TooLong { field: &'static str, max: usize },
+    #[error("{field} exceeds {max} items")]
+    TooManyItems { field: &'static str, max: usize },
+    #[error("{field}[{index}] must not be empty")]
+    EmptyArrayItem { field: &'static str, index: usize },
+    #[error("original_question cannot be changed")]
+    OriginalQuestionChanged,
+    #[error("research brief is not canonical")]
+    NonCanonical,
+    #[error("research brief content hash mismatch: expected {expected}, got {actual}")]
+    ContentHashMismatch { expected: String, actual: String },
+}
+
+impl ResearchBrief {
+    /// Trim and validate a draft while pinning its immutable original question.
+    pub fn normalized(
+        mut self,
+        expected_original_question: &str,
+    ) -> std::result::Result<Self, BriefValidationError> {
+        if self.schema_version != RESEARCH_BRIEF_SCHEMA_VERSION {
+            return Err(BriefValidationError::UnsupportedSchemaVersion(
+                self.schema_version,
+            ));
+        }
+
+        let expected_original = normalize_required(
+            "original_question",
+            expected_original_question,
+            MAX_QUESTION_CHARS,
+        )?;
+        let supplied_original = normalize_required(
+            "original_question",
+            &self.original_question,
+            MAX_QUESTION_CHARS,
+        )?;
+        if supplied_original != expected_original {
+            return Err(BriefValidationError::OriginalQuestionChanged);
+        }
+
+        self.original_question = expected_original;
+        self.research_question = normalize_required(
+            "research_question",
+            &self.research_question,
+            MAX_QUESTION_CHARS,
+        )?;
+        self.desired_output = normalize_optional("desired_output", self.desired_output)?;
+        self.scope.time_range = normalize_optional("scope.time_range", self.scope.time_range)?;
+        self.scope.geography = normalize_optional("scope.geography", self.scope.geography)?;
+        self.scope.include = normalize_list("scope.include", self.scope.include)?;
+        self.scope.exclude = normalize_list("scope.exclude", self.scope.exclude)?;
+        self.source_constraints = normalize_list("source_constraints", self.source_constraints)?;
+        self.accepted_assumptions =
+            normalize_list("accepted_assumptions", self.accepted_assumptions)?;
+        Ok(self)
+    }
+
+    pub fn content_hash(&self) -> std::result::Result<String, BriefValidationError> {
+        let normalized = self.clone().normalized(&self.original_question)?;
+        Ok(hash_normalized_brief(&normalized))
+    }
+}
+
+fn normalize_required(
+    field: &'static str,
+    value: &str,
+    max: usize,
+) -> std::result::Result<String, BriefValidationError> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(BriefValidationError::Empty(field));
+    }
+    if value.chars().count() > max {
+        return Err(BriefValidationError::TooLong { field, max });
+    }
+    Ok(value.to_owned())
+}
+
+fn normalize_optional(
+    field: &'static str,
+    value: Option<String>,
+) -> std::result::Result<Option<String>, BriefValidationError> {
+    value
+        .map(|value| {
+            let value = value.trim();
+            if value.is_empty() {
+                Ok(None)
+            } else if value.chars().count() > MAX_BRIEF_STRING_CHARS {
+                Err(BriefValidationError::TooLong {
+                    field,
+                    max: MAX_BRIEF_STRING_CHARS,
+                })
+            } else {
+                Ok(Some(value.to_owned()))
+            }
+        })
+        .unwrap_or(Ok(None))
+}
+
+fn normalize_list(
+    field: &'static str,
+    values: Vec<String>,
+) -> std::result::Result<Vec<String>, BriefValidationError> {
+    if values.len() > MAX_BRIEF_ARRAY_ITEMS {
+        return Err(BriefValidationError::TooManyItems {
+            field,
+            max: MAX_BRIEF_ARRAY_ITEMS,
+        });
+    }
+    values
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| {
+            let value = value.trim();
+            if value.is_empty() {
+                return Err(BriefValidationError::EmptyArrayItem { field, index });
+            }
+            if value.chars().count() > MAX_BRIEF_ARRAY_ITEM_CHARS {
+                return Err(BriefValidationError::TooLong {
+                    field,
+                    max: MAX_BRIEF_ARRAY_ITEM_CHARS,
+                });
+            }
+            Ok(value.to_owned())
+        })
+        .collect()
+}
+
+fn hash_normalized_brief(brief: &ResearchBrief) -> String {
+    let json = serde_json::to_vec(brief).expect("ResearchBrief serialization cannot fail");
+    let mut hash = Sha256::new();
+    hash.update(json);
+    format!("sha256:{}", hex::encode(hash.finalize()))
+}
+
+/// A confirmed brief has no mutable fields or setters. Construction verifies
+/// the exact hash displayed to the user; deserialization repeats that check.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ConfirmedResearchBrief {
+    brief: ResearchBrief,
+    clarification_id: String,
+    content_hash: String,
+    confirmed_at: DateTime<Utc>,
+}
+
+impl ConfirmedResearchBrief {
+    pub fn new(
+        brief: ResearchBrief,
+        expected_original_question: &str,
+        clarification_id: String,
+        expected_content_hash: &str,
+        confirmed_at: DateTime<Utc>,
+    ) -> std::result::Result<Self, BriefValidationError> {
+        let brief = brief.normalized(expected_original_question)?;
+        let actual = hash_normalized_brief(&brief);
+        if actual != expected_content_hash {
+            return Err(BriefValidationError::ContentHashMismatch {
+                expected: expected_content_hash.to_owned(),
+                actual,
+            });
+        }
+        if clarification_id.trim().is_empty() {
+            return Err(BriefValidationError::Empty("clarification_id"));
+        }
+        Ok(Self {
+            brief,
+            clarification_id,
+            content_hash: expected_content_hash.to_owned(),
+            confirmed_at,
+        })
+    }
+
+    #[must_use]
+    pub fn brief(&self) -> &ResearchBrief {
+        &self.brief
+    }
+
+    #[must_use]
+    pub fn clarification_id(&self) -> &str {
+        &self.clarification_id
+    }
+
+    #[must_use]
+    pub fn content_hash(&self) -> &str {
+        &self.content_hash
+    }
+
+    #[must_use]
+    pub const fn confirmed_at(&self) -> &DateTime<Utc> {
+        &self.confirmed_at
+    }
+}
+
+#[derive(Deserialize)]
+struct ConfirmedResearchBriefWire {
+    brief: ResearchBrief,
+    clarification_id: String,
+    content_hash: String,
+    confirmed_at: DateTime<Utc>,
+}
+
+impl<'de> Deserialize<'de> for ConfirmedResearchBrief {
+    fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let wire = ConfirmedResearchBriefWire::deserialize(deserializer)?;
+        let normalized = wire
+            .brief
+            .clone()
+            .normalized(&wire.brief.original_question)
+            .map_err(serde::de::Error::custom)?;
+        if normalized != wire.brief {
+            return Err(serde::de::Error::custom(BriefValidationError::NonCanonical));
+        }
+        Self::new(
+            wire.brief.clone(),
+            &wire.brief.original_question,
+            wire.clarification_id,
+            &wire.content_hash,
+            wire.confirmed_at,
+        )
+        .map_err(serde::de::Error::custom)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Existing research domain types
 // ---------------------------------------------------------------------------
 
 /// A reference to a stored snapshot: `"snapshot:web/<id>"`. Newtype so a raw
@@ -265,5 +526,118 @@ mod tests {
         let json = serde_json::to_string(&ans).unwrap();
         let back: Answer = serde_json::from_str(&json).unwrap();
         assert_eq!(ans, back);
+    }
+
+    fn intake_brief() -> ResearchBrief {
+        ResearchBrief {
+            schema_version: RESEARCH_BRIEF_SCHEMA_VERSION,
+            original_question: "Which database is best?".into(),
+            research_question: "Compare PostgreSQL and SQLite for a single-user local application"
+                .into(),
+            desired_output: Some("A concise trade-off table".into()),
+            scope: ResearchScope {
+                time_range: None,
+                geography: None,
+                include: vec!["operational simplicity".into()],
+                exclude: vec![],
+            },
+            source_constraints: vec![],
+            accepted_assumptions: vec!["One developer".into()],
+        }
+    }
+
+    #[test]
+    fn research_brief_hash_is_pinned_and_fields_affect_it() {
+        let brief = intake_brief();
+        assert_eq!(
+            brief.content_hash().unwrap(),
+            "sha256:52f7593b95ea27fa1fd70382aa7dbaaa97f2ac9aa7dadda30c74789a5efbd289"
+        );
+        let mut changed = brief.clone();
+        changed.research_question.push('?');
+        assert_ne!(
+            brief.content_hash().unwrap(),
+            changed.content_hash().unwrap()
+        );
+    }
+
+    #[test]
+    fn research_brief_normalizes_empty_optional_constraints() {
+        let mut brief = intake_brief();
+        brief.original_question = "  Which database is best?  ".into();
+        brief.desired_output = Some("  ".into());
+        let normalized = brief.normalized(" Which database is best? ").unwrap();
+        assert_eq!(normalized.original_question, "Which database is best?");
+        assert_eq!(normalized.desired_output, None);
+        assert!(normalized.source_constraints.is_empty());
+    }
+
+    #[test]
+    fn research_brief_rejects_changed_original_and_boundaries() {
+        let mut changed = intake_brief();
+        changed.original_question = "A different question".into();
+        assert_eq!(
+            changed.normalized("Which database is best?").unwrap_err(),
+            BriefValidationError::OriginalQuestionChanged
+        );
+
+        let mut empty = intake_brief();
+        empty.research_question = "  ".into();
+        assert_eq!(
+            empty.normalized("Which database is best?").unwrap_err(),
+            BriefValidationError::Empty("research_question")
+        );
+
+        let mut too_long = intake_brief();
+        too_long.desired_output = Some("x".repeat(MAX_BRIEF_STRING_CHARS + 1));
+        assert!(matches!(
+            too_long.normalized("Which database is best?"),
+            Err(BriefValidationError::TooLong {
+                field: "desired_output",
+                ..
+            })
+        ));
+
+        let mut too_many = intake_brief();
+        too_many.scope.include = vec!["x".into(); MAX_BRIEF_ARRAY_ITEMS + 1];
+        assert!(matches!(
+            too_many.normalized("Which database is best?"),
+            Err(BriefValidationError::TooManyItems {
+                field: "scope.include",
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn confirmed_research_brief_roundtrips_and_rejects_wrong_hash() {
+        let brief = intake_brief();
+        let hash = brief.content_hash().unwrap();
+        let confirmed_at = DateTime::parse_from_rfc3339("2026-07-11T10:00:00Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let confirmed = ConfirmedResearchBrief::new(
+            brief.clone(),
+            &brief.original_question,
+            "clarification-1".into(),
+            &hash,
+            confirmed_at,
+        )
+        .unwrap();
+        let json = serde_json::to_string(&confirmed).unwrap();
+        let back: ConfirmedResearchBrief = serde_json::from_str(&json).unwrap();
+        assert_eq!(confirmed, back);
+        assert_eq!(back.brief(), &brief);
+
+        assert!(matches!(
+            ConfirmedResearchBrief::new(
+                brief.clone(),
+                &brief.original_question,
+                "clarification-1".into(),
+                "sha256:wrong",
+                confirmed_at,
+            ),
+            Err(BriefValidationError::ContentHashMismatch { .. })
+        ));
     }
 }

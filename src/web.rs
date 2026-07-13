@@ -371,7 +371,7 @@ mod tests {
             revision: 0,
             created_at: Utc::now(),
         });
-        let mut log = IntakeLog::create(data_dir.join("intakes"), started).unwrap();
+        let mut log = IntakeLog::create(data_dir.join("intake"), started).unwrap();
         let revised = minimal_brief_event(log.session(), Utc::now()).unwrap();
         log.append(&revised).unwrap();
         (

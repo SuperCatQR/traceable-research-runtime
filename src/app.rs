@@ -132,7 +132,7 @@ impl ResearchService {
             revision: 0,
             created_at: Utc::now(),
         });
-        let mut log = IntakeLog::create(self.config.data_dir.join("intakes"), started)?;
+        let mut log = IntakeLog::create(self.config.data_dir.join("intake"), started)?;
         self.advance_intake(&mut log).await?;
         Ok(log.session().clone())
     }
@@ -145,7 +145,7 @@ impl ResearchService {
         edited_brief: Option<ResearchBrief>,
     ) -> Result<IntakeSession, IntakeCommandError> {
         let _guard = self.intake_locks.lock(clarification_id).await?;
-        let mut log = IntakeLog::open(self.config.data_dir.join("intakes"), clarification_id)?;
+        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
         let edited_brief = edited_brief
             .map(|brief| {
                 let brief = brief
@@ -213,7 +213,7 @@ impl ResearchService {
         revision: u32,
     ) -> Result<IntakeSession, IntakeCommandError> {
         let _guard = self.intake_locks.lock(clarification_id).await?;
-        let mut log = IntakeLog::open(self.config.data_dir.join("intakes"), clarification_id)?;
+        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
         if log.session().revision != revision {
             return Err(IntakeError::StaleBrief {
                 current_revision: log.session().revision,
@@ -285,7 +285,7 @@ impl ResearchService {
         policy: TracePolicy,
     ) -> Result<PreparedRun, PrepareRunError> {
         let _guard = self.intake_locks.lock(clarification_id).await?;
-        let mut log = IntakeLog::open(self.config.data_dir.join("intakes"), clarification_id)?;
+        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
 
         let confirmation = if log.session().status == IntakeStatus::Confirmed {
             if requested_revision != log.session().revision {
@@ -502,7 +502,7 @@ mod tests {
             revision: 0,
             created_at: Utc::now(),
         });
-        let mut log = IntakeLog::create(service.config.data_dir.join("intakes"), started).unwrap();
+        let mut log = IntakeLog::create(service.config.data_dir.join("intake"), started).unwrap();
         let revised = minimal_brief_event(log.session(), Utc::now()).unwrap();
         log.append(&revised).unwrap();
         (
@@ -521,7 +521,7 @@ mod tests {
             revision: 0,
             created_at: Utc::now(),
         });
-        let mut log = IntakeLog::create(service.config.data_dir.join("intakes"), started).unwrap();
+        let mut log = IntakeLog::create(service.config.data_dir.join("intake"), started).unwrap();
         let brief = match minimal_brief_event(log.session(), Utc::now()).unwrap().kind {
             IntakeEventKind::BriefRevised { brief, .. } => brief,
             other => panic!("minimal_brief_event produced {other:?}"),
@@ -556,7 +556,7 @@ mod tests {
         assert!(session.content_hash.is_some());
 
         let replayed =
-            replay_intake(service.config.data_dir.join("intakes"), clarification_id).unwrap();
+            replay_intake(service.config.data_dir.join("intake"), clarification_id).unwrap();
         assert_eq!(replayed.status, IntakeStatus::ReadyToConfirm);
         fs::remove_dir_all(&service.config.data_dir).unwrap();
     }
@@ -616,7 +616,7 @@ mod tests {
 
         assert_eq!(second, first);
         let replayed = replay_intake(
-            service.config.data_dir.join("intakes"),
+            service.config.data_dir.join("intake"),
             "clarification-idempotent",
         )
         .unwrap();
@@ -635,7 +635,7 @@ mod tests {
         let clarification_id = "clarification-crash-window";
         let (revision, content_hash) = ready_intake(&service, clarification_id);
         let mut log =
-            IntakeLog::open(service.config.data_dir.join("intakes"), clarification_id).unwrap();
+            IntakeLog::open(service.config.data_dir.join("intake"), clarification_id).unwrap();
         let confirmed = confirmation_event(
             log.session(),
             revision,

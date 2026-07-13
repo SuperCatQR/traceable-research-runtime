@@ -18,6 +18,7 @@ __pycache__/
 
 # Rust build artifacts (Cargo.lock is committed: this is a binary app, not a lib)
 /target/
+/data/
 
 # dev scratch (detached build/test logs)
 /build_*.log

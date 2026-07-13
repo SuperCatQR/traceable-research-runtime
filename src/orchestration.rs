@@ -10,9 +10,11 @@ use crate::{
     SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection, TraceEvent, TraceWriter,
 };
 
-pub const EXPLORE_ROUNDS: u32 = 3;
+pub const MIN_EXPLORE_ROUNDS: u32 = 3;
+pub const DEFAULT_EXPLORE_ROUNDS: u32 = 3;
+pub const MAX_EXPLORE_ROUNDS: u32 = 5;
 pub const QUERIES_PER_ROUND: usize = 3;
-pub const MAX_STRONG_INPUT_TOKENS: usize = 800_000;
+pub const MAX_STRONG_INPUT_TOKENS: usize = 1_000_000;
 pub const MAX_SNAPSHOTS: usize = 300;
 pub const MAX_READ_SNAPSHOTS: usize = 100;
 const MAX_QUERY_CHARS: usize = 200;
@@ -58,8 +60,22 @@ pub trait ResearchBackend {
     ) -> impl Future<Output = Result<String>>;
 }
 
+#[derive(Debug)]
+pub struct AnswerSource {
+    pub snapshot_ref: SnapshotRef,
+    pub url: String,
+    pub title: String,
+}
+
+#[derive(Debug)]
+pub struct ResearchResult {
+    pub answer: Answer,
+    pub sources: Vec<AnswerSource>,
+}
+
 pub struct ResearchSession<B, W: Write> {
     question: String,
+    rounds: u32,
     backend: B,
     snapshots: SnapshotWriter,
     trace: TraceWriter<W>,
@@ -73,12 +89,14 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     #[must_use]
     pub fn new(
         question: impl Into<String>,
+        rounds: u32,
         backend: B,
         snapshots: SnapshotWriter,
         trace: TraceWriter<W>,
     ) -> Self {
         Self {
             question: question.into(),
+            rounds,
             backend,
             snapshots,
             trace,
@@ -90,16 +108,33 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     }
 
     /// Runs the complete pipeline and records exactly one terminal failure event.
-    pub async fn run(&mut self, snapshot_path: impl AsRef<Path>) -> Result<Answer> {
-        let result = async {
+    pub async fn run(&mut self, snapshot_path: impl AsRef<Path>) -> Result<ResearchResult> {
+        let result: Result<ResearchResult> = async {
             self.explore()
                 .await
                 .map_err(|error| error.at(PipelineStage::Planning))?;
             let reader = SnapshotReader::open(snapshot_path)
                 .map_err(|error| error.at(PipelineStage::Setup))?;
-            self.synthesize_answer(reader)
+            let answer = self
+                .synthesize_answer(reader)
                 .await
-                .map_err(|error| error.at(PipelineStage::Synthesis))
+                .map_err(|error| error.at(PipelineStage::Synthesis))?;
+            let cited: HashSet<_> = answer
+                .claims
+                .iter()
+                .flat_map(|claim| claim.snapshot_refs.iter().cloned())
+                .collect();
+            let sources = self
+                .archived
+                .iter()
+                .filter(|snapshot| cited.contains(&snapshot.snapshot_ref))
+                .map(|snapshot| AnswerSource {
+                    snapshot_ref: snapshot.snapshot_ref.clone(),
+                    url: snapshot.crawl.final_url.clone(),
+                    title: snapshot.title.clone(),
+                })
+                .collect();
+            Ok(ResearchResult { answer, sources })
         }
         .await;
 
@@ -123,7 +158,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     }
 
     pub async fn explore(&mut self) -> Result<&ResearchState> {
-        for round in 1..=EXPLORE_ROUNDS {
+        for round in 1..=self.rounds {
             self.state.round = round;
             self.state.estimated_input_tokens = estimate_snapshot_tokens(&self.archived);
             if self.state.estimated_input_tokens >= MAX_STRONG_INPUT_TOKENS {
@@ -685,7 +720,7 @@ mod tests {
         }
     }
 
-    fn session(db: &TempDb) -> ResearchSession<FixtureBackend, Vec<u8>> {
+    fn session_with_rounds(db: &TempDb, rounds: u32) -> ResearchSession<FixtureBackend, Vec<u8>> {
         let trace = TraceWriter::new(
             Vec::new(),
             RunHeader {
@@ -693,7 +728,7 @@ mod tests {
                 question: "question".into(),
                 started_at: Utc::now(),
                 policy: TracePolicy {
-                    rounds: EXPLORE_ROUNDS,
+                    rounds,
                     input_budget: MAX_STRONG_INPUT_TOKENS as u32,
                     max_snapshots: MAX_SNAPSHOTS as u32,
                 },
@@ -702,10 +737,15 @@ mod tests {
         .unwrap();
         ResearchSession::new(
             "question",
+            rounds,
             FixtureBackend::default(),
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
         )
+    }
+
+    fn session(db: &TempDb) -> ResearchSession<FixtureBackend, Vec<u8>> {
+        session_with_rounds(db, DEFAULT_EXPLORE_ROUNDS)
     }
 
     #[tokio::test]
@@ -773,7 +813,7 @@ mod tests {
                 question: "question".into(),
                 started_at: Utc::now(),
                 policy: TracePolicy {
-                    rounds: EXPLORE_ROUNDS,
+                    rounds: DEFAULT_EXPLORE_ROUNDS,
                     input_budget: MAX_STRONG_INPUT_TOKENS as u32,
                     max_snapshots: MAX_SNAPSHOTS as u32,
                 },
@@ -786,6 +826,7 @@ mod tests {
         };
         let mut session = ResearchSession::new(
             "question",
+            DEFAULT_EXPLORE_ROUNDS,
             backend,
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
@@ -811,11 +852,14 @@ mod tests {
 
         let state = session.explore().await.unwrap().clone();
 
-        assert_eq!(state.round, EXPLORE_ROUNDS);
+        assert_eq!(state.round, DEFAULT_EXPLORE_ROUNDS);
         assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
-        assert_eq!(session.backend.plan_calls, EXPLORE_ROUNDS);
-        assert_eq!(session.backend.search_calls, EXPLORE_ROUNDS * 3);
-        assert_eq!(session.backend.crawl_calls, EXPLORE_ROUNDS * 3);
+        assert_eq!(session.backend.plan_calls, DEFAULT_EXPLORE_ROUNDS);
+        assert_eq!(
+            session.backend.search_calls,
+            DEFAULT_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
+        );
+        assert_eq!(session.backend.crawl_calls, DEFAULT_EXPLORE_ROUNDS * 3);
         assert_eq!(session.archived.len(), 8);
         let trace = String::from_utf8(session.trace.into_inner()).unwrap();
         assert_eq!(trace.matches("\"type\":\"archive_skip\"").count(), 1);
@@ -829,6 +873,22 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn explore_accepts_five_rounds() {
+        let db = TempDb::new("five-rounds");
+        let mut session = session_with_rounds(&db, MAX_EXPLORE_ROUNDS);
+
+        let state = session.explore().await.unwrap().clone();
+
+        assert_eq!(state.round, MAX_EXPLORE_ROUNDS);
+        assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
+        assert_eq!(session.backend.plan_calls, MAX_EXPLORE_ROUNDS);
+        assert_eq!(
+            session.backend.search_calls,
+            MAX_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
+        );
+    }
+
+    #[tokio::test]
     async fn explore_runs_all_rounds_when_every_search_repeats_the_same_url() {
         let db = TempDb::new("duplicate-search-results");
         let mut session = session(&db);
@@ -836,10 +896,13 @@ mod tests {
 
         let state = session.explore().await.unwrap().clone();
 
-        assert_eq!(state.round, EXPLORE_ROUNDS);
+        assert_eq!(state.round, DEFAULT_EXPLORE_ROUNDS);
         assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
-        assert_eq!(session.backend.plan_calls, EXPLORE_ROUNDS);
-        assert_eq!(session.backend.search_calls, EXPLORE_ROUNDS * 3);
+        assert_eq!(session.backend.plan_calls, DEFAULT_EXPLORE_ROUNDS);
+        assert_eq!(
+            session.backend.search_calls,
+            DEFAULT_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
+        );
         assert_eq!(session.backend.crawl_calls, 1);
         assert_eq!(session.archived.len(), 1);
     }

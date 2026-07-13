@@ -1,12 +1,12 @@
 # traceable-search
 
-可审计的 Web 研究 MCP 服务：经 Bing 搜索、crawl4ai 抓取并锁定网页快照，再由 OpenAI-compatible 强模型生成带 `snapshot_ref` 的答案。服务通过 MCP `stdio` 暴露 `research_web` 工具。
+可审计的 Web 研究服务：经 Bing 搜索、crawl4ai 抓取并锁定网页快照，再由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。服务在 `http://127.0.0.1:8787/` 提供 WebUI；内部以 `snapshot_ref` 与内容哈希完成校验和审计。
 
 ## 架构
 
 ```text
-MCP client ──stdio── traceable-search
-                       ├── Python ddgs ── Bing
+Browser ──HTTP/SSE── traceable-search WebUI
+                       ├── HTTP ── SearXNG ── Bing
                        ├── HTTP ── crawl4ai
                        ├── HTTP ── upstream model
                        └── data/
@@ -20,27 +20,93 @@ MCP client ──stdio── traceable-search
 
 - Podman 可运行的 Linux 环境（Windows 建议使用 WSL2；本文以 Ubuntu 24.04 为例）
 - Rust toolchain
-- Python 3.12 与 `pip`
+- Linux 构建依赖：`pkg-config` 与 OpenSSL 开发包（Ubuntu 24.04：`sudo apt install pkg-config libssl-dev`）
+- `curl`（服务连通性验证）
+- Python 3（仅供下述部署命令生成随机密钥及校验 JSON；`traceable-search` 本身不依赖 Python）
 
-安装搜索依赖并构建：
+构建并测试：
 
 ```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements-search.txt
 cargo build --release
 cargo test
 ```
 
-> [!IMPORTANT]
-> 运行 `traceable-search` 时，`PATH` 中的 `python` 必须能导入 `ddgs`。
-
 ## 外部服务
 
-本项目不部署或管理外部服务。请自行准备：
+本项目不部署或管理外部服务。宿主须能访问 Bing、待抓取的公开网页及上游模型端点。请自行准备：
 
+- SearXNG：自托管 JSON Search API；
 - crawl4ai `0.9.1`：可访问的 `/crawl` API 及 bearer token（若启用认证）；
 - 上游模型：OpenAI-compatible `/v1/chat/completions` API、API key 与模型名。
+
+### SearXNG 部署示例
+
+以下为 WSL rootless Podman 示例。宿主机需有 `python3`，用于生成 `SECRET_KEY` 及后续校验 JSON；SearXNG 容器已自带其运行环境：
+
+```bash
+install -d -m 700 ~/.config/searxng
+SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+umask 077
+cat > ~/.config/searxng/settings.yml <<EOF
+use_default_settings:
+  engines:
+    keep_only:
+      - bing
+
+general:
+  instance_name: "traceable-search"
+
+server:
+  secret_key: "$SECRET_KEY"
+  bind_address: "0.0.0.0"
+  port: 8080
+  limiter: false
+  image_proxy: false
+
+search:
+  safe_search: 0
+  autocomplete: ""
+  default_lang: "auto"
+  formats:
+    - html
+    - json
+
+engines:
+  - name: bing
+    engine: bing
+    shortcut: bi
+    disabled: false
+    base_url: https://cn.bing.com
+EOF
+unset SECRET_KEY
+
+podman run -d \
+  --name searxng \
+  --restart=unless-stopped \
+  --publish 127.0.0.1:8888:8080 \
+  --volume ~/.config/searxng:/etc/searxng:Z \
+  docker.io/searxng/searxng@sha256:bf2700fa1e7b63c9ef577004513efef509f9c23bfa2cd6e56be08211508df95a
+```
+
+验证 JSON Search API：
+
+```bash
+curl -fsS 'http://127.0.0.1:8888/search?q=Rust&format=json&categories=general' \
+  | python3 -c '
+import json, sys
+data = json.load(sys.stdin)
+engines = sorted({e for item in data.get("results", []) for e in item.get("engines", [])})
+print("results:", len(data.get("results", [])))
+print("engines:", engines)
+assert data.get("results") and engines == ["bing"]
+'
+```
+
+> [!NOTE]
+> 此配置仅保留 Bing engine，并使用 `https://cn.bing.com`。当前中英文 smoke test 均返回 10 条结果，且 `engines` 唯一为 `bing`。SearXNG 此处抓取 Bing 搜索页，并非调用官方 Bing Search API；仍可能受 CAPTCHA、限流或页面结构变化影响。
+
+> [!CAUTION]
+> 此配置关闭 limiter，仅适用于 localhost。若对外开放，须配置反向代理、HTTPS、访问控制及 Valkey/Redis limiter。
 
 ### crawl4ai 部署示例
 
@@ -122,56 +188,119 @@ set -a
 source .env
 set +a
 mkdir -p "$TRACEABLE_SEARCH_DATA_DIR"
+test -w "$TRACEABLE_SEARCH_DATA_DIR"
 ```
 
 变量说明：
 
 | 变量 | 必需 | 含义 |
 |---|---:|---|
+| `WEB_BIND` | 否 | WebUI 监听地址；默认 `127.0.0.1:8787`；容器内用 `0.0.0.0:8787` |
+| `SEARCH_BASE_URL` | 是 | SearXNG 基础 URL；保留尾部 `/` |
 | `CRAWL4AI_BASE_URL` | 是 | crawl4ai 基础 URL；保留尾部 `/` |
 | `CRAWL4AI_TOKEN` | 否 | crawl4ai bearer token；服务启用认证时填写 |
 | `STRONG_MODEL_BASE_URL` | 是 | 上游模型的 OpenAI-compatible API 基础 URL |
 | `STRONG_MODEL_API_KEY` | 是 | 上游模型签发的 API key |
 | `STRONG_MODEL_ID` | 是 | 上游模型名；建议 `deepseek-v4-pro` |
-| `TRACEABLE_SEARCH_DATA_DIR` | 否 | 快照与 trace 目录；默认 `data` |
+| `TRACEABLE_SEARCH_DATA_DIR` | 否 | 快照与 trace 目录；默认 `data`；运行用户须有写权限 |
 
 > [!IMPORTANT]
-> 基础 URL 应保留尾部 `/`。程序分别拼接 `crawl` 与 `chat/completions`。
+> 基础 URL 应保留尾部 `/`。程序分别拼接 `search`、`crawl` 与 `chat/completions`。
 
-## 接入 MCP client
+## 启动 WebUI
 
-本项目是 `stdio` MCP server，通常由 MCP client 直接启动。通用配置示例：
+本程序读取进程环境，不自动解析 `.env`。加载配置后启动：
+
+```bash
+set -a
+source .env
+set +a
+cargo run --release
+```
+
+浏览器访问：
+
+```text
+http://127.0.0.1:8787/
+```
+
+默认仅监听 localhost；一次仅运行一个研究任务。提交时可选择 3–5 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
+
+## Podman 容器
+
+仅 WebUI 主程序进入镜像；SearXNG、crawl4ai 与模型仍须独立部署。构建固定目标：
+
+```bash
+podman build --platform linux/amd64 \
+  --tag localhost/traceable-search:0.1.0 \
+  --file Containerfile .
+```
+
+准备权限受限的运行配置：
+
+```bash
+install -d -m 700 ~/.config/traceable-search
+umask 077
+cat > ~/.config/traceable-search/web.env <<'EOF'
+WEB_BIND=127.0.0.1:8787
+SEARCH_BASE_URL=http://127.0.0.1:8888/
+CRAWL4AI_BASE_URL=http://127.0.0.1:11235/
+CRAWL4AI_TOKEN=<token>
+STRONG_MODEL_BASE_URL=https://api.deepseek.com/
+STRONG_MODEL_API_KEY=<api-key>
+STRONG_MODEL_ID=deepseek-v4-pro
+TRACEABLE_SEARCH_DATA_DIR=/data
+EOF
+chmod 600 ~/.config/traceable-search/web.env
+mkdir -p data
+```
+
+此 WSL 部署使用 Podman host network，因 bridge 容器通常不能访问仅绑定 WSL loopback 的外部服务。启动：
+
+```bash
+podman run -d \
+  --name traceable-search \
+  --platform linux/amd64 \
+  --network host \
+  --env-file ~/.config/traceable-search/web.env \
+  --volume "$PWD/data:/data:Z" \
+  localhost/traceable-search:0.1.0
+```
+
+> [!CAUTION]
+> WebUI 无认证。host network 下必须保持 `WEB_BIND=127.0.0.1:8787`；勿改为 `0.0.0.0:8787`。密钥不得写入镜像或提交仓库。
+
+检查、停止：
+
+```bash
+podman logs --tail 50 traceable-search
+curl -fsS http://127.0.0.1:8787/
+podman stop traceable-search
+```
+
+升级时构建新 tag，删除旧容器，再以同一 env file 与 `/data` bind mount 启动；快照和 trace 因此保留。本机开发无需镜像，可继续直接运行 release binary。
+
+## 返回格式
+
+WebUI/API 返回来源 URL 与标题，不暴露内部 `snapshot_ref`：
 
 ```json
 {
-  "mcpServers": {
-    "traceable-search": {
-      "command": "/absolute/path/target/release/traceable-search",
-      "args": [],
-      "env": {
-        "PATH": "/absolute/path/.venv/bin:/usr/local/bin:/usr/bin",
-        "CRAWL4AI_BASE_URL": "http://127.0.0.1:11235/",
-        "CRAWL4AI_TOKEN": "<crawl4ai token>",
-        "STRONG_MODEL_BASE_URL": "http://127.0.0.1:3000/v1/",
-        "STRONG_MODEL_API_KEY": "<上游模型 API key>",
-        "STRONG_MODEL_ID": "<上游模型名>",
-        "TRACEABLE_SEARCH_DATA_DIR": "/absolute/path/data"
-      }
+  "answer": "grounded answer",
+  "claims": [
+    {
+      "text": "verifiable claim",
+      "sources": [
+        {"url": "https://example.com/page", "title": "Example"}
+      ]
     }
-  }
+  ]
 }
-```
-
-若 MCP client 运行于 Windows、binary 运行于 WSL，可令客户端通过 WSL 启动；具体配置依客户端对命令与参数的格式而异：
-
-```text
-command: wsl.exe
-args: ["--distribution", "Ubuntu-24.04", "--exec", "/absolute/wsl/path/target/release/traceable-search"]
 ```
 
 ## 验证
 
-先依外部服务文档验证 crawl4ai 与 OpenAI-compatible API 可达。一次成功研究后，本项目应生成：
+先验证 SearXNG、crawl4ai 与 OpenAI-compatible API 可达。一次成功研究后，本项目应生成：
 
 ```text
 data/snapshots.sqlite
@@ -182,8 +311,7 @@ data/traces/<run_id>.jsonl
 
 | 现象 | 检查 |
 |---|---|
-| `failed to start ddgs` | `PATH` 中是否存在 `python` |
-| `No module named 'ddgs'` | 是否在该 Python 环境执行 `pip install -r requirements-search.txt` |
+| SearXNG 返回空结果 | 检查 Bing engine、`unresponsive_engines` 与 `SEARCH_BASE_URL` |
 | crawl4ai 返回认证失败 | `CRAWL4AI_TOKEN` 是否为该服务签发的有效 token |
 | 模型返回 401 | `STRONG_MODEL_API_KEY` 是否有效 |
 | 模型端点 404 | `STRONG_MODEL_BASE_URL` 是否指向 OpenAI-compatible `/v1/` API |

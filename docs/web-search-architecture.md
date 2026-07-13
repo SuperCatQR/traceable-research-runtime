@@ -23,13 +23,13 @@
 
 ## 2. 产品目标
 
-- **探索有深度**：所有问题默认探索 `N > 1` 轮；暂定 `MAX_ROUNDS = 3`。
+- **探索有深度**：所有问题默认探索 `N > 1` 轮；用户可选 `3–5` 轮，默认 `3` 轮。
 - **高召回**：每轮每个查询词取 Bing 第一页，去重后全部尝试抓取，不做模型候选筛选。
 - **原文作答**：标题和程序摘录只导航；最终事实只能来自强模型实际读过的快照原文。
-- **可溯源**：事实结论携带 `snapshot_ref`，指向带哈希的不可变快照。
+- **可溯源**：内部事实结论携带 `snapshot_ref`，指向带哈希的不可变快照；WebUI/API 对外将其映射为来源 URL 与标题，不暴露内部引用。
 - **可审计**：查询、搜索结果、抓取结果、摘录、原文选择理由、结论和模型调用均落 trace/\<run\_id>.jsonl。
 - **流程可控**：模型只返回约定 JSON；`run.py` 仅作薄入口，轮数、抓取、预算、校验与终止均由研究编排层控制。
-- **大上下文优先**：按强模型 1M token 上下文设计；输入预算设为 `MAX_STRONG_INPUT_TOKENS = 800_000`，预留输出和系统指令空间。
+- **大上下文优先**：按强模型 1M token 上下文设计；输入预算设为 `MAX_STRONG_INPUT_TOKENS = 1_000_000`，预留输出和系统指令空间。
 
 ## 3. 网页获取的三个动作
 
@@ -45,7 +45,7 @@
 
 ### 3.1 搜索：`web_search`
 
-- 后端固定 Bing（`ddgs`，`backend="bing"`）；搜索结果仅导航，不作证据。
+- 后端固定为自托管 SearXNG，且仅启用 Bing engine；SearXNG 抓取 Bing 搜索页而非调用官方 Bing Search API。搜索结果仅导航，不作证据。
 - `MAX_QUERIES_PER_ROUND = 3`，每词 `RESULTS_PER_QUERY = 10`，即第一页规模。
 - 每轮理论候选最多 30 条；按规范化 URL 去重。三轮理论上限约 90 条，重复 URL 通常会使实际数量更少。
 - 每条结果记录 `query`、页内 `rank`、`title`、`snippet` 和 URL，便于回放 Bing 当时如何排序。
@@ -258,7 +258,7 @@ sequenceDiagram
     U->>R: 问题
     R->>X: ResearchSession(question, policy).run()
     X->>A: 记 question
-    loop 固定 N 轮，默认 N=3
+    loop 用户选择 N=3–5，默认 N=3
         X->>P: reader 读取本 run 既有原文
         P-->>X: 标题 + 原文 + snapshot_ref
         X->>S: 用户问题 + 既有原文
@@ -310,7 +310,7 @@ sequenceDiagram
 2. **搜索第一页**：每词取 Bing 前 10 条，记录排名，跨词、跨轮按规范化 URL 去重。
 3. **全量抓取**：所有新候选均尝试 `archive_page`（无模型候选选择）。`archive_page` 装配默认 config（JS 渲染 + `scan_full_page` 上限，不对抗反爬）交 crawl4ai 抓取，再由本地校验成败与质量；命中登录/付费/反爬/正文不在 DOM 等边界或校验不过，记 `archive_skip` 并跳过，不重试、不伪装成功。
 4. **反馈深化**：下一轮 strong 从已读原文中识别新主体、术语、时间线、冲突点和证据缺口，据此生成新词。
-5. **固定收敛**：默认完整执行 3 轮；若达到 800k 输入预算、300 份快照或没有任何新 URL，程序提前结束探索并进入汇总。
+5. **固定收敛**：完整执行用户选择的 3–5 轮；若达到 1,000,000 token 输入预算、300 份快照或没有任何新 URL，程序提前结束探索并进入汇总。
 
 **查询生成提示词**（步 1 每轮通用，由 `research_session.py` 装配，模型不改）：
 
@@ -373,9 +373,9 @@ N 轮结束后，为每份快照构造：
 1. strong 一次读入全部 `title + excerpt + snapshot_ref`，返回相关 `snapshot_ref` 和逐项选择理由。
 2. 研究编排层校验 snapshot\_ref 属本 run，随后从 snapshot reader 读取这些原文。
 3. strong 读取选中原文后回答；每条事实 Claim 必须列出一个或多个 `snapshot_ref`。
-4. 程序只接受引用已实际送入最终调用、且哈希匹配的 snapshot\_ref。
+4. 程序只接受引用已实际送入最终调用、且哈希匹配的 snapshot\_ref；内部审计仍记录该引用，WebUI/API 响应则按引用映射为 `sources[{url,title}]`。
 
-默认 `MAX_READ_SNAPSHOTS = 100`，最终原文输入仍受 800k token 总预算约束。选择上限刻意偏高，以降低漏选；若标题和摘录目录本身超过预算，先停止继续探索，不在终局静默丢页。
+默认 `MAX_READ_SNAPSHOTS = 100`，最终原文输入仍受 1,000,000 token 总预算约束。选择上限刻意偏高，以降低漏选；若标题和摘录目录本身超过预算，先停止继续探索，不在终局静默丢页。
 
 > 完整数据流示例（含查询生成提示词的逐轮槽位）见 [web-search-dataflow-example.md](./web-search-dataflow-example.md)。
 
@@ -388,7 +388,7 @@ N 轮结束后，为每份快照构造：
 3. **抓取有效**：HTTP/crawl 状态、最终 URL、正文非空、最小正文长度和结构化字段通过检查。
 4. **快照一致**：每次 reader 读出的 `content_hash` 与存档记录一致。
 5. **选择归属**：选源输出顶层只能含 `selected`；每项只能含 `snapshot_ref + reason`，未知字段一律拒绝；每个 `snapshot_ref` 必须属于本 run，并把选择理由落 trace。
-6. **Claim 有源**：作答输出顶层只能含 `answer + claims`，`claims` 不得为空；每条 Claim 至少引用一份已送入最终 strong 调用的原文 `snapshot_ref`，未知字段一律拒绝。
+6. **Claim 有源**：strong 作答输出顶层只能含 `answer + claims`，`claims` 不得为空；每条 Claim 至少引用一份已送入最终调用的原文 `snapshot_ref`，未知字段一律拒绝。WebUI/API 公开 DTO 不返回该字段，仅返回对应的 URL 与标题。
 
 不再做 `quote in text` 的“逐字取证”校验。它只能证明字符串存在，不能证明引文足以支持 Claim；新流程把程序摘录降为导航材料，让 strong 对实际原文负责。代价是 Claim 与原文之间的语义蕴含仍依赖 strong，程序只能验证“读过并引用了哪份原文”，不能机械证明结论正确。
 
@@ -398,7 +398,7 @@ N 轮结束后，为每份快照构造：
 
 系统只用一个 strong 模型；导航摘录由程序完成，不引入第二个模型。
 
-- **strong**：每轮分析问题与既有原文、生成 3 个新查询；N 轮后阅读标题和摘录目录、选择原文；最终阅读原文并回答。假设 1M token 上下文，单次输入预算 800k。
+- **strong**：每轮分析问题与既有原文、生成 3 个新查询；N 轮后阅读标题和摘录目录、选择原文；最终阅读原文并回答。假设足够大的模型上下文，单次输入预算 1,000,000 token。
 - **程序摘录**：N 轮结束后逐页确定性截取标题+首段+URL，仅供 strong 导航选页，不允许成为 Claim 来源。
 
 模型调用无状态；每次输入由 `research_session.py` 从问题、快照与审计日志重建。模型返回结构化 JSON，不持有控制流。
@@ -412,7 +412,7 @@ N 轮结束后，为每份快照构造：
 ## 8. 存储与审计
 
 - **快照 DB** `snapshot.sqlite`：经 `snapshot.py` 写入标题、URL、原文、哈希、抓取凭证和时间。正文不可变；`retrieval_server.py` 只持 writer，`research_session.py` 只持 reader，`run.py` 均不持有。
-- **审计日志** `trace/<run_id>.jsonl`：单一 append-only 文件，每 run 一份。首行为 `run_header`，记 `run_id`、**原始用户问题**、启动时间与配置；原始用户问题在此单独、不可变地存储，是每轮重放注入 strong、识别新主体的锚，与 strong 生成的 `query` 行语义分离。其后逐行记录 query、search\_result、archive/archive\_skip、excerpt、snapshot\_selection、claim，以及终止事件 answer 或 run\_failed，供回放与问题定位。`ResearchSession` 启动即写首行并追加后续，MCP 层不写。
+- **审计日志** `trace/<run_id>.jsonl`：单一 append-only 文件，每 run 一份。首行为 `run_header`，记 `run_id`、**原始用户问题**、启动时间与配置；原始用户问题在此单独、不可变地存储，是每轮重放注入 strong、识别新主体的锚，与 strong 生成的 `query` 行语义分离。其后逐行记录 query、search\_result、archive/archive\_skip、excerpt、snapshot\_selection、claim，以及终止事件 answer 或 run\_failed，供回放与问题定位。`ResearchSession` 启动即写首行并追加后续，HTTP 层不写。
 
 `snapshot.py` 内部使用参数化 SQL、字段校验和事务，上层不直接执行 SQL；审计日志是纯 append-only 结构化 JSON，无独立数据库。密钥与正文不写审计日志，正文只以 `snapshot_ref/content_hash` 引用。
 
@@ -427,7 +427,7 @@ N 轮结束后，为每份快照构造：
 
 每个 run 恰有一个终止事件，且必须是末行：成功为 `answer`，失败为 `run_failed`，二者互斥。选源后的抓取与快照持久化不回滚；故后续选源或作答失败时，内容寻址快照可保留以供审计，但本 run 仍由 `run_failed` 明确终止，不伪装成部分答案。
 
-MCP 层仅把同一失败语义映射给客户端：`external` 使用 server error `-32000`，`internal` 使用 internal error `-32603`，`data` 固定含 `error_class + stage`；请求缺参或空问题仍为 invalid params `-32602`。字段只增不改；新增事件只扩 `type` 枚举，旧字段与 v1 读取能力保留。
+HTTP 层将同一失败语义映射为 JSON `error_class + stage + message`；空问题为 400、未知任务为 404、并发任务为 409。字段只增不改；新增事件只扩 `type` 枚举，旧 trace 读取能力保留。
 
 ## 9. 实现状态与迁移
 
@@ -446,8 +446,8 @@ MCP 层仅把同一失败语义映射给客户端：`external` 使用 server err
 
 - **SSRF**：请求前及重定向后检查；仅允许公网 http(s)。
 - **提示注入**：网页正文、标题、snippet、程序摘录均是不可信数据；模型系统指令明确禁止执行页面内指令。
-- **抓取边界**：默认 3 轮 × 3 词 × 每词第一页 10 条；URL 去重；高位上限 300 份来源。
-- **上下文边界**：按 1M 模型窗口设计，单次输入最多 800k token；达到预算即停止扩展，不静默截掉终局目录。
+- **抓取边界**：默认 3 轮、最多 5 轮 × 3 词 × 每词第一页 10 条；URL 去重；高位上限 300 份来源。
+- **上下文边界**：按 1M 模型窗口设计，单次输入最多 1,000,000 token；达到预算即停止扩展，不静默截掉终局目录。
 - **页面边界**：单页存档最多 4MB；超限明确标记截断，不能伪装成完整原文。
 - **凭据隔离**：`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN` 走环境变量，不入库、不入仓。
 
@@ -472,7 +472,7 @@ MCP 层仅把同一失败语义映射给客户端：`external` 使用 server err
 3. **append-only trace 是主要调试手段**：`trace/<run_id>.jsonl` 逐行记全链（`run_header → query → search_result → archive/archive_skip → excerpt → snapshot_selection → claim → answer/run_failed`）。一个 run 一个文件，打开即见当轮实况，无需插桩或复现环境。
 4. **六道校验各卡一个阶段**：校验失败即锁定阶段——schema 错对应查询步，哈希不符对应快照读取，ref 越权对应选源步。错误分类天然对应位置。
 5. **快照不可变加 content\_hash**：排除“数据在脚下变了”这类最难查的 bug；损坏由校验机械发现。
-6. **单抓取后端、固定 N 轮、无并发**：从源头排除竞态与并行乱序类 heisenbug。
+6. **单抓取后端、有界 N 轮、无并发**：从源头排除竞态与并行乱序类 heisenbug。
 
 ### 12.2 定位一个 bug 的典型路径
 
@@ -493,4 +493,4 @@ MCP 层仅把同一失败语义映射给客户端：`external` 使用 server err
 
 ***
 
-`ponytail:` 编排层暂只用一个 `research_session.py`，内部以三个纯函数（`plan_queries`/`select_sources`/`synthesize_answer`，见 §4.3）固化测试边界，不拆 planner/selector/synthesizer 为独立组件；待并发恢复或多研究策略确有需要时再提成独立模块。抓取仍只保留 crawl4ai 单后端与固定 N 轮。
+`ponytail:` 编排层暂只用一个 `research_session.py`，内部以三个纯函数（`plan_queries`/`select_sources`/`synthesize_answer`，见 §4.3）固化测试边界，不拆 planner/selector/synthesizer 为独立组件；待并发恢复或多研究策略确有需要时再提成独立模块。抓取仍只保留 crawl4ai 单后端与 3–5 有界 N 轮。

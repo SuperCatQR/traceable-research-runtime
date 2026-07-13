@@ -1,7 +1,7 @@
-//! P3 external adapters: ddgs/Bing, crawl4ai, an OpenAI-compatible strong model,
+//! P3 external adapters: SearXNG/Bing, crawl4ai, an OpenAI-compatible strong model,
 //! and the public-HTTP SSRF boundary shared by every page fetch.
 
-use std::{net::IpAddr, process::Stdio, time::Duration};
+use std::{net::IpAddr, time::Duration};
 
 use chrono::Utc;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
@@ -10,6 +10,7 @@ use url::{Host, Url};
 use crate::{CrawlMeta, Result, SearchError, SearchResult, Snapshot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+const BLOCKED_DOMAINS: &[&str] = &["talk-doubao.com.cn"];
 
 /// Accept only public HTTP(S) URLs. Every DNS answer is checked: a hostname with
 /// even one private/special address is rejected rather than gambling on which
@@ -27,6 +28,13 @@ pub async fn validate_public_url(raw: &str) -> Result<Url> {
     }
 
     let host = url.host().ok_or_else(|| ssrf(raw, "URL has no host"))?;
+    if let Host::Domain(domain) = host
+        && BLOCKED_DOMAINS
+            .iter()
+            .any(|blocked| domain == *blocked || domain.ends_with(&format!(".{blocked}")))
+    {
+        return Err(ssrf(raw, "domain is blocked"));
+    }
     match host {
         Host::Ipv4(ip) => ensure_public(raw, IpAddr::V4(ip))?,
         Host::Ipv6(ip) => ensure_public(raw, IpAddr::V6(ip))?,
@@ -110,19 +118,23 @@ fn http_client() -> Result<reqwest::Client> {
         })
 }
 
-const DDGS_SCRIPT: &str = "import json,sys; from ddgs import DDGS; print(json.dumps(DDGS().text(sys.argv[1], backend='bing', max_results=10)))";
-
-/// Official Python `ddgs` client, pinned by `requirements-search.txt`, with the
-/// backend fixed to Bing. The query is an argv value, never shell source.
-pub struct DdgsClient {
-    python: String,
+/// Thin client for a self-hosted SearXNG instance configured with Bing only.
+pub struct SearxngClient {
+    client: reqwest::Client,
+    endpoint: Url,
 }
 
-impl DdgsClient {
-    pub fn new(python: impl Into<String>) -> Self {
-        Self {
-            python: python.into(),
-        }
+impl SearxngClient {
+    pub fn new(base_url: &str) -> Result<Self> {
+        let endpoint = Url::parse(base_url)
+            .and_then(|base| base.join("search"))
+            .map_err(|error| SearchError::Search {
+                message: format!("invalid SearXNG endpoint: {error}"),
+            })?;
+        Ok(Self {
+            client: http_client()?,
+            endpoint,
+        })
     }
 
     pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
@@ -131,60 +143,82 @@ impl DdgsClient {
                 message: "query is empty".into(),
             });
         }
-        let output = tokio::process::Command::new(&self.python)
-            .args(["-c", DDGS_SCRIPT, query])
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .await
-            .map_err(|error| SearchError::Search {
-                message: format!("failed to start ddgs: {error}"),
-            })?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr);
+        let mut endpoint = self.endpoint.clone();
+        endpoint.query_pairs_mut().extend_pairs([
+            ("q", query),
+            ("format", "json"),
+            ("categories", "general"),
+            ("language", query_language(query)),
+        ]);
+        let response =
+            self.client
+                .get(endpoint)
+                .send()
+                .await
+                .map_err(|error| SearchError::Search {
+                    message: error.to_string(),
+                })?;
+        let status = response.status();
+        if !status.is_success() {
             return Err(SearchError::Search {
-                message: format!(
-                    "ddgs failed: {}",
-                    stderr.trim().chars().take(500).collect::<String>()
-                ),
+                message: format!("SearXNG returned HTTP {status}"),
             });
         }
-        parse_ddgs_results(query, &output.stdout)
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| SearchError::Search {
+                message: error.to_string(),
+            })?;
+        parse_searxng_results(query, &body)
     }
 }
 
-impl Default for DdgsClient {
-    fn default() -> Self {
-        Self::new("python")
+fn query_language(query: &str) -> &'static str {
+    if query
+        .chars()
+        .any(|ch| ('\u{4e00}'..='\u{9fff}').contains(&ch))
+    {
+        "zh-CN"
+    } else {
+        "en-US"
     }
 }
 
 #[derive(Deserialize)]
-struct DdgsResult {
-    title: String,
-    href: String,
+struct SearxngEnvelope {
     #[serde(default)]
-    body: String,
+    results: Vec<SearxngResult>,
 }
 
-fn parse_ddgs_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
-    let raw: Vec<DdgsResult> =
+#[derive(Deserialize)]
+struct SearxngResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
+    let raw: SearxngEnvelope =
         serde_json::from_slice(body).map_err(|error| SearchError::Search {
-            message: format!("invalid ddgs JSON: {error}"),
+            message: format!("invalid SearXNG JSON: {error}"),
         })?;
     let results: Vec<_> = raw
+        .results
         .into_iter()
+        .filter(|item| {
+            Url::parse(&item.url).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        })
         .take(10)
         .enumerate()
-        .filter(|(_, item)| Url::parse(&item.href).is_ok())
         .map(|(index, item)| {
-            SearchResult::new(query, item.title, item.body, item.href, index as u32 + 1)
+            SearchResult::new(query, item.title, item.content, item.url, index as u32 + 1)
         })
         .collect();
     if results.is_empty() {
         Err(SearchError::Search {
-            message: "ddgs/Bing returned no valid result".into(),
+            message: "SearXNG/Bing returned no valid result".into(),
         })
     } else {
         Ok(results)
@@ -465,6 +499,18 @@ struct ChatResponseMessage {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn blocked_phishing_domain_is_rejected_before_dns() {
+        for url in [
+            "https://talk-doubao.com.cn/",
+            "https://www.talk-doubao.com.cn/login",
+        ] {
+            let error = validate_public_url(url).await.unwrap_err();
+            assert!(error.to_string().contains("domain is blocked"));
+        }
+        assert!(!BLOCKED_DOMAINS.contains(&"talk.doubao.com.cn"));
+    }
+
     #[test]
     fn special_addresses_are_not_public() {
         for raw in [
@@ -488,18 +534,30 @@ mod tests {
     }
 
     #[test]
-    fn ddgs_contract_fixes_bing_and_maps_results() {
-        assert!(DDGS_SCRIPT.contains("backend='bing'"));
-        assert!(DDGS_SCRIPT.contains("max_results=10"));
-        let json = br#"[{"title":"Alpha","href":"https://example.com/a","body":"One"},{"title":"Beta","href":"https://example.com/b","body":"Two"}]"#;
-        let results = parse_ddgs_results("query", json).unwrap();
+    fn searxng_language_follows_query_script() {
+        assert_eq!(query_language("黑格尔哲学"), "zh-CN");
+        assert_eq!(query_language("Hegel philosophy"), "en-US");
+    }
+
+    #[test]
+    fn searxng_contract_maps_and_filters_results() {
+        let json = br#"{"results":[{"title":"Skip","url":"ftp://example.com/x"},{"title":"Alpha","url":"https://example.com/a","content":"One"},{"title":"Beta","url":"http://example.com/b"}]}"#;
+        let results = parse_searxng_results("query", json).unwrap();
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].rank, 1);
+        assert_eq!(results[1].rank, 2);
         assert_eq!(results[0].snippet, "One");
+        assert!(results[1].snippet.is_empty());
         assert_eq!(
             results[0].search_result_id,
             crate::search_result_id("query", "https://example.com/a")
         );
+    }
+
+    #[test]
+    fn searxng_rejects_bad_json_and_empty_results() {
+        assert!(parse_searxng_results("query", b"not json").is_err());
+        assert!(parse_searxng_results("query", br#"{"results":[]}"#).is_err());
     }
 
     #[test]

@@ -21,7 +21,7 @@ run.py → research_session.py:  ResearchSession(question, policy).run()
 {"type":"run_header","run_id":"r-20260711-a1b2","question":"2024年诺贝尔物理学奖颁给了谁？获奖理由是什么？","started_at":"2026-07-11T10:00:00Z","policy":{"rounds":3,"input_budget":800000,"max_snapshots":300}}
 ```
 
-## 2. 阶段一：Explore（固定 3 轮）
+## 2. 阶段一：Explore（本例选择默认 3 轮；可选 3–5 轮）
 
 ### 2.1 第 1 轮
 
@@ -110,9 +110,9 @@ strong 对照原始问题读这 19 份原文，发现「Hopfield 网络」「玻
 
 ### 2.3 第 3 轮
 
-同上，用同一模板。跑满默认 3 轮，或中途撞到 800k 输入预算、300 份快照、本轮零新 URL 之一则提前收敛。假设累计 42 份成功快照。
+同上，用同一模板。跑满所选轮数，或中途撞到 1,000,000 token 输入预算、300 份快照、本轮零新 URL 之一则提前收敛。假设累计 42 份成功快照。
 
-## 3. 阶段二：Synthesize（三轮后一次）
+## 3. 阶段二：Synthesize（所选轮数结束后一次）
 
 1. **程序摘录**：对 42 份快照逐一 `reader.get(snapshot_ref)`，程序确定性截取「标题+首段+URL」，不经模型、不改正文：
 
@@ -135,7 +135,7 @@ strong 对照原始问题读这 19 份原文，发现「Hopfield 网络」「玻
  "claims":[{"text":"得主为 Hopfield 与 Hinton","snapshot_refs":["snapshot:web/9f3a1c…"]}]}
 ```
 
-6. **校验有源**：程序只接受引用了已送入本次调用、且哈希匹配的 `snapshot_ref`，随后写 trace 的 `selection`/`claim`/`answer` 行，返回 `ResearchResult` 给 `run.py`，再给用户。若搜索无果、全部 `archive_skip`、无可用原文或 strong 判断原文不足，则据实拒答。
+6. **校验有源**：程序只接受引用了已送入本次调用、且哈希匹配的 `snapshot_ref`，随后写 trace 的 `selection`/`claim`/`answer` 行；WebUI/API 边界将引用映射为 `url + title` 后返回用户，不暴露内部 `snapshot_ref`。若搜索无果、全部 `archive_skip`、无可用原文或 strong 判断原文不足，则据实拒答。
 
 ## 4. 提示词块在流程里的作用
 

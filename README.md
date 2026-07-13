@@ -1,17 +1,19 @@
 # traceable-search
 
-可审计的 Web 研究服务：经 Bing 搜索、crawl4ai 抓取并锁定网页快照，再由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。服务在 `http://127.0.0.1:8787/` 提供 WebUI；内部以 `snapshot_ref` 与内容哈希完成校验和审计。
+可审计的 Web 研究服务：先经 Intake 反复澄清并由用户确认完整 Brief，再经 Bing 搜索、crawl4ai 抓取并锁定网页快照，最后由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。服务在 `http://127.0.0.1:8787/` 提供 WebUI；确认前不启动研究，内部以 `snapshot_ref` 与内容哈希完成校验和审计。
 
 ## 架构
 
 ```text
 Browser ──HTTP/SSE── traceable-search WebUI
+                       ├── Intake：创建、澄清、确认或取消
                        ├── HTTP ── SearXNG ── Bing
                        ├── HTTP ── crawl4ai
                        ├── HTTP ── upstream model
                        └── data/
                            ├── snapshots.sqlite
-                           └── traces/*.jsonl
+                           ├── intake/<clarification_id>.jsonl
+                           └── traces/<run_id>.jsonl
 ```
 
 详见 [`docs/web-search-architecture.md`](docs/web-search-architecture.md)。
@@ -202,7 +204,7 @@ test -w "$TRACEABLE_SEARCH_DATA_DIR"
 | `STRONG_MODEL_BASE_URL` | 是 | 上游模型的 OpenAI-compatible API 基础 URL |
 | `STRONG_MODEL_API_KEY` | 是 | 上游模型签发的 API key |
 | `STRONG_MODEL_ID` | 是 | 上游模型名；建议 `deepseek-v4-pro` |
-| `TRACEABLE_SEARCH_DATA_DIR` | 否 | 快照与 trace 目录；默认 `data`；运行用户须有写权限 |
+| `TRACEABLE_SEARCH_DATA_DIR` | 否 | 快照、`intake/` 与 `traces/` 目录；默认 `data`；运行用户须有写权限 |
 
 > [!IMPORTANT]
 > 基础 URL 应保留尾部 `/`。程序分别拼接 `search`、`crawl` 与 `chat/completions`。
@@ -224,7 +226,18 @@ cargo run --release
 http://127.0.0.1:8787/
 ```
 
-默认仅监听 localhost；一次仅运行一个研究任务。提交时可选择 3–5 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
+默认仅监听 localhost；一次仅运行一个研究任务。WebUI 依次调用四个 Intake 命令端点：
+
+```text
+POST /api/research/intakes
+POST /api/research/intakes/{clarification_id}/reply
+POST /api/research/intakes/{clarification_id}/confirm
+POST /api/research/intakes/{clarification_id}/cancel
+```
+
+创建后先回答互斥问题或编辑 Brief；即使问题已清晰，也必须预览并确认。只有携当前 `revision` 与 `content_hash` 的 confirm 才会分配 `run_id` 并启动研究；旧版本返回 409，WebUI 保留尚未提交的输入。`INTAKE_FAILED` 可经 reply 重试或生成最小 Brief；cancel 进入不可恢复终态且不创建 run。各命令按 `clarification_id` 从 `data/intake/` 惰性回放，故进程重启后可用原 ID 重试 reply、confirm 或 cancel。
+
+确认时可选择 1–8 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
 
 ## Podman 容器
 
@@ -304,8 +317,11 @@ WebUI/API 返回来源 URL 与标题，不暴露内部 `snapshot_ref`：
 
 ```text
 data/snapshots.sqlite
+data/intake/<clarification_id>.jsonl
 data/traces/<run_id>.jsonl
 ```
+
+`data/intake/` 记录创建、澄清、确认或取消的 append-only 历史；`data/traces/` 仅在确认后产生。删除或截断任一 JSONL 都会破坏审计与重启恢复，勿以此处理失败会话。
 
 常见故障：
 

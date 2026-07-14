@@ -9,14 +9,14 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::{
-    Claim, ClarificationAnswer, ConfirmedResearchBrief, CrawlClient, ErrorClass, INTAKE_PROMPT,
-    IntakeError, IntakeEvent, IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks,
-    IntakeStatus, LiveBackend, ModelParseOutcome, PipelineStage, ReplayedRunHeader, ResearchBrief,
+    Claim, ConfirmedResearchBrief, CrawlClient, ErrorClass, INTAKE_PROMPT, IntakeError,
+    IntakeEvent, IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks, IntakeStatus,
+    LiveBackend, MAX_TOTAL_QUESTIONS, ModelParseOutcome, PipelineStage, ReplayedRunHeader,
     RunHeader, SearchError, SearxngClient, SnapshotReader, SnapshotRef, SnapshotWriter,
     StrongClient, TracePolicy, TraceWriter, cancellation_event, confirmation_event,
-    events_for_model_output,
+    events_for_model_output, minimal_brief_event,
     orchestration::{AnswerSource, ResearchResult, ResearchSession},
-    parse_model_attempt, replay_run_header,
+    parse_model_attempt, replay_run_header, user_reply_event,
 };
 
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -100,6 +100,25 @@ pub struct ResearchService {
     intake_locks: IntakeSessionLocks,
 }
 
+fn require_failed_intake(
+    session: &IntakeSession,
+    requested_revision: u32,
+) -> Result<(), IntakeError> {
+    if session.revision != requested_revision {
+        return Err(IntakeError::StaleBrief {
+            current_revision: session.revision,
+            requested_revision,
+        });
+    }
+    if session.status != IntakeStatus::IntakeFailed {
+        return Err(IntakeError::InvalidTransition {
+            status: session.status,
+            event: "intake_recovery",
+        });
+    }
+    Ok(())
+}
+
 impl ResearchService {
     pub fn new(config: AppConfig) -> Self {
         Self {
@@ -142,57 +161,41 @@ impl ResearchService {
         &self,
         clarification_id: &str,
         revision: u32,
-        answers: Vec<ClarificationAnswer>,
-        edited_brief: Option<ResearchBrief>,
+        answer: &str,
     ) -> Result<IntakeSession, IntakeCommandError> {
         let _guard = self.intake_locks.lock(clarification_id).await?;
         let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
-        let edited_brief = edited_brief
-            .map(|brief| {
-                let brief = brief
-                    .normalized(&log.session().original_question)
-                    .map_err(IntakeError::from)?;
-                let content_hash = brief.content_hash().map_err(IntakeError::from)?;
-                Ok::<_, IntakeError>((brief, content_hash))
-            })
-            .transpose()?;
-        // A reply from NEEDS_INPUT records the user's answers first. From
-        // INTAKE_FAILED there are no pending questions: recovery skips
-        // UserReplied and either revises the brief (edited_brief present, used
-        // by both "generate minimal Brief" and manual edit) or retries the
-        // model (advance_intake). Any other state falls through to UserReplied,
-        // which the reducer rejects as an invalid transition.
-        if log.session().status == IntakeStatus::IntakeFailed {
-            if log.session().revision != revision {
-                return Err(IntakeError::StaleBrief {
-                    current_revision: log.session().revision,
-                    requested_revision: revision,
-                }
-                .into());
-            }
-        } else {
-            log.append(&IntakeEvent::new(IntakeEventKind::UserReplied {
-                revision,
-                answers,
-                replied_at: Utc::now(),
-            }))?;
-        }
-        if let Some((brief, content_hash)) = edited_brief {
-            let revision = log
-                .session()
-                .revision
-                .checked_add(1)
-                .ok_or_else(|| IntakeError::InvalidEvent("revision overflow".into()))?;
-            log.append(&IntakeEvent::new(IntakeEventKind::BriefRevised {
-                revision,
-                brief,
-                content_hash,
-                ready_to_confirm: true,
-                revised_at: Utc::now(),
-            }))?;
-        } else {
-            self.advance_intake(&mut log).await?;
-        }
+        log.append(&user_reply_event(
+            log.session(),
+            revision,
+            answer,
+            Utc::now(),
+        )?)?;
+        self.advance_intake(&mut log).await?;
+        Ok(log.session().clone())
+    }
+
+    pub async fn retry_intake(
+        &self,
+        clarification_id: &str,
+        revision: u32,
+    ) -> Result<IntakeSession, IntakeCommandError> {
+        let _guard = self.intake_locks.lock(clarification_id).await?;
+        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
+        require_failed_intake(log.session(), revision)?;
+        self.advance_intake(&mut log).await?;
+        Ok(log.session().clone())
+    }
+
+    pub async fn use_minimal_brief(
+        &self,
+        clarification_id: &str,
+        revision: u32,
+    ) -> Result<IntakeSession, IntakeCommandError> {
+        let _guard = self.intake_locks.lock(clarification_id).await?;
+        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
+        require_failed_intake(log.session(), revision)?;
+        log.append(&minimal_brief_event(log.session(), Utc::now())?)?;
         Ok(log.session().clone())
     }
 
@@ -232,7 +235,10 @@ impl ResearchService {
             &self.config.model_api_key,
             &self.config.model,
         )?;
-        let base_input = serde_json::to_string(log.session())?;
+        let base_input = serde_json::to_string(&serde_json::json!({
+            "session": log.session(),
+            "remaining_questions": MAX_TOTAL_QUESTIONS.saturating_sub(log.session().questions.len()),
+        }))?;
         let mut correction = None;
         for attempt in 1..=2 {
             let user = match correction.take() {
@@ -525,7 +531,7 @@ mod tests {
     /// Drives an intake into INTAKE_FAILED and returns (current_revision, a
     /// valid recovery brief). IntakeFailed does not bump the revision, so the
     /// returned revision is still 0.
-    fn failed_intake(service: &ResearchService, clarification_id: &str) -> (u32, ResearchBrief) {
+    fn failed_intake(service: &ResearchService, clarification_id: &str) -> u32 {
         let started = IntakeEvent::new(IntakeEventKind::IntakeStarted {
             clarification_id: clarification_id.into(),
             original_question: "Original question, byte for byte?".into(),
@@ -533,10 +539,6 @@ mod tests {
             created_at: Utc::now(),
         });
         let mut log = IntakeLog::create(service.config.data_dir.join("intake"), started).unwrap();
-        let brief = match minimal_brief_event(log.session(), Utc::now()).unwrap().kind {
-            IntakeEventKind::BriefRevised { brief, .. } => brief,
-            other => panic!("minimal_brief_event produced {other:?}"),
-        };
         log.append(&IntakeEvent::new(IntakeEventKind::IntakeFailed {
             revision: 0,
             message: "model returned invalid structured output twice".into(),
@@ -544,20 +546,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(log.session().status, IntakeStatus::IntakeFailed);
-        (log.session().revision, brief)
+        log.session().revision
     }
 
     #[tokio::test]
-    async fn reply_from_failed_intake_recovers_with_edited_brief() {
+    async fn failed_intake_recovers_with_server_generated_minimal_brief() {
         let service = test_service("intake-failed-recovery");
         let clarification_id = "clarification-failed-recovery";
-        let (revision, brief) = failed_intake(&service, clarification_id);
+        let revision = failed_intake(&service, clarification_id);
 
-        // Recovery uses edited_brief (the "generate minimal Brief" / manual
-        // edit action). An empty answers vec is correct: a failed intake has no
-        // pending questions and the reducer would reject a UserReplied event.
         let session = service
-            .reply_intake(clarification_id, revision, Vec::new(), Some(brief))
+            .use_minimal_brief(clarification_id, revision)
             .await
             .unwrap();
 
@@ -573,13 +572,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reply_from_failed_intake_rejects_stale_revision() {
+    async fn failed_intake_recovery_rejects_stale_revision() {
         let service = test_service("intake-failed-stale");
         let clarification_id = "clarification-failed-stale";
-        let (revision, brief) = failed_intake(&service, clarification_id);
+        let revision = failed_intake(&service, clarification_id);
 
         let error = service
-            .reply_intake(clarification_id, revision + 7, Vec::new(), Some(brief))
+            .use_minimal_brief(clarification_id, revision + 7)
             .await
             .unwrap_err();
 

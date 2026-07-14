@@ -12,8 +12,8 @@ use tokio::sync::RwLock;
 use tokio_stream::{StreamExt, wrappers::ReceiverStream};
 
 use crate::{
-    ClarificationAnswer, IntakeError, PublicAnswer, PublicError, ResearchBrief, ResearchService,
-    TracePolicy,
+    ClarificationQuestion, IntakeError, IntakeSession, IntakeStatus, PublicAnswer, PublicError,
+    ResearchBrief, ResearchService, TracePolicy,
     app::{IntakeCommandError, PrepareRunError},
 };
 
@@ -75,9 +75,7 @@ struct StartIntakeRequest {
 #[serde(deny_unknown_fields)]
 struct ReplyIntakeRequest {
     revision: u32,
-    #[serde(default)]
-    answers: Vec<ClarificationAnswer>,
-    edited_brief: Option<ResearchBrief>,
+    answer: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -91,8 +89,41 @@ struct ConfirmIntakeRequest {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CancelIntakeRequest {
+struct RevisionIntakeRequest {
     revision: u32,
+}
+
+#[derive(Serialize)]
+struct IntakeResponse<'a> {
+    clarification_id: &'a str,
+    original_question: &'a str,
+    revision: u32,
+    status: IntakeStatus,
+    brief_draft: Option<&'a ResearchBrief>,
+    question: Option<&'a ClarificationQuestion>,
+    questions_asked: usize,
+    content_hash: Option<&'a str>,
+    failure: Option<&'a str>,
+}
+
+impl<'a> From<&'a IntakeSession> for IntakeResponse<'a> {
+    fn from(session: &'a IntakeSession) -> Self {
+        Self {
+            clarification_id: &session.clarification_id,
+            original_question: &session.original_question,
+            revision: session.revision,
+            status: session.status,
+            brief_draft: session.brief_draft.as_ref(),
+            question: session.pending_questions().into_iter().next(),
+            questions_asked: session.questions.len(),
+            content_hash: session.content_hash.as_deref(),
+            failure: session.failure.as_deref(),
+        }
+    }
+}
+
+fn intake_response(status: StatusCode, session: &IntakeSession) -> Response {
+    (status, Json(IntakeResponse::from(session))).into_response()
 }
 
 #[derive(Serialize)]
@@ -124,6 +155,14 @@ pub fn router(service: ResearchService) -> Router {
             post(reply_intake),
         )
         .route(
+            "/api/research/intakes/{clarification_id}/retry",
+            post(retry_intake),
+        )
+        .route(
+            "/api/research/intakes/{clarification_id}/minimal-brief",
+            post(use_minimal_brief),
+        )
+        .route(
             "/api/research/intakes/{clarification_id}/confirm",
             post(confirm_intake),
         )
@@ -141,7 +180,7 @@ async fn start_intake(
     Json(request): Json<StartIntakeRequest>,
 ) -> Response {
     match state.service.start_intake(&request.question).await {
-        Ok(session) => (StatusCode::CREATED, Json(session)).into_response(),
+        Ok(session) => intake_response(StatusCode::CREATED, &session),
         Err(error) => intake_error_response(&error),
     }
 }
@@ -153,15 +192,40 @@ async fn reply_intake(
 ) -> Response {
     match state
         .service
-        .reply_intake(
-            &clarification_id,
-            request.revision,
-            request.answers,
-            request.edited_brief,
-        )
+        .reply_intake(&clarification_id, request.revision, &request.answer)
         .await
     {
-        Ok(session) => Json(session).into_response(),
+        Ok(session) => intake_response(StatusCode::OK, &session),
+        Err(error) => intake_error_response(&error),
+    }
+}
+
+async fn retry_intake(
+    State(state): State<WebState>,
+    Path(clarification_id): Path<String>,
+    Json(request): Json<RevisionIntakeRequest>,
+) -> Response {
+    match state
+        .service
+        .retry_intake(&clarification_id, request.revision)
+        .await
+    {
+        Ok(session) => intake_response(StatusCode::OK, &session),
+        Err(error) => intake_error_response(&error),
+    }
+}
+
+async fn use_minimal_brief(
+    State(state): State<WebState>,
+    Path(clarification_id): Path<String>,
+    Json(request): Json<RevisionIntakeRequest>,
+) -> Response {
+    match state
+        .service
+        .use_minimal_brief(&clarification_id, request.revision)
+        .await
+    {
+        Ok(session) => intake_response(StatusCode::OK, &session),
         Err(error) => intake_error_response(&error),
     }
 }
@@ -228,14 +292,14 @@ async fn confirm_intake(
 async fn cancel_intake(
     State(state): State<WebState>,
     Path(clarification_id): Path<String>,
-    Json(request): Json<CancelIntakeRequest>,
+    Json(request): Json<RevisionIntakeRequest>,
 ) -> Response {
     match state
         .service
         .cancel_intake(&clarification_id, request.revision)
         .await
     {
-        Ok(session) => Json(session).into_response(),
+        Ok(session) => intake_response(StatusCode::OK, &session),
         Err(error) => intake_error_response(&error),
     }
 }
@@ -448,8 +512,7 @@ mod tests {
             Path("missing".into()),
             Json(ReplyIntakeRequest {
                 revision: 0,
-                answers: Vec::new(),
-                edited_brief: None,
+                answer: "answer".into(),
             }),
         )
         .await;
@@ -463,6 +526,32 @@ mod tests {
         )
         .await;
         assert_eq!(created.status(), StatusCode::CREATED);
+        let body = axum::body::to_bytes(created.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        let keys = response
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            keys,
+            [
+                "brief_draft",
+                "clarification_id",
+                "content_hash",
+                "failure",
+                "original_question",
+                "question",
+                "questions_asked",
+                "revision",
+                "status",
+            ]
+            .into_iter()
+            .collect()
+        );
 
         let clarification_id = "ready-for-confirm";
         let (revision, content_hash) = ready_intake(&data_dir, clarification_id);

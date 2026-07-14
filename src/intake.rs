@@ -19,9 +19,9 @@ use crate::{
 };
 
 pub const INTAKE_EVENT_SCHEMA_VERSION: u32 = 1;
-pub const MAX_QUESTIONS_PER_ROUND: usize = 3;
-pub const MAX_CLARIFICATION_ROUNDS: u32 = 2;
 pub const MAX_TOTAL_QUESTIONS: usize = 5;
+
+const MAX_LEGACY_QUESTIONS_PER_EVENT: usize = 3;
 
 const MAX_QUESTION_ID_CHARS: usize = 128;
 const MAX_CLARIFICATION_TEXT_CHARS: usize = 4_000;
@@ -58,7 +58,7 @@ pub struct ClarificationAnswer {
 #[serde(deny_unknown_fields)]
 pub struct IntakeModelOutput {
     pub brief_draft: ResearchBrief,
-    pub questions: Vec<ClarificationQuestion>,
+    pub question: Option<ClarificationQuestion>,
     pub ready_to_confirm: bool,
 }
 
@@ -330,9 +330,9 @@ fn reduce_existing(
                     "clarification_asked requires a brief draft".into(),
                 ));
             }
-            if *round != session.clarification_rounds + 1 || *round > MAX_CLARIFICATION_ROUNDS {
+            if *round != session.clarification_rounds + 1 {
                 return Err(IntakeError::InvalidEvent(
-                    "clarification round is out of sequence or over limit".into(),
+                    "clarification round is out of sequence".into(),
                 ));
             }
             validate_questions(questions, &session.questions)?;
@@ -364,7 +364,12 @@ fn reduce_existing(
             run_id,
             confirmed_brief,
         } => {
-            require_status(session, IntakeStatus::ReadyToConfirm, "confirmed")?;
+            if !matches!(
+                session.status,
+                IntakeStatus::NeedsInput | IntakeStatus::ReadyToConfirm
+            ) {
+                return transition_error(session, "confirmed");
+            }
             require_revision(session, *revision)?;
             validate_file_id(run_id, false)?;
             let draft = session.brief_draft.as_ref().ok_or_else(|| {
@@ -379,6 +384,7 @@ fn reduce_existing(
                 ));
             }
             next.status = IntakeStatus::Confirmed;
+            next.pending_question_ids.clear();
             next.confirmation = Some(IntakeConfirmation {
                 run_id: run_id.clone(),
                 brief: confirmed_brief.clone(),
@@ -435,16 +441,9 @@ pub fn events_for_model_output(
         return transition_error(session, "model_output");
     }
     let output = validate_model_output(output, &session.original_question)?;
-    let remaining_questions = MAX_TOTAL_QUESTIONS.saturating_sub(session.questions.len());
-    let can_ask = session.clarification_rounds < MAX_CLARIFICATION_ROUNDS
-        && remaining_questions > 0
-        && !output.ready_to_confirm;
+    let can_ask = session.questions.len() < MAX_TOTAL_QUESTIONS && !output.ready_to_confirm;
     let questions: Vec<_> = if can_ask {
-        output
-            .questions
-            .into_iter()
-            .take(remaining_questions)
-            .collect()
+        output.question.into_iter().collect()
     } else {
         Vec::new()
     };
@@ -470,6 +469,33 @@ pub fn events_for_model_output(
         }));
     }
     Ok(events)
+}
+
+pub fn user_reply_event(
+    session: &IntakeSession,
+    requested_revision: u32,
+    answer: &str,
+    now: DateTime<Utc>,
+) -> IntakeResult<IntakeEvent> {
+    require_status(session, IntakeStatus::NeedsInput, "user_replied")?;
+    require_revision(session, requested_revision)?;
+    let question_id = match session.pending_question_ids.as_slice() {
+        [question_id] => question_id.clone(),
+        _ => {
+            return Err(IntakeError::InvalidEvent(
+                "single reply requires exactly one pending question".into(),
+            ));
+        }
+    };
+    validate_text(answer, MAX_CLARIFICATION_TEXT_CHARS, "clarification answer")?;
+    Ok(IntakeEvent::new(IntakeEventKind::UserReplied {
+        revision: requested_revision,
+        answers: vec![ClarificationAnswer {
+            question_id,
+            answer: answer.trim().to_owned(),
+        }],
+        replied_at: now,
+    }))
 }
 
 pub fn minimal_brief_event(
@@ -505,7 +531,12 @@ pub fn confirmation_event(
     run_id: String,
     now: DateTime<Utc>,
 ) -> IntakeResult<IntakeEvent> {
-    require_status(session, IntakeStatus::ReadyToConfirm, "confirmed")?;
+    if !matches!(
+        session.status,
+        IntakeStatus::NeedsInput | IntakeStatus::ReadyToConfirm
+    ) {
+        return transition_error(session, "confirmed");
+    }
     if requested_revision != session.revision {
         return Err(IntakeError::StaleBrief {
             current_revision: session.revision,
@@ -593,17 +624,17 @@ fn validate_model_output(
     original_question: &str,
 ) -> IntakeResult<IntakeModelOutput> {
     output.brief_draft = output.brief_draft.normalized(original_question)?;
-    if !output.questions.is_empty() {
-        validate_questions(&output.questions, &[])?;
+    if let Some(question) = &output.question {
+        validate_questions(std::slice::from_ref(question), &[])?;
     }
-    if output.ready_to_confirm && !output.questions.is_empty() {
+    if output.ready_to_confirm && output.question.is_some() {
         return Err(IntakeError::InvalidEvent(
-            "ready_to_confirm output must not contain questions".into(),
+            "ready_to_confirm output must not contain a question".into(),
         ));
     }
-    if !output.ready_to_confirm && output.questions.is_empty() {
+    if !output.ready_to_confirm && output.question.is_none() {
         return Err(IntakeError::InvalidEvent(
-            "non-ready model output must contain questions".into(),
+            "non-ready model output must contain a question".into(),
         ));
     }
     Ok(output)
@@ -612,7 +643,7 @@ fn validate_model_output(
 fn validate_model_json_shape(value: &serde_json::Value) -> IntakeResult<()> {
     exact_keys(
         value,
-        &["brief_draft", "questions", "ready_to_confirm"],
+        &["brief_draft", "question", "ready_to_confirm"],
         "model output",
     )?;
     let brief = value
@@ -659,9 +690,9 @@ fn validate_questions(
     questions: &[ClarificationQuestion],
     prior: &[ClarificationQuestion],
 ) -> IntakeResult<()> {
-    if questions.is_empty() || questions.len() > MAX_QUESTIONS_PER_ROUND {
+    if questions.is_empty() || questions.len() > MAX_LEGACY_QUESTIONS_PER_EVENT {
         return Err(IntakeError::InvalidEvent(
-            "each clarification round must contain 1..=3 questions".into(),
+            "clarification event must contain 1..=3 questions".into(),
         ));
     }
     let mut ids: HashSet<&str> = prior.iter().map(|question| question.id.as_str()).collect();
@@ -959,7 +990,7 @@ mod tests {
             &state,
             IntakeModelOutput {
                 brief_draft: brief(),
-                questions: Vec::new(),
+                question: None,
                 ready_to_confirm: true,
             },
             now(),
@@ -979,7 +1010,7 @@ mod tests {
             &state,
             IntakeModelOutput {
                 brief_draft: brief(),
-                questions: vec![question("database-kind")],
+                question: Some(question("database-kind")),
                 ready_to_confirm: false,
             },
             now(),
@@ -992,52 +1023,118 @@ mod tests {
     }
 
     #[test]
-    fn two_round_and_five_question_limits_stop_followups() {
+    fn five_single_questions_stop_a_sixth_followup() {
         let mut state = session();
-        for ids in [["q1", "q2", "q3"].as_slice(), ["q4", "q5"].as_slice()] {
+        for number in 1..=MAX_TOTAL_QUESTIONS {
             let events = events_for_model_output(
                 &state,
                 IntakeModelOutput {
                     brief_draft: brief(),
-                    questions: ids.iter().map(|id| question(id)).collect(),
+                    question: Some(question(&format!("q{number}"))),
                     ready_to_confirm: false,
                 },
                 now(),
             )
             .unwrap();
+            assert_eq!(events.len(), 2);
             state = apply_all(state, &events);
-            let answers = state
-                .pending_questions()
-                .into_iter()
-                .map(|question| ClarificationAnswer {
-                    question_id: question.id.clone(),
-                    answer: "No restriction".into(),
-                })
-                .collect();
-            state = reduce_intake_event(
-                Some(&state),
-                &IntakeEvent::new(IntakeEventKind::UserReplied {
-                    revision: state.revision,
-                    answers,
-                    replied_at: now(),
-                }),
-            )
-            .unwrap();
+            let reply = user_reply_event(&state, state.revision, "No restriction", now()).unwrap();
+            state = reduce_intake_event(Some(&state), &reply).unwrap();
         }
         let events = events_for_model_output(
             &state,
             IntakeModelOutput {
                 brief_draft: brief(),
-                questions: vec![question("q6")],
+                question: Some(question("q6")),
                 ready_to_confirm: false,
             },
             now(),
         )
         .unwrap();
+        assert_eq!(events.len(), 1);
         state = apply_all(state, &events);
         assert_eq!(state.status, IntakeStatus::ReadyToConfirm);
         assert_eq!(state.questions.len(), MAX_TOTAL_QUESTIONS);
-        assert_eq!(state.clarification_rounds, MAX_CLARIFICATION_ROUNDS);
+        assert_eq!(state.clarification_rounds as usize, MAX_TOTAL_QUESTIONS);
+    }
+
+    #[test]
+    fn single_reply_rejects_blank_or_legacy_multiple_pending_questions() {
+        let base = session();
+        let draft = brief();
+        let content_hash = draft.content_hash().unwrap();
+        let draft_state = reduce_intake_event(
+            Some(&base),
+            &IntakeEvent::new(IntakeEventKind::BriefRevised {
+                revision: 1,
+                brief: draft,
+                content_hash,
+                ready_to_confirm: false,
+                revised_at: now(),
+            }),
+        )
+        .unwrap();
+        let legacy = reduce_intake_event(
+            Some(&draft_state),
+            &IntakeEvent::new(IntakeEventKind::ClarificationAsked {
+                revision: 1,
+                round: 1,
+                questions: vec![question("legacy-1"), question("legacy-2")],
+                asked_at: now(),
+            }),
+        )
+        .unwrap();
+        assert!(matches!(
+            user_reply_event(&legacy, legacy.revision, "A", now()),
+            Err(IntakeError::InvalidEvent(_))
+        ));
+
+        let one = apply_all(
+            base.clone(),
+            &events_for_model_output(
+                &base,
+                IntakeModelOutput {
+                    brief_draft: brief(),
+                    question: Some(question("q1")),
+                    ready_to_confirm: false,
+                },
+                now(),
+            )
+            .unwrap(),
+        );
+        assert!(matches!(
+            user_reply_event(&one, one.revision, "   ", now()),
+            Err(IntakeError::InvalidEvent(_))
+        ));
+    }
+
+    #[test]
+    fn needs_input_can_be_confirmed() {
+        let base = session();
+        let state = apply_all(
+            base.clone(),
+            &events_for_model_output(
+                &base,
+                IntakeModelOutput {
+                    brief_draft: brief(),
+                    question: Some(question("q1")),
+                    ready_to_confirm: false,
+                },
+                now(),
+            )
+            .unwrap(),
+        );
+        let event = confirmation_event(
+            &state,
+            state.revision,
+            state.content_hash.as_deref().unwrap(),
+            "run-needs-input".into(),
+            now(),
+        )
+        .unwrap();
+        let confirmed = reduce_intake_event(Some(&state), &event).unwrap();
+        assert_eq!(confirmed.status, IntakeStatus::Confirmed);
+        assert!(confirmed.pending_questions().is_empty());
     }
 
     #[test]
@@ -1049,7 +1146,7 @@ mod tests {
                 &base,
                 IntakeModelOutput {
                     brief_draft: brief(),
-                    questions: vec![question("q1")],
+                    question: Some(question("q1")),
                     ready_to_confirm: false,
                 },
                 now(),
@@ -1062,7 +1159,7 @@ mod tests {
                 &base,
                 IntakeModelOutput {
                     brief_draft: brief(),
-                    questions: Vec::new(),
+                    question: None,
                     ready_to_confirm: true,
                 },
                 now(),
@@ -1094,7 +1191,7 @@ mod tests {
                 &base,
                 IntakeModelOutput {
                     brief_draft: brief(),
-                    questions: Vec::new(),
+                    question: None,
                     ready_to_confirm: true,
                 },
                 now(),
@@ -1145,7 +1242,7 @@ mod tests {
             log.session(),
             IntakeModelOutput {
                 brief_draft: brief(),
-                questions: Vec::new(),
+                question: None,
                 ready_to_confirm: true,
             },
             now(),
@@ -1179,7 +1276,7 @@ mod tests {
             log.session(),
             IntakeModelOutput {
                 brief_draft: brief(),
-                questions: vec![question("q1")],
+                question: Some(question("q1")),
                 ready_to_confirm: false,
             },
             now(),
@@ -1226,7 +1323,7 @@ mod tests {
                 &base,
                 IntakeModelOutput {
                     brief_draft: brief(),
-                    questions: Vec::new(),
+                    question: None,
                     ready_to_confirm: true,
                 },
                 now(),

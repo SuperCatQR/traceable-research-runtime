@@ -1,11 +1,11 @@
 # traceable-search
 
-可审计的 Web 研究服务：先经 Intake 反复澄清并由用户确认完整 Brief，再经 Bing 搜索、crawl4ai 抓取并锁定网页快照，最后由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。服务在 `http://127.0.0.1:8787/` 提供 WebUI；确认前不启动研究，内部以 `snapshot_ref` 与内容哈希完成校验和审计。
+可审计的 Web 研究库：先经 Intake 反复澄清并由用户确认完整 Brief，再经 Bing 搜索、crawl4ai 抓取并锁定网页快照，最后由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。确认前不启动研究，内部以 `snapshot_ref` 与内容哈希完成校验和审计。
 
 ## 架构
 
 ```text
-Browser ──HTTP/SSE── traceable-search WebUI
+Rust caller ──library── traceable-search
                        ├── Intake：创建、澄清、确认或取消
                        ├── HTTP ── SearXNG ── Bing
                        ├── HTTP ── crawl4ai
@@ -20,7 +20,6 @@ Browser ──HTTP/SSE── traceable-search WebUI
 
 ## 前置条件
 
-- Podman 可运行的 Linux 环境（Windows 建议使用 WSL2；本文以 Ubuntu 24.04 为例）
 - Rust toolchain
 - Linux 构建依赖：`pkg-config` 与 OpenSSL 开发包（Ubuntu 24.04：`sudo apt install pkg-config libssl-dev`）
 - `curl`（服务连通性验证）
@@ -197,7 +196,6 @@ test -w "$TRACEABLE_SEARCH_DATA_DIR"
 
 | 变量 | 必需 | 含义 |
 |---|---:|---|
-| `WEB_BIND` | 否 | WebUI 监听地址；默认 `127.0.0.1:8787`；容器内用 `0.0.0.0:8787` |
 | `SEARCH_BASE_URL` | 是 | SearXNG 基础 URL；保留尾部 `/` |
 | `CRAWL4AI_BASE_URL` | 是 | crawl4ai 基础 URL；保留尾部 `/` |
 | `CRAWL4AI_TOKEN` | 否 | crawl4ai bearer token；服务启用认证时填写 |
@@ -209,109 +207,6 @@ test -w "$TRACEABLE_SEARCH_DATA_DIR"
 > [!IMPORTANT]
 > 基础 URL 应保留尾部 `/`。程序分别拼接 `search`、`crawl` 与 `chat/completions`。
 
-## 启动 WebUI
-
-本程序读取进程环境，不自动解析 `.env`。加载配置后启动：
-
-```bash
-set -a
-source .env
-set +a
-cargo run --release
-```
-
-浏览器访问：
-
-```text
-http://127.0.0.1:8787/
-```
-
-默认仅监听 localhost；一次仅运行一个研究任务。WebUI 依次调用四个 Intake 命令端点：
-
-```text
-POST /api/research/intakes
-POST /api/research/intakes/{clarification_id}/reply
-POST /api/research/intakes/{clarification_id}/confirm
-POST /api/research/intakes/{clarification_id}/cancel
-```
-
-创建后先回答互斥问题或编辑 Brief；即使问题已清晰，也必须预览并确认。只有携当前 `revision` 与 `content_hash` 的 confirm 才会分配 `run_id` 并启动研究；旧版本返回 409，WebUI 保留尚未提交的输入。`INTAKE_FAILED` 可经 reply 重试或生成最小 Brief；cancel 进入不可恢复终态且不创建 run。各命令按 `clarification_id` 从 `data/intake/` 惰性回放，故进程重启后可用原 ID 重试 reply、confirm 或 cancel。
-
-确认时可选择 3–5 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
-
-## Podman 容器
-
-仅 WebUI 主程序进入镜像；SearXNG、crawl4ai 与模型仍须独立部署。构建固定目标：
-
-```bash
-podman build --platform linux/amd64 \
-  --tag localhost/traceable-search:0.1.0 \
-  --file Containerfile .
-```
-
-准备权限受限的运行配置：
-
-```bash
-install -d -m 700 ~/.config/traceable-search
-umask 077
-cat > ~/.config/traceable-search/web.env <<'EOF'
-WEB_BIND=127.0.0.1:8787
-SEARCH_BASE_URL=http://127.0.0.1:8888/
-CRAWL4AI_BASE_URL=http://127.0.0.1:11235/
-CRAWL4AI_TOKEN=<token>
-STRONG_MODEL_BASE_URL=https://api.deepseek.com/
-STRONG_MODEL_API_KEY=<api-key>
-STRONG_MODEL_ID=deepseek-v4-pro
-TRACEABLE_SEARCH_DATA_DIR=/data
-EOF
-chmod 600 ~/.config/traceable-search/web.env
-mkdir -p data
-```
-
-此 WSL 部署使用 Podman host network，因 bridge 容器通常不能访问仅绑定 WSL loopback 的外部服务。启动：
-
-```bash
-podman run -d \
-  --name traceable-search \
-  --platform linux/amd64 \
-  --network host \
-  --env-file ~/.config/traceable-search/web.env \
-  --volume "$PWD/data:/data:Z" \
-  localhost/traceable-search:0.1.0
-```
-
-> [!CAUTION]
-> WebUI 无认证。host network 下必须保持 `WEB_BIND=127.0.0.1:8787`；勿改为 `0.0.0.0:8787`。密钥不得写入镜像或提交仓库。
-
-检查、停止：
-
-```bash
-podman logs --tail 50 traceable-search
-curl -fsS http://127.0.0.1:8787/
-podman stop traceable-search
-```
-
-升级时构建新 tag，删除旧容器，再以同一 env file 与 `/data` bind mount 启动；快照和 trace 因此保留。本机开发无需镜像，可继续直接运行 release binary。
-
-## 返回格式
-
-WebUI/API 返回来源 URL 与标题，不暴露内部 `snapshot_ref`：
-
-```json
-{
-  "answer": "grounded answer",
-  "claims": [
-    {
-      "text": "verifiable claim",
-      "sources": [
-        {"url": "https://example.com/page", "title": "Example"}
-      ]
-    }
-  ]
-}
-```
-
-## 验证
 
 先验证 SearXNG、crawl4ai 与 OpenAI-compatible API 可达。一次成功研究后，本项目应生成：
 

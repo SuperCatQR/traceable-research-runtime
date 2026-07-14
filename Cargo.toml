@@ -4,9 +4,6 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-# localhost WebUI + JSON/SSE API
-axum = "0.8"
-tokio-stream = "0.1"
 # async runtime
 tokio = { version = "1.52.3", features = ["fs", "macros", "rt-multi-thread", "time", "net"] }
 # HTTP client: crawl4ai + strong model (P3); native-tls = SChannel on Windows, no extra C toolchain
@@ -30,3 +27,7 @@ chrono = { version = "0.4.45", features = ["serde"] }
 thiserror = "2.0.18"
 # non-domain error bubbling in main()/tests
 anyhow = "1.0.103"
+
+[dev-dependencies]
+# local HTTP fixtures for adapter tests
+axum = "0.8"

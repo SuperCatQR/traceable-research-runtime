@@ -9,12 +9,12 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::{
-    Claim, ConfirmedResearchBrief, CrawlClient, ErrorClass, INTAKE_PROMPT, IntakeError,
-    IntakeEvent, IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks, IntakeStatus,
-    LiveBackend, MAX_TOTAL_QUESTIONS, ModelParseOutcome, PipelineStage, ReplayedRunHeader,
-    RunHeader, SearchError, SearxngClient, SnapshotReader, SnapshotRef, SnapshotWriter,
-    StrongClient, TracePolicy, TraceWriter, cancellation_event, confirmation_event,
-    events_for_model_output, minimal_brief_event,
+    Claim, ConfirmedResearchBrief, CrawlClient, INTAKE_PROMPT, IntakeError, IntakeEvent,
+    IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks, IntakeStatus, LiveBackend,
+    MAX_TOTAL_QUESTIONS, ModelParseOutcome, ReplayedRunHeader, RunHeader, SearchError,
+    SearxngClient, SnapshotReader, SnapshotRef, SnapshotWriter, StrongClient, TracePolicy,
+    TraceWriter, cancellation_event, confirmation_event, events_for_model_output,
+    minimal_brief_event,
     orchestration::{AnswerSource, ResearchResult, ResearchSession},
     parse_model_attempt, replay_run_header, user_reply_event,
 };
@@ -45,19 +45,6 @@ impl AppConfig {
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data")),
         })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn for_test(data_dir: PathBuf) -> Self {
-        Self {
-            search_base_url: "not a URL".into(),
-            crawl_base_url: "http://127.0.0.1:1/".into(),
-            crawl_token: String::new(),
-            model_base_url: "http://127.0.0.1:1/v1/".into(),
-            model_api_key: String::new(),
-            model: "test".into(),
-            data_dir,
-        }
     }
 }
 
@@ -362,7 +349,7 @@ impl ResearchService {
         })
     }
 
-    pub(crate) async fn run(&self, prepared: PreparedRun) -> Result<PublicAnswer, SearchError> {
+    pub async fn run(&self, prepared: PreparedRun) -> Result<PublicAnswer, SearchError> {
         let store_path = self.config.data_dir.join("snapshots.sqlite");
         let backend = LiveBackend::new(
             SearxngClient::new(&self.config.search_base_url).map_err(setup_error)?,
@@ -465,23 +452,6 @@ fn public_answer(result: ResearchResult) -> Result<PublicAnswer, SearchError> {
         answer: result.answer.answer,
         claims,
     })
-}
-
-#[derive(Debug, Serialize)]
-pub struct PublicError {
-    pub error_class: ErrorClass,
-    pub stage: PipelineStage,
-    pub message: String,
-}
-
-impl From<&SearchError> for PublicError {
-    fn from(error: &SearchError) -> Self {
-        Self {
-            error_class: error.error_class(),
-            stage: error.stage().unwrap_or(PipelineStage::Setup),
-            message: error.to_string(),
-        }
-    }
 }
 
 #[cfg(test)]

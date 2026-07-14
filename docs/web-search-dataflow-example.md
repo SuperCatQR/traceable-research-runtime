@@ -135,7 +135,7 @@ strong 对照原始问题读这 19 份原文，发现「Hopfield 网络」「玻
  "claims":[{"text":"得主为 Hopfield 与 Hinton","snapshot_refs":["snapshot:web/9f3a1c…"]}]}
 ```
 
-6. **校验有源**：程序只接受引用了已送入本次调用、且哈希匹配的 `snapshot_ref`，随后写 trace 的 `selection`/`claim`/`answer` 行；WebUI/API 边界将引用映射为 `url + title` 后返回用户，不暴露内部 `snapshot_ref`。若搜索无果、全部 `archive_skip`、无可用原文或 strong 判断原文不足，则据实拒答。
+6. **校验有源**：程序只接受引用了已送入本次调用、且哈希匹配的 `snapshot_ref`，随后写 trace 的 `selection`/`claim`/`answer` 行；公开结果将引用映射为 `url + title`，不暴露内部 `snapshot_ref`。若搜索无果、全部 `archive_skip`、无可用原文或 strong 判断原文不足，则据实拒答。
 
 ## 4. 提示词块在流程里的作用
 

@@ -1,12 +1,12 @@
 # traceable-search
 
-可审计的 Web 研究库：先经 Intake 反复澄清并由用户确认完整 Brief，再经 Bing 搜索、crawl4ai 抓取并锁定网页快照，最后由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。确认前不启动研究，内部以 `snapshot_ref` 与内容哈希完成校验和审计。
+可审计的 Web 研究库：Intake 模型反思原问题与历史回答，自主决定继续质询或完成 Brief；达到质询上限时由独立 final prompt 强制完成。模型完成后冻结执行策略，再经 SearXNG/Bing 搜索、crawl4ai 抓取并锁定网页快照，最后由 OpenAI-compatible 强模型生成带来源 URL 与标题的答案。研究开始前不触网，内部以 `snapshot_ref` 与内容哈希完成校验和审计。
 
 ## 架构
 
 ```text
 Rust caller ──library── traceable-search
-                       ├── Intake：创建、澄清、确认或取消
+                       ├── Intake：模型质询、用户回答、完成或取消
                        ├── HTTP ── SearXNG ── Bing
                        ├── HTTP ── crawl4ai
                        ├── HTTP ── upstream model
@@ -25,12 +25,25 @@ Rust caller ──library── traceable-search
 - `curl`（服务连通性验证）
 - Python 3（仅供下述部署命令生成随机密钥及校验 JSON；`traceable-search` 本身不依赖 Python）
 
-构建并测试：
+构建并验证：
 
 ```bash
 cargo build --release
-cargo test
+cargo fmt -- --check
+cargo clippy --all-targets -- -D warnings
+cargo test --all-targets
 ```
+
+## Library 调用
+
+高层入口为 crate root 导出的 `ResearchService`。典型生命周期如下：
+
+1. `AppConfig::from_env()` 后构造 `ResearchService`。
+2. `start_intake(question)` 创建会话。模型可直接完成，也可提出一个问题；处于 `NeedsInput` 时以 `reply_intake` 回答。模型输出连续两次非法时进入 `IntakeFailed`，修复外部原因后调用 `retry_intake`。
+3. 模型进入 `Complete` 后，调用 `prepare_run(clarification_id, policy)` 冻结执行策略并取得 `PreparedRun`；此步配置研究资源，不是用户确认 Brief。`rounds` 仅允许 3–5。
+4. 将 `PreparedRun` 交给 `run`。研究前不会触网；重复 prepare 复用首次 `run_id` 与策略。
+
+`IntakeCommandError`、`PrepareRunError`、`PreparedRun`、`PublicAnswer` 皆从 crate root 导出。当前 crate 不含 binary 或 HTTP server；宿主负责进程生命周期、鉴权及对外 transport。
 
 ## 外部服务
 
@@ -182,7 +195,7 @@ curl -i http://127.0.0.1:11235/
 cp .env.example .env
 ```
 
-本程序读取进程环境，不会自动解析 `.env`。启动前加载：
+本 library 读取进程环境，不会自动解析 `.env`。宿主启动前加载：
 
 ```bash
 set -a
@@ -208,7 +221,7 @@ test -w "$TRACEABLE_SEARCH_DATA_DIR"
 > 基础 URL 应保留尾部 `/`。程序分别拼接 `search`、`crawl` 与 `chat/completions`。
 
 
-先验证 SearXNG、crawl4ai 与 OpenAI-compatible API 可达。一次成功研究后，本项目应生成：
+先验证 SearXNG、crawl4ai 与 OpenAI-compatible API 可达。宿主完成一次成功研究后，本项目应生成：
 
 ```text
 data/snapshots.sqlite
@@ -216,7 +229,7 @@ data/intake/<clarification_id>.jsonl
 data/traces/<run_id>.jsonl
 ```
 
-`data/intake/` 记录创建、澄清、确认或取消的 append-only 历史；`data/traces/` 仅在确认后产生。删除或截断任一 JSONL 都会破坏审计与重启恢复，勿以此处理失败会话。
+`data/intake/` 记录创建、模型判断、质询、用户回答、run 准备、取消或失败的 append-only 历史；`data/traces/` 仅在 run 准备后产生。删除或截断任一 JSONL 都会破坏审计与重启恢复，勿以此处理失败会话。
 
 常见故障：
 

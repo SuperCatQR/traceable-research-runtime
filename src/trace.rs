@@ -16,11 +16,44 @@ use crate::{
 
 pub const TRACE_SCHEMA_VERSION: u32 = 3;
 
+impl Default for TracePolicy {
+    fn default() -> Self {
+        Self {
+            rounds: 3,
+            input_budget: 1_000_000,
+            max_snapshots: 300,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TracePolicy {
     pub rounds: u32,
     pub input_budget: u32,
     pub max_snapshots: u32,
+}
+
+pub fn validate_trace_policy(policy: &TracePolicy) -> std::result::Result<(), String> {
+    use crate::orchestration::{
+        MAX_EXPLORE_ROUNDS, MAX_SNAPSHOTS, MAX_STRONG_INPUT_TOKENS, MIN_EXPLORE_ROUNDS,
+    };
+
+    if !(MIN_EXPLORE_ROUNDS..=MAX_EXPLORE_ROUNDS).contains(&policy.rounds) {
+        return Err(format!(
+            "policy rounds must be between {MIN_EXPLORE_ROUNDS} and {MAX_EXPLORE_ROUNDS}"
+        ));
+    }
+    if policy.input_budget == 0 || policy.input_budget as usize > MAX_STRONG_INPUT_TOKENS {
+        return Err(format!(
+            "policy input_budget must be between 1 and {MAX_STRONG_INPUT_TOKENS}"
+        ));
+    }
+    if policy.max_snapshots == 0 || policy.max_snapshots as usize > MAX_SNAPSHOTS {
+        return Err(format!(
+            "policy max_snapshots must be between 1 and {MAX_SNAPSHOTS}"
+        ));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -307,6 +340,7 @@ pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
         return Err(invalid_trace("first trace event is not run_header"));
     };
     validate_run_id(&run_id)?;
+    validate_trace_policy(&policy).map_err(invalid_trace)?;
     match schema_version {
         1 | 2 => match (question, clarification_id, brief) {
             (Some(question), None, None) => Ok(ReplayedRunHeader::Legacy {
@@ -482,6 +516,26 @@ mod tests {
             }
         ));
         assert!(matches!(&events[1], TraceEvent::SnapshotSelection { .. }));
+    }
+
+    #[test]
+    fn replay_rejects_invalid_persisted_policy() {
+        let fixture = concat!(
+            r#"{"type":"run_header","schema_version":1,"run_id":"legacy","question":"q","started_at":"2026-07-11T10:00:00Z","policy":{"rounds":0,"input_budget":0,"max_snapshots":0}}"#,
+            "\n",
+        );
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "traceable-search-invalid-policy-{}-{nonce}.jsonl",
+            std::process::id()
+        ));
+        fs::write(&path, fixture).unwrap();
+        let error = replay_run_header(&path).unwrap_err();
+        assert!(error.to_string().contains("policy rounds"));
+        fs::remove_file(path).unwrap();
     }
 
     #[test]

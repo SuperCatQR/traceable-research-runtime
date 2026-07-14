@@ -1,10 +1,10 @@
 # Web Search 架构设计
 
-> 状态：主体已实现；§4.4 对话式 Intake 调整待实现
+> 状态：主体已实现；模型主导 Intake、执行策略准备门与 3–5 轮递归搜索已落地
 >
 > 日期：2026-07-14
 >
-> 目的：为 Web Search 单独建模。公网网页与结构化索引库是两类不同的原文世界，本文不复用索引库的“逐层下降选枝”抽象，而是按网页自身规律描述系统。目标流程以确认式 Intake、固定多轮探索、全量抓取、分层阅读和原文作答为核心；实现状态见 §9。
+> 目的：为 Web Search 单独建模。公网网页与结构化索引库是两类不同的原文世界，本文不复用索引库的“逐层下降选枝”抽象，而是按网页自身规律描述系统。目标流程以模型主导 Intake、固定多轮探索、全量抓取、分层阅读和原文作答为核心；实现状态见 §9。
 
 ## 1. 为什么单独设计
 
@@ -17,7 +17,7 @@
 - **网页内容不可信**。正文可能含提示注入，一律只当数据，不执行其中指令。
 - **抓取会主动向外发请求**。必须在请求前和重定向后执行 SSRF 守卫。
 
-因此骨架是：**澄清并确认 Research Brief → 强模型提出查询 → Bing 每词取第一页 → 全量抓取并存快照 → 迭代 N 轮 → 程序摘录导航目录 → 强模型选择并阅读原文 → 带来源作答**。
+因此骨架是：**模型主导澄清并完成 Research Brief → 冻结执行策略 → 强模型提出查询 → Bing 每词取第一页 → 全量抓取并存快照 → 迭代 N 轮 → 程序摘录导航目录 → 强模型选择并阅读原文 → 带来源作答**。
 
 这里没有“模型先挑搜索候选”与“逐字取证”两步。搜索引擎已完成第一页排序，再让模型预选只会增加调用和黑箱判断；快照增长本身可接受。程序摘录只截取标题+首段供最终导航，不提供事实证据。
 
@@ -57,7 +57,7 @@ crawl4ai 是唯一正文抽取后端，但不承担公网信任边界。`CrawlCl
 抓取流程如下。搜索所得候选去重后全部进入，不经过模型挑选：
 
 1. `fetch_public_page` 只接受公网 `http(s)` URL；DNS 的全部解析地址均须为公网地址。
-2. Rust 客户端关闭自动重定向，逐跳读取 `Location`、重新解析 DNS 并复验；最多跟随 10 跳，故跳前与跳后均受 SSRF 守卫。
+2. Rust 客户端关闭自动重定向，逐跳读取 `Location`、重新解析 DNS 并复验；最多跟随 5 跳，故跳前与跳后均受 SSRF 守卫。
 3. 响应体以流式方式读取，累计超过 `MAX_PAGE_BYTES = 4_000_000` 即停止并返回失败，不先无界缓冲。
 4. HTML 经离线输入发送到 `POST {CRAWL4AI_BASE}/crawl`；crawl4ai 负责正文抽取，不启用代理、认证 profile 或主动反爬绕过。
 5. 本地校验 crawl4ai 响应、正文、内容哈希、最终 URL 与抓取元数据；失败记 `archive_skip`，继续下一候选，不伪装成功。
@@ -132,9 +132,9 @@ flowchart TB
 
 ### 4.2 数据流
 
-数据流按 Intake、Explore、Synthesize 三阶段分别绘制。`ResearchService` 负责会话命令、确认准备与启动研究，不生成或修改模型返回的 Brief 内容。
+数据流按 Intake、Explore、Synthesize 三阶段分别绘制。`ResearchService` 负责会话命令、模型调用和执行策略准备，不生成或修改模型返回的 Brief 内容。
 
-Intake（用户只提交问题，模型逐次质询，用户显式确认）：
+Intake（模型自主决定质询或完成，用户只回答当前问题）：
 
 ```mermaid
 flowchart LR
@@ -145,12 +145,12 @@ flowchart LR
     intakeAudit[("data/intake/&lt;clarification_id&gt;.jsonl")]
     researchStart["PreparedRun<br/>冻结Brief与run_id"]
 
-    caller -->|提交question 回答 确认 取消| appService
+    caller -->|提交question 回答 取消| appService
     appService --> intakeState --> intakeAudit
     appService -->|原问题 当前草案 完整问答| strongIntake
-    strongIntake -->|修订草案和至多一个问题| appService
+    strongIntake -->|decision ask/complete + 草案 + 可选问题| appService
     appService -->|草案 当前问题 质询次数| caller
-    appService -->|人工确认revision与content_hash| researchStart
+    appService -->|模型complete后冻结policy| researchStart
 ```
 
 Explore（固定 N 轮）：
@@ -215,11 +215,11 @@ flowchart LR
 
 组件边界：
 
-- `src/app.rs` 提供纯 Rust 应用入口，串行化同一 Intake 的命令，调用模型推进草案，并以 `revision + content_hash` 准备唯一 run。
-- `src/intake.rs` 独占确认前事件回放与状态转移；它不能搜索、抓取或访问快照 DB。
+- `src/app.rs` 提供纯 Rust 应用入口，串行化同一 Intake 的命令，选择普通/final prompt，调用模型推进草案，并在模型完成后准备唯一 run。
+- `src/intake.rs` 独占 Intake 事件回放与状态转移；它只验证协议与不变量，不能判断问题质量、搜索、抓取或访问快照 DB。
 - `src/orchestration.rs` 只接受 `ConfirmedResearchBrief`，独占 Explore 与 Synthesize 控制流；模型不能改变轮数、直接触网或访问 DB。
 - Bing 的标题和 snippet、程序摘录都只用于导航；crawl4ai 只抽取已经本地安全获取的 HTML。
-- `data/snapshots.sqlite` 保存不可变网页版本；`data/intake/<clarification_id>.jsonl` 保存确认前修订史；`data/traces/<run_id>.jsonl` 保存冻结 Brief、派生摘录、选择理由、Claim 和答案。
+- `data/snapshots.sqlite` 保存不可变网页版本；`data/intake/<clarification_id>.jsonl` 保存模型判断与问答历史；`data/traces/<run_id>.jsonl` 保存冻结 Brief、派生摘录、选择理由、Claim 和答案。
 - 三层资料是逻辑视图：**标题**来自搜索/页面 metadata，**摘录**来自程序摘录（标题+首段+URL），**原文**来自快照。摘录不覆盖原文，也不升级为证据。
 
 ### 4.3 研究编排层
@@ -242,24 +242,24 @@ result = ResearchSession(confirmed_brief, policy).run()
 ```rust
 plan_queries(raw, previous_queries) -> Result<Vec<PlannedQuery>>
 select_sources(raw, run_snapshots) -> Result<Vec<SourceSelection>>
-validate_answer(raw, selected_snapshots) -> Result<Answer>
+synthesize_answer(raw, selected_snapshots) -> Result<Answer>
 ```
 
 校验函数只接收纯数据、返回纯数据，不触网、不碰 DB、不写日志；搜索、抓取、快照读写、审计落盘与轮次控制仍由 `ResearchSession` 统一编排。固定 fixture 可独立覆盖模型输出边界；待并发恢复或多研究策略成为真实需求时再拆 planner、selector、synthesizer。
 
-### 4.4 Research Intake：问题澄清与确认
+### 4.4 Research Intake：模型主导的问题澄清
 
 #### 目标与非目标
 
-用户在 Intake 入口只填写自然语言 `question`，不手工填写 Brief。服务立即调用 strong 生成结构化 `ResearchBrief` 草案；若仍有会显著改变**查询方向、来源选择或答案形态**的歧义，模型每次只提出一个问题，并在用户回答后修订草案。模型不得追问本可通过网页研究得到的事实，例如“该公司 CEO 是谁”，也不得为了填满字段而追问。
+用户在 Intake 入口只填写自然语言 `question`，不手工填写 Brief。模型反思原问题、当前草案与完整问答历史，自主返回 `decision = ask | complete`。若仍有会显著改变**查询方向、来源选择或答案形态**的歧义，模型一次只提出一个问题；若信息已足够，则可在首轮直接完成。状态机不裁决问题质量，也不改写模型决定，只校验协议、记录事件并限制最多展示 5 个问题。模型不得追问本可通过网页研究得到的事实，例如“该公司 CEO 是谁”，亦不得为填满字段而追问。
 
-确认对象不是模型润色的一句话，而是结构化 `ResearchBrief`：
+模型完成的对象不是润色后的一句话，而是结构化 `ResearchBrief`：
 
 ```json
 {
   "schema_version": 1,
   "original_question": "用户最初输入，不可改写",
-  "research_question": "经确认、可研究且边界明确的核心问题",
+    "research_question": "模型完成的、可研究且边界明确的核心问题",
   "desired_output": "答案形态、深度或比较维度；未指定则为 null",
   "scope": {
     "time_range": null,
@@ -272,7 +272,7 @@ validate_answer(raw, selected_snapshots) -> Result<Answer>
 }
 ```
 
-除 `original_question` 与 `research_question` 外，其余字段均可为空；空值表示用户无特别约束，不触发补问。每次模型修订后都向用户展示完整草案。用户可在任一次质询时直接确认当前草案，无须答完剩余问题。确认时对规范化 JSON 计算 `content_hash`，并附加 `clarification_id`、`confirmed_at`，得到不可变 `ConfirmedResearchBrief`。后续所有查询规划、选源和作答调用都重放**完整 Brief**，不只重放改写后的问题。
+除 `original_question` 与 `research_question` 外，其余字段均可为空；空值表示用户无特别约束，不触发补问。模型完成时对规范化 JSON 计算 `content_hash`。调用方随后以 `prepare_run(clarification_id, policy)` 冻结执行策略并产生不可变 `ConfirmedResearchBrief`；此步不是用户对内容的确认。后续查询规划、选源和作答均重放完整 Brief。
 
 #### Research Intake 时序
 
@@ -288,52 +288,39 @@ sequenceDiagram
 
     U->>W: start_intake(question)
     W->>I: create(question)
-    I->>M: 原问题生成 Brief 草案和至多一个质询
+    I->>M: 普通 prompt + 原问题与历史
     alt 模型失败或连续两次返回非法 JSON
         I->>L: append intake_failed
         I-->>W: INTAKE_FAILED，可重试或取消
-        W-->>U: 显式失败，不启动 Research
-    else 草案有效
-        M-->>I: brief_draft + question + ready_to_confirm
-        I->>L: append intake_started、brief_revised、可选 clarification_asked
-        I-->>W: 草案、当前问题、revision、content_hash、questions_asked
-        W-->>U: 展示完整草案与确认按钮
+    else decision=complete
+        M-->>I: complete + brief_draft
+        I->>L: append model_evaluated(complete)
+        I-->>W: COMPLETE
+    else decision=ask
+        M-->>I: ask + brief_draft + 一个问题
+        I->>L: append model_evaluated(ask)、clarification_asked
+        I-->>W: NEEDS_INPUT
     end
 
-    Note over U,I: 用户看到任一版草案后均可立即确认或取消
-    loop 回答当前质询，累计最多展示 5 个且用户尚未确认或取消
+    loop 模型继续 ask 且已展示问题少于 5 个
         U->>W: reply_intake(id, revision, answer)
         W->>I: answer_current_question
         I->>L: append user_replied
-        I->>M: 原问题、当前草案、完整问答、剩余质询额度
-        alt 模型修订失败
-            I->>L: append intake_failed
-            I-->>U: INTAKE_FAILED，不启动 Research
-        else 已回答第 5 个质询
-            M-->>I: brief_draft + question=null
-            I->>L: append brief_revised
-            I-->>U: 展示最新版草案，仅等待确认或取消
-        else 尚有质询额度
-            M-->>I: brief_draft + 零或一个新质询
-            I->>L: append brief_revised、可选 clarification_asked
-            I-->>U: 展示新版草案；可回答、确认或取消
-        end
+        I->>M: 普通 prompt + 原问题与完整历史
+        M-->>I: ask 或 complete
+        I->>L: append model_evaluated、可选 clarification_asked
     end
 
-    alt 用户确认任一版当前草案
-        U->>W: confirm_intake(id, revision, content_hash, policy)
-        W->>I: confirm_current_brief
-        I->>L: append confirmed，预分配唯一 run_id
-        I->>S: start(ConfirmedResearchBrief, run_id)
-        S-->>U: 返回同一 run_id，进入 Research
-    else 用户取消
-        U->>W: cancel_intake(id, revision)
-        W->>I: cancel
-        I->>L: append cancelled
-        I-->>U: CANCELLED，不启动 Research
-    else 达到 5 次但尚未确认
-        I-->>U: 保持 READY_TO_CONFIRM，绝不自动启动 Research
+    alt 已回答第 5 个问题
+        I->>M: final prompt + 原问题与完整历史
+        M-->>I: complete + brief_draft，不得再提问
+        I->>L: append model_evaluated(complete)
     end
+
+    W->>I: prepare_run(id, policy)
+    I->>L: append run_prepared，预分配唯一 run_id
+    I->>S: start(ConfirmedResearchBrief, run_id)
+    S-->>W: 返回同一 run_id，进入 Research
 ```
 
 #### 状态机与设问规则
@@ -342,34 +329,33 @@ sequenceDiagram
 stateDiagram-v2
     [*] --> DRAFT: 用户提交question
     DRAFT --> NEEDS_INPUT: 生成草案和一个质询
-    DRAFT --> READY_TO_CONFIRM: 无需继续质询或已答完第5问
+    DRAFT --> COMPLETE: 模型决定信息充分
     DRAFT --> INTAKE_FAILED: 模型调用或结构化输出失败
     NEEDS_INPUT --> DRAFT: 用户回答当前质询
-    NEEDS_INPUT --> CONFIRMED: 用户直接确认当前草案
-    READY_TO_CONFIRM --> CONFIRMED: 用户确认当前草案
+    COMPLETE --> PREPARED: 调用方冻结执行policy
     NEEDS_INPUT --> CANCELLED: 用户取消
-    READY_TO_CONFIRM --> CANCELLED: 用户取消
-    INTAKE_FAILED --> DRAFT: 重试或生成最小Brief
+    COMPLETE --> CANCELLED: 调用方取消
+    INTAKE_FAILED --> DRAFT: 重试模型
     INTAKE_FAILED --> CANCELLED: 用户取消
-    CONFIRMED --> [*]: 创建run_id并启动ResearchSession
+    PREPARED --> [*]: 创建run_id并启动ResearchSession
 ```
 
-每次 strong 返回 `brief_draft + question + ready_to_confirm` 的固定 JSON，其中 `question` 只能是一个问题或 `null`。程序执行以下硬约束：
+每次 strong 返回 `decision + brief_draft + question` 的固定 JSON。程序执行以下硬约束：
 
 1. 单次模型调用至多产生一个质询；它必须改变检索路径或答案验收标准，优先给出互斥选项，并允许“其他”或“不限制”。
-2. 每个 Intake 累计至多向用户展示 5 个质询，由服务端计数，模型不能重置或延长。用户回答第 5 问后，服务只接受修订后的草案，不再接受新问题，并进入 `READY_TO_CONFIRM`。
-3. 用户可在 `NEEDS_INPUT` 或 `READY_TO_CONFIRM` 状态确认当前草案。达到 5 次上限只会停止质询，绝不自动确认或自动启动 Research。
-4. 模型不得把未经用户表达的具体时间、地域、主体或立场写成事实；必要推定只能进入 `accepted_assumptions`，并展示给用户确认。
-5. 无论模型判断多清晰，均须用户显式确认当前草案；清晰问题仅省去质询，不省确认。
-6. 每次修订递增 `revision`。确认请求必须携带当前 `revision + content_hash`；若草案已变化则返回 `409 stale_brief`，防止并发页面确认旧版本。
+2. 每个 Intake 累计至多展示 5 个质询；回答第 5 问后，服务改用独立 final prompt，只接受 `complete`，不替模型生成 Brief。
+3. `ask` 必须带一个问题，`complete` 必须令问题为 `null`；编排器不得互换 decision，也不得绕过待答问题。
+4. 模型不得把未经用户表达的具体时间、地域、主体或立场写成事实；必要推定只能进入 `accepted_assumptions`。
+5. 模型可首轮完成；用户只回答问题，不确认 Brief 内容。
+6. 每次模型判断递增 `revision`。`prepare_run` 从当前 `COMPLETE` 状态读取 hash 并冻结 policy；重复调用复用首次 run。
 
 #### 持久化
 
-调用方经 `ResearchService` 的强类型方法创建、回复、恢复、确认或取消 Intake；不能提交 `brief_draft`，草案仅由服务根据原问题和完整问答历史生成。
+调用方经 `ResearchService` 的强类型方法创建、回复、重试、准备或取消 Intake；不能提交 `brief_draft`，草案仅由模型根据原问题和完整问答历史生成。
 
-`data/intake/<clarification_id>.jsonl` 以 append-only 事件保存 `intake_started | clarification_asked | user_replied | brief_revised | confirmed | cancelled | intake_failed`，使服务重启后仍可恢复当前草案、待答问题和 `questions_asked`。确认前没有 `run_id`，不创建快照，也不写研究 trace。确认时由 `IntakeService` 串行执行幂等协议：校验 `revision + content_hash`，预分配 `run_id`，追加含 `run_id + ConfirmedResearchBrief` 的 `confirmed` 事件，再以 `create_new` 创建 `data/traces/<run_id>.jsonl` 并写 `run_header`；若中途崩溃，恢复逻辑从 `confirmed` 事件补建同一 `run_id`，重复确认则返回既有 `run_id`，绝不启动第二次研究。两个 JSONL 不伪装成跨文件事务。完整 `ConfirmedResearchBrief + clarification_id + content_hash` 同时嵌入 `run_header`，故研究 trace 单文件即可回放，Intake 日志则保留“为何如此理解”的对话史。
+`data/intake/<clarification_id>.jsonl` 以 append-only 事件保存 `intake_started | model_evaluated | clarification_asked | user_replied | run_prepared | cancelled | intake_failed`。旧 `brief_revised | confirmed` 仍可回放。模型 complete 前没有 `run_id`；`prepare_run` 串行校验当前状态、冻结 policy、预分配 `run_id` 并追加 `run_prepared`，再以 `create_new` 创建 trace。若中途崩溃，恢复逻辑以同一 `run_id` 补建 trace；重复 prepare 返回既有 run。完整 `ConfirmedResearchBrief + clarification_id + content_hash` 嵌入 `run_header`。
 
-若 Intake 模型调用失败或 JSON 连续两次不合法，进入可重试的 `INTAKE_FAILED` 状态并追加 `intake_failed` 事件，不静默拿原问题启动研究。用户可显式选择“按原问题生成最小 Brief”，但该草案仍由服务生成、须经预览和人工确认。
+若 Intake 模型调用失败或 JSON 连续两次不合法，进入可重试的 `INTAKE_FAILED` 状态并追加 `intake_failed` 事件，不静默拿原问题启动研究。调用方只可修复外部原因后重试模型，或取消会话；编排器不生成替代 Brief。
 
 此层提升的是**问题定义质量与跨轮稳定性**，不能修复搜索引擎召回、抓取失败、来源偏差或证据不足；这些仍由 Explore、Synthesize 与据实拒答处理。
 
@@ -392,7 +378,7 @@ sequenceDiagram
     participant J as data/traces JSONL
 
     U->>W: 确认 Research Brief
-    W->>A: confirm_intake
+    W->>A: prepare_run
     A->>O: ResearchSession::new(...).run()
     O->>J: run_header + 完整冻结 Brief
     loop rounds=3..5，默认 3
@@ -442,7 +428,7 @@ sequenceDiagram
 ### 5.1 每轮探索
 
 1. **生成查询**（strong）：第 1 轮输入完整 `ConfirmedResearchBrief`；第 2 轮起再加入目前已归档的全部原文。冻结 Brief 是每轮不变的锚，完整存储于 `run_header`，每轮重放；输出恰好 3 个查询及各自证据缺口，并与历史查询去重。
-2. **搜索第一页**：`SearxngClient` 固定请求 Bing general 类别，每词最多取前 10 条并记录排名；超时、HTTP 5xx 与限流响应按 1/2/4/8 秒退避，最多 5 次尝试。
+2. **搜索第一页**：`SearxngClient` 固定请求 Bing general 类别，每词最多取前 10 条并记录排名；HTTP 429 或响应体报告 rate limit 时按 `1, 3, 5, 9s` 退避，最多重试 4 次，耗尽后显式失败。
 3. **全量抓取**：跨词、跨轮按去 fragment 的 URL 去重；每个新 URL 均先由本地 `SafeHttpFetcher` 执行请求前与逐重定向 SSRF 校验、限长下载和 HTML 清洗，再把已下载 HTML 交 crawl4ai 离线抽取。任一阶段失败即写 `archive_skip`，其余候选继续；成功才保存快照并写 `archive`。
 4. **反馈深化**：下一轮 strong 从已归档原文中识别新主体、术语、时间线、冲突点和证据缺口，据此生成新词。
 5. **有界收敛**：执行用户选择的 3–5 轮，默认 3；达到 1,000,000 token 估算输入预算、300 份快照或本轮无任何新 URL 时提前结束探索，并写 `round_completed` 检查点与停止原因。
@@ -520,7 +506,7 @@ N 轮结束后，为每份快照构造：
 质量不能只靠模型自觉，Intake 与研究编排层至少执行八道校验：
 
 1. **Brief 草案**：JSON schema 正确，`original_question` 与初始输入逐字一致，字段长度与数组数量有界；单次模型调用至多一个质询、累计至多 5 个，空约束不触发补问。
-2. **确认完整性**：`revision + content_hash` 必须指向当前 `NEEDS_INPUT` 或 `READY_TO_CONFIRM` 草案；只有冻结的 `ConfirmedResearchBrief` 能启动研究；重复确认只能返回首次预分配的同一 `run_id`。
+2. **准备完整性**：只有模型 `complete` 后的当前草案可冻结为 `ConfirmedResearchBrief` 并启动研究；重复 prepare 只返回首次预分配的 `run_id` 与 policy。
 3. **查询输出**：JSON schema 正确、每轮恰好 3 词、长度有界、轮内和历史去重。
 4. **候选归属**：只处理本 run Bing 返回且经规范化去重的新 URL；归档快照必须由本轮 `SearchResult` 与实际抓取结果共同构造。
 5. **抓取有效**：请求前与每次重定向都通过公网 http(s) 校验；本地 HTTP 响应、crawl4ai 状态、最终 URL、正文非空、最小正文长度和结构化字段皆须通过检查。
@@ -550,8 +536,8 @@ N 轮结束后，为每份快照构造：
 ## 8. 存储与审计
 
 - **快照 DB** `data/snapshots.sqlite`：经 `src/snapshot.rs` 写入标题、URL、原文、哈希、抓取凭证和时间。正文不可变；探索阶段只持 `SnapshotWriter`，合成阶段另开 `SnapshotReader`，上层不持有数据库连接。
-- **Intake 日志** `data/intake/<clarification_id>.jsonl`：每次澄清一份 append-only 文件，保存原始问题、草案修订、所问问题、用户回答、确认或失败事件；`IntakeService` 独占写入。其目的不是研究证据审计，而是恢复确认前状态及解释“为何冻结成此 Brief”。
-- **研究日志** `data/traces/<run_id>.jsonl`：每 run 一份 append-only 文件。首行 `run_header` 固定保存 `run_id + clarification_id + ConfirmedResearchBrief + content_hash + 启动时间 + 配置`，是每轮重放 strong 的不可变锚；其后记录 query、search\_result、archive/archive\_skip、excerpt、snapshot\_selection、claim、`round_completed`，以及终止事件 answer 或 run\_failed。`ResearchSession` 独占写入，HTTP 层不写。
+- **Intake 日志** `data/intake/<clarification_id>.jsonl`：每次澄清一份 append-only 文件，保存原始问题、模型判断、所问问题、用户回答、run 准备或失败事件；其目的不是研究证据审计，而是恢复模型主导的 Intake 状态及解释 Brief 来源。
+- **研究日志** `data/traces/<run_id>.jsonl`：每 run 一份 append-only 文件。首行 `run_header` 固定保存 `run_id + clarification_id + ConfirmedResearchBrief + content_hash + 启动时间 + 配置`，是每轮重放 strong 的不可变锚；其后记录 query、search\_result、archive/archive\_skip、excerpt、snapshot\_selection、claim、`round_completed`，以及终止事件 answer 或 run\_failed。`ResearchSession` 独占写入。
 
 `src/snapshot.rs` 内部使用参数化 SQL、字段校验和事务，上层不直接执行 SQL；两类审计日志皆为纯 append-only 结构化 JSON，无独立数据库。密钥与网页正文不写日志，正文只以 `snapshot_ref/content_hash` 引用；Intake 会保存用户原始问题和回答，故入口须拒收凭据字段，日志目录沿用服务数据目录权限与保留策略。
 
@@ -559,25 +545,25 @@ N 轮结束后，为每份快照构造：
 
 两类 JSONL 各有固定事件契约：
 
-- Intake 首行 `intake_started` 携带 `schema_version: 1`；事件枚举为 `intake_started | clarification_asked | user_replied | brief_revised | confirmed | cancelled | intake_failed`。`confirmed` 固定含 `run_id + revision + content_hash + ConfirmedResearchBrief`。
+- Intake 首行 `intake_started` 携带 `schema_version: 1`；新事件枚举为 `intake_started | model_evaluated | clarification_asked | user_replied | run_prepared | cancelled | intake_failed`。旧 `brief_revised | confirmed` 保持反序列化与 replay 兼容。
 - 研究 `run_header` 携带 `schema_version: 3`。v3 相比 v2 以完整 `ConfirmedResearchBrief` 取代单独的原始问题字段；读取方仍须接受无 `run_failed` 的 v1 及以原始问题为锚的 v2 历史日志。
 - 研究事件枚举仍为 `run_header | query | search_result | archive | archive_skip | excerpt | snapshot_selection | claim | answer | run_failed`。
 - `snapshot_selection` 每项固定为 `snapshot_ref + reason`，不含 `relevance`。
 - `run_failed` 固定含 `error_class`、`stage`、`message`。`error_class` 取 `external | internal`；`stage` 指明 `setup | planning | search | archive | selection | synthesis | trace` 之一。
 
-每个 Intake 会话只可不可逆地终止为 `confirmed | cancelled` 之一；`intake_failed` 是可经 `DRAFT` 新事件恢复的失败状态，不是会话终止事件。每个 run 恰有一个末行终止事件：成功为 `answer`，失败为 `run_failed`，二者互斥。选源后的抓取与快照持久化不回滚；故后续失败时，内容寻址快照可保留以供审计，但本 run 仍由 `run_failed` 明确终止，不伪装成部分答案。
+每个 Intake 会话只可不可逆地终止为 `prepared | cancelled` 之一；`intake_failed` 可经模型重试恢复，不是终态。每个 run 恰有一个末行终止事件：成功为 `answer`，失败为 `run_failed`，二者互斥。
 
-HTTP 层将同一失败语义映射为 JSON `error_class + stage + message`；空问题或非法回答为 400、未知会话/run 为 404、旧 `revision/content_hash` 或并发修改为 409。字段只增不改；新增事件只扩相应 `type` 枚举，旧日志读取能力保留。
+library 调用边界保留同一失败语义：Intake 命令返回 `IntakeCommandError`，确认准备返回 `PrepareRunError`，研究执行返回带 `error_class + stage + message` 的 `SearchError`。字段只增不改；新增事件只扩相应 `type` 枚举，旧日志读取能力保留。
 
 ## 9. 实现状态
 
 Rust 主链、存储与安全边界已实现；§4.4 本轮调整尚待落码：
 
 1. **已有 Intake 基础**：`src/intake.rs` 已落地 Brief schema、澄清状态机、幂等确认及 `data/intake/<clarification_id>.jsonl` 回放；创建入口只接收 `question`，服务会生成草案。
-2. **待调整 Intake 对话**：模型输出由“单次最多 3 个问题”收紧为零或一个；服务新增累计 5 次硬上限；回复 API 由 `answers[] + edited_brief` 收紧为当前问题的单个 `answer`；确认门由仅 `READY_TO_CONFIRM` 放宽为 `NEEDS_INPUT | READY_TO_CONFIRM`。第 5 问后只停问并等待人工确认，绝不自动启动 Research。
+2. **已实现模型主导 Intake**：模型每轮决定 `ask | complete`；服务只校验协议并累计最多 5 问；回答第 5 问后改用 final prompt，用户无 Brief 确认权。
 3. **已有研究主链**：`src/orchestration.rs` 只接受冻结的 `ConfirmedResearchBrief`，执行 3–5 轮 Explore、目录选源与基于已读原文的最终作答；旧单轮、cheap 逐字取证和 strong 候选预选均已移除。
 4. **已有持久化与抓取**：`src/snapshot.rs` 以 `data/snapshots.sqlite` 保存内容寻址的不可变正文；`src/trace.rs` 以 `data/traces/<run_id>.jsonl` 保存研究事件并支持检查点回放；`src/adapters.rs` 固定 SearXNG/Bing 搜索并含退避重试，网页先经 `SafeHttpFetcher` 完成本地 SSRF 校验、限长下载与清洗，再交 crawl4ai 离线抽取。
-5. **已有程序校验**：程序已校验 Brief revision/hash、查询 JSON、候选归属、抓取质量、快照 hash、选源范围、Claim 引用范围和资源上限；失败以 `error_class + stage + message` 落 trace 并映射 HTTP。固定 fixture 与集成测试已覆盖原 Intake、搜索重试、SSRF 重定向、探索续跑和终止事件互斥；§4.4 新边界须同步更新 Intake 与 Web API 测试。
+5. **已有程序校验**：程序已校验 Brief revision/hash、确认时冻结的 `TracePolicy`、查询 JSON、候选归属、抓取质量、快照 hash、选源范围、Claim 引用范围和资源上限；失败以 `error_class + stage + message` 落 trace。固定 fixture 与模块测试覆盖 Intake、搜索限流重试、SSRF 重定向、探索续跑、URL 重试与最终页去重，以及终止事件互斥。
 
 ## 10. 安全与资源边界
 
@@ -587,7 +573,7 @@ Rust 主链、存储与安全边界已实现；§4.4 本轮调整尚待落码：
 - **抓取边界**：默认 3 轮、最多 5 轮 × 3 词 × 每词第一页 10 条；URL 去重；高位上限 300 份来源。
 - **上下文边界**：按 1M 模型窗口设计，单次输入最多 1,000,000 token；达到预算即停止扩展，不静默截掉终局目录。
 - **页面边界**：单页存档最多 4MB；超限明确标记截断，不能伪装成完整原文。
-- **凭据隔离**：`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN` 走环境变量，不入库、不入仓；Intake 日志按服务数据目录权限保护，API 响应不回显疑似凭据。
+- **凭据隔离**：`CRAWL4AI_BASE_URL` / `CRAWL4AI_TOKEN` 走环境变量，不入库、不入仓；Intake 日志按宿主数据目录权限保护，library 返回值不回显疑似凭据。
 
 ## 11. 边界与局限
 
@@ -605,16 +591,16 @@ Rust 主链、存储与安全边界已实现；§4.4 本轮调整尚待落码：
 
 ### 12.1 有利于定位问题的结构特征
 
-1. **阶段控制各有一处**：`src/intake.rs` 独占确认前状态机，`src/orchestration.rs` 独占确认后研究编排；交界只有不可变 `ConfirmedResearchBrief`。`src/app.rs` 只校验并转交命令，不生成或修改 Brief；模型不改状态、不触网、不碰 DB。
+1. **阶段控制各有一处**：`src/intake.rs` 独占 Intake 状态投影，`src/orchestration.rs` 独占研究编排；交界为不可变 `ConfirmedResearchBrief`。`src/app.rs` 只选 prompt、调用模型、持久化事件并冻结执行 policy，不判断问题质量或修改 Brief。
 2. **模型调用无状态、可重放**：Intake 从草案与问答事件重建输入，Research 从冻结 Brief、快照与研究日志重建输入，无隐藏状态。模型本身不确定，但输入与管道可重放。
-3. **双 append-only 日志覆盖全链**：`data/intake/<clarification_id>.jsonl` 解释问题如何被理解，`data/traces/<run_id>.jsonl` 记录确认后研究链；`confirmed.run_id` 与 `run_header.clarification_id` 双向关联，阶段内各是一会话一文件。
+3. **双 append-only 日志覆盖全链**：Intake 日志解释问题如何被模型理解，trace 记录研究链；`run_prepared.run_id` 与 `run_header.clarification_id` 关联两阶段。
 4. **八道校验各卡一个边界**：草案或确认校验失败锁定 Intake，查询、抓取、哈希、ref 或 Claim 校验失败锁定 Research；`stage` 与 `error_class` 进一步区分位置和归因。
 5. **Brief 与快照皆不可变且带 content\_hash**：排除输入或证据暗改；损坏与旧版本确认由程序机械发现。
 6. **单进程、单抓取后端、有界澄清与有界 N 轮**：从源头限制竞态、无限对话和并行乱序类 heisenbug。
 
 ### 12.2 定位一个 bug 的典型路径
 
-若“答案正确回答了错误问题”，先按 `clarification_id` 看 `brief_revised` 与 `user_replied`，判断歧义来自用户回答还是 Brief 修订；再沿 `confirmed.run_id` 打开研究日志。若“答案漏掉关键页”，看 `archive_skip`，再看 `snapshot_selection`，最后看 `claim`。问题定义与证据处理分段定位，不必混读整条链。
+若“答案正确回答了错误问题”，先按 `clarification_id` 看 `model_evaluated` 与 `user_replied`；再沿 `run_prepared.run_id` 打开研究日志。若“答案漏掉关键页”，看 `archive_skip`、`snapshot_selection` 与 `claim`。
 
 ### 12.3 已知风险与应对
 

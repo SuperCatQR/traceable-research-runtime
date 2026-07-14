@@ -8,7 +8,7 @@ use url::Url;
 use crate::{
     Answer, ConfirmedResearchBrief, Excerpt, PipelineStage, Query, Result, RunReplay, SearchError,
     SearchResult, Snapshot, SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection,
-    TraceEvent, TraceWriter,
+    TraceEvent, TracePolicy, TraceWriter,
 };
 
 pub const MIN_EXPLORE_ROUNDS: u32 = 3;
@@ -77,41 +77,43 @@ pub struct ResearchResult {
 
 pub struct ResearchSession<B, W: Write> {
     brief: ConfirmedResearchBrief,
-    rounds: u32,
+    policy: TracePolicy,
     backend: B,
     snapshots: SnapshotWriter,
     trace: TraceWriter<W>,
     state: ResearchState,
     archived: Vec<Snapshot>,
     previous_queries: Vec<String>,
-    seen_urls: HashSet<String>,
+    archived_urls: HashSet<String>,
+    archived_refs: HashSet<SnapshotRef>,
 }
 
 impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     #[must_use]
     pub fn new(
         brief: ConfirmedResearchBrief,
-        rounds: u32,
+        policy: TracePolicy,
         backend: B,
         snapshots: SnapshotWriter,
         trace: TraceWriter<W>,
     ) -> Self {
         Self {
             brief,
-            rounds,
+            policy,
             backend,
             snapshots,
             trace,
             state: ResearchState::default(),
             archived: Vec::new(),
             previous_queries: Vec::new(),
-            seen_urls: HashSet::new(),
+            archived_urls: HashSet::new(),
+            archived_refs: HashSet::new(),
         }
     }
 
     pub fn resume(
         brief: ConfirmedResearchBrief,
-        rounds: u32,
+        policy: TracePolicy,
         backend: B,
         snapshots: SnapshotWriter,
         trace: TraceWriter<W>,
@@ -124,13 +126,17 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 SearchError::InvalidSnapshot(format!("missing replay snapshot {reference:?}"))
             })?);
         }
-        let seen_urls = archived
+        let archived_urls = archived
             .iter()
-            .filter_map(|snapshot| normalized_url(&snapshot.requested_url).ok())
+            .filter_map(|snapshot| normalized_url(&snapshot.crawl.final_url).ok())
+            .collect();
+        let archived_refs = archived
+            .iter()
+            .map(|snapshot| snapshot.snapshot_ref.clone())
             .collect();
         Ok(Self {
             brief,
-            rounds,
+            policy,
             backend,
             snapshots,
             trace,
@@ -142,7 +148,8 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             },
             archived,
             previous_queries: replay.previous_queries,
-            seen_urls,
+            archived_urls,
+            archived_refs,
         })
     }
 
@@ -198,14 +205,14 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     }
 
     pub async fn explore(&mut self) -> Result<&ResearchState> {
-        for round in self.state.round + 1..=self.rounds {
+        for round in self.state.round + 1..=self.policy.rounds {
             self.state.round = round;
             self.state.estimated_input_tokens = estimate_snapshot_tokens(&self.archived);
-            if self.state.estimated_input_tokens >= MAX_STRONG_INPUT_TOKENS {
+            if self.state.estimated_input_tokens >= self.policy.input_budget as usize {
                 self.state.stop_reason = Some(StopReason::InputBudget);
                 break;
             }
-            if self.archived.len() >= MAX_SNAPSHOTS {
+            if self.archived.len() >= self.policy.max_snapshots as usize {
                 self.state.stop_reason = Some(StopReason::SnapshotLimit);
                 break;
             }
@@ -241,6 +248,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 .extend(queries.iter().map(|query| query.query.clone()));
 
             let mut new_results = Vec::new();
+            let mut round_urls = HashSet::new();
             for query in queries {
                 let results = self
                     .backend
@@ -261,7 +269,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                         .map_err(|error| error.at(PipelineStage::Trace))?;
                     match normalized_url(&result.url) {
                         Ok(url) => {
-                            if self.seen_urls.insert(url) {
+                            if !self.archived_urls.contains(&url) && round_urls.insert(url) {
                                 new_results.push(result);
                             }
                         }
@@ -281,12 +289,26 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 self.state.stop_reason = Some(StopReason::NoNewUrls);
             }
             for result in new_results {
-                if self.archived.len() >= MAX_SNAPSHOTS {
+                if self.archived.len() >= self.policy.max_snapshots as usize {
                     self.state.stop_reason = Some(StopReason::SnapshotLimit);
                     break;
                 }
                 match self.backend.crawl(&result.url).await {
                     Ok(snapshot) => {
+                        let final_url = normalized_url(&snapshot.crawl.final_url)
+                            .map_err(|error| error.at(PipelineStage::Archive))?;
+                        if self.archived_urls.contains(&final_url)
+                            || self.archived_refs.contains(&snapshot.snapshot_ref)
+                        {
+                            self.trace
+                                .append(&TraceEvent::ArchiveSkip {
+                                    search_result_id: result.search_result_id,
+                                    reason: "duplicate final URL or snapshot".into(),
+                                    error_class: crate::ErrorClass::External,
+                                })
+                                .map_err(|error| error.at(PipelineStage::Trace))?;
+                            continue;
+                        }
                         self.snapshots
                             .save(&snapshot)
                             .map_err(|error| error.at(PipelineStage::Archive))?;
@@ -298,6 +320,8 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                                 char_len: snapshot.body.chars().count(),
                             })
                             .map_err(|error| error.at(PipelineStage::Trace))?;
+                        self.archived_urls.insert(final_url);
+                        self.archived_refs.insert(snapshot.snapshot_ref.clone());
                         self.archived.push(snapshot);
                         self.state.archived_snapshots = self.archived.len();
                     }
@@ -403,7 +427,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             evidence.push(snapshot);
         }
 
-        if estimate_snapshot_tokens(&evidence) >= MAX_STRONG_INPUT_TOKENS {
+        if estimate_snapshot_tokens(&evidence) >= self.policy.input_budget as usize {
             return model_output("selected snapshot content reaches input budget")
                 .map_err(|error| error.at(PipelineStage::Selection));
         }
@@ -691,6 +715,8 @@ mod tests {
         synthesize_calls: u32,
         plan_error: bool,
         duplicate_urls: bool,
+        crawl_failures_remaining: u32,
+        converged_final_url: bool,
         planned_briefs: Vec<ConfirmedResearchBrief>,
         selected_brief: Option<ConfirmedResearchBrief>,
         synthesized_brief: Option<ConfirmedResearchBrief>,
@@ -747,17 +773,28 @@ mod tests {
 
         fn crawl(&mut self, url: &str) -> impl Future<Output = Result<Snapshot>> {
             self.crawl_calls += 1;
-            let result = if url.contains("/q1-0#") {
+            let result = if self.crawl_failures_remaining > 0 {
+                self.crawl_failures_remaining -= 1;
+                Err(SearchError::Fetch {
+                    url: url.into(),
+                    reason: "fixture transient failure".into(),
+                })
+            } else if url.contains("/q1-0#") && !self.duplicate_urls {
                 Err(SearchError::Fetch {
                     url: url.into(),
                     reason: "fixture skip".into(),
                 })
             } else {
+                let final_url = if self.converged_final_url {
+                    "https://example.com/canonical".into()
+                } else {
+                    url.into()
+                };
                 Ok(Snapshot::new(
                     url.into(),
                     url.into(),
                     format!("body for {url}"),
-                    CrawlMeta::basic(url.into(), 200, Utc::now()),
+                    CrawlMeta::basic(final_url, 200, Utc::now()),
                 ))
             };
             std::future::ready(result)
@@ -871,6 +908,11 @@ mod tests {
 
     fn session_with_rounds(db: &TempDb, rounds: u32) -> ResearchSession<FixtureBackend, Vec<u8>> {
         let brief = confirmed_brief();
+        let policy = TracePolicy {
+            rounds,
+            input_budget: MAX_STRONG_INPUT_TOKENS as u32,
+            max_snapshots: MAX_SNAPSHOTS as u32,
+        };
         let trace = TraceWriter::new(
             Vec::new(),
             RunHeader {
@@ -878,17 +920,13 @@ mod tests {
                 clarification_id: brief.clarification_id().into(),
                 brief: brief.clone(),
                 started_at: Utc::now(),
-                policy: TracePolicy {
-                    rounds,
-                    input_budget: MAX_STRONG_INPUT_TOKENS as u32,
-                    max_snapshots: MAX_SNAPSHOTS as u32,
-                },
+                policy: policy.clone(),
             },
         )
         .unwrap();
         ResearchSession::new(
             brief,
-            rounds,
+            policy,
             FixtureBackend::default(),
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
@@ -939,7 +977,11 @@ mod tests {
         };
         let mut resumed = ResearchSession::resume(
             brief,
-            DEFAULT_EXPLORE_ROUNDS,
+            TracePolicy {
+                rounds: DEFAULT_EXPLORE_ROUNDS,
+                input_budget: MAX_STRONG_INPUT_TOKENS as u32,
+                max_snapshots: MAX_SNAPSHOTS as u32,
+            },
             backend,
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
@@ -950,7 +992,7 @@ mod tests {
 
         assert_eq!(resumed.state.round, 1);
         assert_eq!(resumed.archived.len(), restored_count);
-        assert_eq!(resumed.seen_urls.len(), restored_count);
+        assert_eq!(resumed.archived_urls.len(), restored_count);
         resumed.explore().await.unwrap();
         assert_eq!(resumed.state.round, DEFAULT_EXPLORE_ROUNDS);
         assert_eq!(resumed.backend.plan_calls, DEFAULT_EXPLORE_ROUNDS);
@@ -1034,7 +1076,11 @@ mod tests {
         };
         let mut session = ResearchSession::new(
             confirmed_brief(),
-            DEFAULT_EXPLORE_ROUNDS,
+            TracePolicy {
+                rounds: DEFAULT_EXPLORE_ROUNDS,
+                input_budget: MAX_STRONG_INPUT_TOKENS as u32,
+                max_snapshots: MAX_SNAPSHOTS as u32,
+            },
             backend,
             SnapshotWriter::open(&db.0).unwrap(),
             trace,
@@ -1085,7 +1131,7 @@ mod tests {
         let db = TempDb::new("max-rounds");
         let session = session_with_rounds(&db, MAX_EXPLORE_ROUNDS);
 
-        assert_eq!(session.rounds, MAX_EXPLORE_ROUNDS);
+        assert_eq!(session.policy.rounds, MAX_EXPLORE_ROUNDS);
     }
 
     #[tokio::test]
@@ -1102,6 +1148,35 @@ mod tests {
         assert_eq!(session.backend.search_calls, 2 * QUERIES_PER_ROUND as u32);
         assert_eq!(session.backend.crawl_calls, 1);
         assert_eq!(session.archived.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn transient_crawl_failure_is_retried_in_a_later_round() {
+        let db = TempDb::new("crawl-retry");
+        let mut session = session(&db);
+        session.backend.duplicate_urls = true;
+        session.backend.crawl_failures_remaining = 1;
+
+        let state = session.explore().await.unwrap().clone();
+
+        assert_eq!(state.round, 3);
+        assert_eq!(state.stop_reason, Some(StopReason::NoNewUrls));
+        assert_eq!(session.backend.crawl_calls, 2);
+        assert_eq!(session.archived.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn redirects_converging_on_one_page_archive_one_snapshot() {
+        let db = TempDb::new("redirect-convergence");
+        let mut session = session(&db);
+        session.backend.converged_final_url = true;
+
+        session.explore().await.unwrap();
+
+        assert_eq!(session.archived.len(), 1);
+        assert_eq!(session.archived_urls.len(), 1);
+        assert_eq!(session.archived_refs.len(), 1);
+        assert_eq!(session.state.archived_snapshots, 1);
     }
 
     #[tokio::test]

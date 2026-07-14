@@ -14,8 +14,7 @@ use serde::{Deserialize, Serialize};
 use tokio::sync::{Mutex, OwnedMutexGuard};
 
 use crate::{
-    BriefValidationError, ConfirmedResearchBrief, RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief,
-    ResearchScope,
+    BriefValidationError, ConfirmedResearchBrief, ResearchBrief, TracePolicy, validate_trace_policy,
 };
 
 pub const INTAKE_EVENT_SCHEMA_VERSION: u32 = 1;
@@ -32,9 +31,11 @@ const MAX_OPTIONS_PER_QUESTION: usize = 16;
 pub enum IntakeStatus {
     Draft,
     NeedsInput,
-    ReadyToConfirm,
+    #[serde(alias = "READY_TO_CONFIRM")]
+    Complete,
     IntakeFailed,
-    Confirmed,
+    #[serde(alias = "CONFIRMED")]
+    Prepared,
     Cancelled,
 }
 
@@ -54,12 +55,19 @@ pub struct ClarificationAnswer {
     pub answer: String,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum IntakeDecision {
+    Ask,
+    Complete,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct IntakeModelOutput {
+    pub decision: IntakeDecision,
     pub brief_draft: ResearchBrief,
     pub question: Option<ClarificationQuestion>,
-    pub ready_to_confirm: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,10 +104,26 @@ pub enum IntakeEventKind {
         ready_to_confirm: bool,
         revised_at: DateTime<Utc>,
     },
+    ModelEvaluated {
+        revision: u32,
+        decision: IntakeDecision,
+        brief: ResearchBrief,
+        content_hash: String,
+        evaluated_at: DateTime<Utc>,
+    },
+    RunPrepared {
+        revision: u32,
+        run_id: String,
+        brief: ConfirmedResearchBrief,
+        policy: TracePolicy,
+    },
+    /// Legacy event retained for replay compatibility.
     Confirmed {
         revision: u32,
         run_id: String,
         confirmed_brief: ConfirmedResearchBrief,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        policy: Option<TracePolicy>,
     },
     Cancelled {
         revision: u32,
@@ -126,6 +150,7 @@ impl IntakeEvent {
 pub struct IntakeConfirmation {
     pub run_id: String,
     pub brief: ConfirmedResearchBrief,
+    pub policy: Option<TracePolicy>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -260,13 +285,98 @@ pub fn reduce_intake_event(
     }
 }
 
+fn apply_model_evaluation(
+    session: &IntakeSession,
+    revision: u32,
+    brief: &ResearchBrief,
+    content_hash: &str,
+    decision: IntakeDecision,
+    event: &'static str,
+) -> IntakeResult<IntakeSession> {
+    if !matches!(
+        session.status,
+        IntakeStatus::Draft | IntakeStatus::Complete | IntakeStatus::IntakeFailed
+    ) {
+        return transition_error(session, event);
+    }
+    if revision
+        != session
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| IntakeError::InvalidEvent("revision overflow".into()))?
+    {
+        return Err(IntakeError::InvalidEvent(format!(
+            "{event} revision must be {}",
+            session.revision + 1
+        )));
+    }
+    let normalized = brief.clone().normalized(&session.original_question)?;
+    if &normalized != brief {
+        return Err(IntakeError::Brief(BriefValidationError::NonCanonical));
+    }
+    let actual_hash = brief.content_hash()?;
+    if actual_hash != content_hash {
+        return Err(IntakeError::InvalidEvent(format!(
+            "{event} content_hash does not match brief"
+        )));
+    }
+    let mut next = session.clone();
+    next.revision = revision;
+    next.brief_draft = Some(brief.clone());
+    next.content_hash = Some(content_hash.to_owned());
+    next.status = if decision == IntakeDecision::Complete {
+        IntakeStatus::Complete
+    } else {
+        IntakeStatus::Draft
+    };
+    next.failure = None;
+    next.pending_question_ids.clear();
+    Ok(next)
+}
+
+fn apply_run_prepared(
+    session: &IntakeSession,
+    revision: u32,
+    run_id: &str,
+    brief: &ConfirmedResearchBrief,
+    policy: Option<TracePolicy>,
+    event: &'static str,
+) -> IntakeResult<IntakeSession> {
+    if session.status != IntakeStatus::Complete {
+        return transition_error(session, event);
+    }
+    require_revision(session, revision)?;
+    validate_file_id(run_id, false)?;
+    let draft = session
+        .brief_draft
+        .as_ref()
+        .ok_or_else(|| IntakeError::InvalidEvent(format!("{event} requires a brief draft")))?;
+    if brief.clarification_id() != session.clarification_id
+        || brief.brief() != draft
+        || Some(brief.content_hash()) != session.content_hash.as_deref()
+    {
+        return Err(IntakeError::InvalidEvent(format!(
+            "{event} brief does not match the completed intake"
+        )));
+    }
+    let mut next = session.clone();
+    next.status = IntakeStatus::Prepared;
+    next.pending_question_ids.clear();
+    next.confirmation = Some(IntakeConfirmation {
+        run_id: run_id.to_owned(),
+        brief: brief.clone(),
+        policy,
+    });
+    Ok(next)
+}
+
 fn reduce_existing(
     session: &IntakeSession,
     event: &IntakeEventKind,
 ) -> IntakeResult<IntakeSession> {
     if matches!(
         session.status,
-        IntakeStatus::Confirmed | IntakeStatus::Cancelled
+        IntakeStatus::Prepared | IntakeStatus::Cancelled
     ) {
         return transition_error(session, event_name(event));
     }
@@ -279,43 +389,34 @@ fn reduce_existing(
             ready_to_confirm,
             ..
         } => {
-            if !matches!(
-                session.status,
-                IntakeStatus::Draft | IntakeStatus::ReadyToConfirm | IntakeStatus::IntakeFailed
-            ) {
-                return transition_error(session, "brief_revised");
-            }
-            if *revision
-                != session
-                    .revision
-                    .checked_add(1)
-                    .ok_or_else(|| IntakeError::InvalidEvent("revision overflow".into()))?
-            {
-                return Err(IntakeError::InvalidEvent(format!(
-                    "brief_revised revision must be {}",
-                    session.revision + 1
-                )));
-            }
-            let normalized = brief.clone().normalized(&session.original_question)?;
-            if &normalized != brief {
-                return Err(IntakeError::Brief(BriefValidationError::NonCanonical));
-            }
-            let actual_hash = brief.content_hash()?;
-            if &actual_hash != content_hash {
-                return Err(IntakeError::InvalidEvent(
-                    "brief_revised content_hash does not match brief".into(),
-                ));
-            }
-            next.revision = *revision;
-            next.brief_draft = Some(brief.clone());
-            next.content_hash = Some(content_hash.clone());
-            next.status = if *ready_to_confirm {
-                IntakeStatus::ReadyToConfirm
-            } else {
-                IntakeStatus::Draft
-            };
-            next.failure = None;
-            next.pending_question_ids.clear();
+            next = apply_model_evaluation(
+                session,
+                *revision,
+                brief,
+                content_hash,
+                if *ready_to_confirm {
+                    IntakeDecision::Complete
+                } else {
+                    IntakeDecision::Ask
+                },
+                "brief_revised",
+            )?;
+        }
+        IntakeEventKind::ModelEvaluated {
+            revision,
+            decision,
+            brief,
+            content_hash,
+            ..
+        } => {
+            next = apply_model_evaluation(
+                session,
+                *revision,
+                brief,
+                content_hash,
+                *decision,
+                "model_evaluated",
+            )?;
         }
         IntakeEventKind::ClarificationAsked {
             revision,
@@ -359,43 +460,40 @@ fn reduce_existing(
             next.pending_question_ids.clear();
             next.status = IntakeStatus::Draft;
         }
+        IntakeEventKind::RunPrepared {
+            revision,
+            run_id,
+            brief,
+            policy,
+        } => {
+            next = apply_run_prepared(
+                session,
+                *revision,
+                run_id,
+                brief,
+                Some(policy.clone()),
+                "run_prepared",
+            )?;
+        }
         IntakeEventKind::Confirmed {
             revision,
             run_id,
             confirmed_brief,
+            policy,
         } => {
-            if !matches!(
-                session.status,
-                IntakeStatus::NeedsInput | IntakeStatus::ReadyToConfirm
-            ) {
-                return transition_error(session, "confirmed");
-            }
-            require_revision(session, *revision)?;
-            validate_file_id(run_id, false)?;
-            let draft = session.brief_draft.as_ref().ok_or_else(|| {
-                IntakeError::InvalidEvent("confirmed requires a brief draft".into())
-            })?;
-            if confirmed_brief.clarification_id() != session.clarification_id
-                || confirmed_brief.brief() != draft
-                || Some(confirmed_brief.content_hash()) != session.content_hash.as_deref()
-            {
-                return Err(IntakeError::InvalidEvent(
-                    "confirmed brief does not match the current intake draft".into(),
-                ));
-            }
-            next.status = IntakeStatus::Confirmed;
-            next.pending_question_ids.clear();
-            next.confirmation = Some(IntakeConfirmation {
-                run_id: run_id.clone(),
-                brief: confirmed_brief.clone(),
-            });
+            next = apply_run_prepared(
+                session,
+                *revision,
+                run_id,
+                confirmed_brief,
+                policy.clone(),
+                "confirmed",
+            )?;
         }
         IntakeEventKind::Cancelled { revision, .. } => {
             if !matches!(
                 session.status,
-                IntakeStatus::NeedsInput
-                    | IntakeStatus::ReadyToConfirm
-                    | IntakeStatus::IntakeFailed
+                IntakeStatus::NeedsInput | IntakeStatus::Complete | IntakeStatus::IntakeFailed
             ) {
                 return transition_error(session, "cancelled");
             }
@@ -441,24 +539,23 @@ pub fn events_for_model_output(
         return transition_error(session, "model_output");
     }
     let output = validate_model_output(output, &session.original_question)?;
-    let can_ask = session.questions.len() < MAX_TOTAL_QUESTIONS && !output.ready_to_confirm;
-    let questions: Vec<_> = if can_ask {
-        output.question.into_iter().collect()
-    } else {
-        Vec::new()
-    };
-    let ready_to_confirm = output.ready_to_confirm || questions.is_empty();
+    if session.questions.len() >= MAX_TOTAL_QUESTIONS && output.decision == IntakeDecision::Ask {
+        return Err(IntakeError::InvalidEvent(
+            "question limit reached; final model output must complete the brief".into(),
+        ));
+    }
+    let questions: Vec<_> = output.question.into_iter().collect();
     let revision = session
         .revision
         .checked_add(1)
         .ok_or_else(|| IntakeError::InvalidEvent("revision overflow".into()))?;
     let content_hash = output.brief_draft.content_hash()?;
-    let mut events = vec![IntakeEvent::new(IntakeEventKind::BriefRevised {
+    let mut events = vec![IntakeEvent::new(IntakeEventKind::ModelEvaluated {
         revision,
+        decision: output.decision,
         brief: output.brief_draft,
         content_hash,
-        ready_to_confirm,
-        revised_at: now,
+        evaluated_at: now,
     })];
     if !questions.is_empty() {
         events.push(IntakeEvent::new(IntakeEventKind::ClarificationAsked {
@@ -498,45 +595,48 @@ pub fn user_reply_event(
     }))
 }
 
-pub fn minimal_brief_event(
+pub fn run_prepared_event(
     session: &IntakeSession,
+    requested_revision: u32,
+    requested_content_hash: &str,
+    run_id: String,
+    policy: TracePolicy,
     now: DateTime<Utc>,
 ) -> IntakeResult<IntakeEvent> {
-    let brief = ResearchBrief {
-        schema_version: RESEARCH_BRIEF_SCHEMA_VERSION,
-        original_question: session.original_question.clone(),
-        research_question: session.original_question.clone(),
-        desired_output: None,
-        scope: ResearchScope::default(),
-        source_constraints: Vec::new(),
-        accepted_assumptions: Vec::new(),
-    }
-    .normalized(&session.original_question)?;
-    Ok(IntakeEvent::new(IntakeEventKind::BriefRevised {
-        revision: session
-            .revision
-            .checked_add(1)
-            .ok_or_else(|| IntakeError::InvalidEvent("revision overflow".into()))?,
-        content_hash: brief.content_hash()?,
+    validate_trace_policy(&policy).map_err(IntakeError::InvalidEvent)?;
+    require_status(session, IntakeStatus::Complete, "run_prepared")?;
+    require_revision(session, requested_revision)?;
+    require_content_hash_value(session, requested_content_hash)?;
+    validate_file_id(&run_id, false)?;
+    let brief = ConfirmedResearchBrief::new(
+        session
+            .brief_draft
+            .clone()
+            .ok_or_else(|| IntakeError::InvalidEvent("run_prepared requires a brief".into()))?,
+        &session.original_question,
+        session.clarification_id.clone(),
+        requested_content_hash,
+        now,
+    )?;
+    Ok(IntakeEvent::new(IntakeEventKind::RunPrepared {
+        revision: requested_revision,
+        run_id,
         brief,
-        ready_to_confirm: true,
-        revised_at: now,
+        policy,
     }))
 }
 
+/// Legacy confirmation constructor retained for replay/API compatibility.
 pub fn confirmation_event(
     session: &IntakeSession,
     requested_revision: u32,
     requested_content_hash: &str,
     run_id: String,
+    policy: TracePolicy,
     now: DateTime<Utc>,
 ) -> IntakeResult<IntakeEvent> {
-    if !matches!(
-        session.status,
-        IntakeStatus::NeedsInput | IntakeStatus::ReadyToConfirm
-    ) {
-        return transition_error(session, "confirmed");
-    }
+    validate_trace_policy(&policy).map_err(IntakeError::InvalidEvent)?;
+    require_status(session, IntakeStatus::Complete, "confirmed")?;
     if requested_revision != session.revision {
         return Err(IntakeError::StaleBrief {
             current_revision: session.revision,
@@ -569,6 +669,7 @@ pub fn confirmation_event(
         revision: requested_revision,
         run_id,
         confirmed_brief,
+        policy: Some(policy),
     }))
 }
 
@@ -598,14 +699,7 @@ pub fn parse_model_attempt(
             "model parse attempt must be 1 or 2".into(),
         ));
     }
-    let parsed = parse_model_output(json, &session.original_question).and_then(|output| {
-        if session.questions.is_empty() && output.ready_to_confirm {
-            return Err(IntakeError::InvalidEvent(
-                "initial model output must contain one clarification question".into(),
-            ));
-        }
-        Ok(output)
-    });
+    let parsed = parse_model_output(json, &session.original_question);
     match parsed {
         Ok(output) => Ok(ModelParseOutcome::Accepted(output)),
         Err(error) if attempt == 1 => Ok(ModelParseOutcome::RetryCorrection {
@@ -635,15 +729,18 @@ fn validate_model_output(
     if let Some(question) = &output.question {
         validate_questions(std::slice::from_ref(question), &[])?;
     }
-    if output.ready_to_confirm && output.question.is_some() {
-        return Err(IntakeError::InvalidEvent(
-            "ready_to_confirm output must not contain a question".into(),
-        ));
-    }
-    if !output.ready_to_confirm && output.question.is_none() {
-        return Err(IntakeError::InvalidEvent(
-            "non-ready model output must contain a question".into(),
-        ));
+    match (output.decision, output.question.is_some()) {
+        (IntakeDecision::Complete, false) | (IntakeDecision::Ask, true) => {}
+        (IntakeDecision::Complete, true) => {
+            return Err(IntakeError::InvalidEvent(
+                "complete model output must not contain a question".into(),
+            ));
+        }
+        (IntakeDecision::Ask, false) => {
+            return Err(IntakeError::InvalidEvent(
+                "ask model output must contain a question".into(),
+            ));
+        }
     }
     Ok(output)
 }
@@ -651,7 +748,7 @@ fn validate_model_output(
 fn validate_model_json_shape(value: &serde_json::Value) -> IntakeResult<()> {
     exact_keys(
         value,
-        &["brief_draft", "question", "ready_to_confirm"],
+        &["decision", "brief_draft", "question"],
         "model output",
     )?;
     let brief = value
@@ -777,6 +874,23 @@ fn require_status(
     Ok(())
 }
 
+fn require_content_hash_value(
+    session: &IntakeSession,
+    requested_content_hash: &str,
+) -> IntakeResult<()> {
+    let current_hash = session
+        .content_hash
+        .as_deref()
+        .ok_or_else(|| IntakeError::InvalidEvent("intake has no content_hash".into()))?;
+    if current_hash != requested_content_hash {
+        return Err(IntakeError::StaleContentHash {
+            current_hash: current_hash.to_owned(),
+            requested_hash: requested_content_hash.to_owned(),
+        });
+    }
+    Ok(())
+}
+
 fn require_revision(session: &IntakeSession, revision: u32) -> IntakeResult<()> {
     if revision != session.revision {
         return Err(IntakeError::InvalidEvent(format!(
@@ -800,6 +914,8 @@ const fn event_name(event: &IntakeEventKind) -> &'static str {
         IntakeEventKind::ClarificationAsked { .. } => "clarification_asked",
         IntakeEventKind::UserReplied { .. } => "user_replied",
         IntakeEventKind::BriefRevised { .. } => "brief_revised",
+        IntakeEventKind::ModelEvaluated { .. } => "model_evaluated",
+        IntakeEventKind::RunPrepared { .. } => "run_prepared",
         IntakeEventKind::Confirmed { .. } => "confirmed",
         IntakeEventKind::Cancelled { .. } => "cancelled",
         IntakeEventKind::IntakeFailed { .. } => "intake_failed",
@@ -935,6 +1051,8 @@ mod tests {
 
     use chrono::TimeZone;
 
+    use crate::{RESEARCH_BRIEF_SCHEMA_VERSION, ResearchScope};
+
     use super::*;
 
     const QUESTION: &str = "Compare Rust 2024 edition changes with Rust 2021";
@@ -961,6 +1079,14 @@ mod tests {
             scope: ResearchScope::default(),
             source_constraints: Vec::new(),
             accepted_assumptions: Vec::new(),
+        }
+    }
+
+    fn test_policy() -> TracePolicy {
+        TracePolicy {
+            rounds: 3,
+            input_budget: 1_000,
+            max_snapshots: 10,
         }
     }
 
@@ -997,15 +1123,15 @@ mod tests {
         let events = events_for_model_output(
             &state,
             IntakeModelOutput {
+                decision: IntakeDecision::Complete,
                 brief_draft: brief(),
                 question: None,
-                ready_to_confirm: true,
             },
             now(),
         )
         .unwrap();
         let state = apply_all(state, &events);
-        assert_eq!(state.status, IntakeStatus::ReadyToConfirm);
+        assert_eq!(state.status, IntakeStatus::Complete);
         assert_eq!(state.revision, 1);
         assert!(state.questions.is_empty());
         assert!(state.confirmation.is_none());
@@ -1017,9 +1143,9 @@ mod tests {
         let events = events_for_model_output(
             &state,
             IntakeModelOutput {
+                decision: IntakeDecision::Ask,
                 brief_draft: brief(),
                 question: Some(question("database-kind")),
-                ready_to_confirm: false,
             },
             now(),
         )
@@ -1031,15 +1157,15 @@ mod tests {
     }
 
     #[test]
-    fn five_single_questions_stop_a_sixth_followup() {
+    fn five_single_questions_require_a_final_completion() {
         let mut state = session();
         for number in 1..=MAX_TOTAL_QUESTIONS {
             let events = events_for_model_output(
                 &state,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Ask,
                     brief_draft: brief(),
                     question: Some(question(&format!("q{number}"))),
-                    ready_to_confirm: false,
                 },
                 now(),
             )
@@ -1049,19 +1175,32 @@ mod tests {
             let reply = user_reply_event(&state, state.revision, "No restriction", now()).unwrap();
             state = reduce_intake_event(Some(&state), &reply).unwrap();
         }
+        assert!(matches!(
+            events_for_model_output(
+                &state,
+                IntakeModelOutput {
+                    decision: IntakeDecision::Ask,
+                    brief_draft: brief(),
+                    question: Some(question("q6")),
+                },
+                now(),
+            ),
+            Err(IntakeError::InvalidEvent(message))
+                if message.contains("question limit reached")
+        ));
         let events = events_for_model_output(
             &state,
             IntakeModelOutput {
+                decision: IntakeDecision::Complete,
                 brief_draft: brief(),
-                question: Some(question("q6")),
-                ready_to_confirm: false,
+                question: None,
             },
             now(),
         )
         .unwrap();
         assert_eq!(events.len(), 1);
         state = apply_all(state, &events);
-        assert_eq!(state.status, IntakeStatus::ReadyToConfirm);
+        assert_eq!(state.status, IntakeStatus::Complete);
         assert_eq!(state.questions.len(), MAX_TOTAL_QUESTIONS);
         assert_eq!(state.clarification_rounds as usize, MAX_TOTAL_QUESTIONS);
     }
@@ -1102,9 +1241,9 @@ mod tests {
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Ask,
                     brief_draft: brief(),
                     question: Some(question("q1")),
-                    ready_to_confirm: false,
                 },
                 now(),
             )
@@ -1117,32 +1256,32 @@ mod tests {
     }
 
     #[test]
-    fn needs_input_can_be_confirmed() {
+    fn pending_model_question_cannot_be_bypassed() {
         let base = session();
         let state = apply_all(
             base.clone(),
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Ask,
                     brief_draft: brief(),
                     question: Some(question("q1")),
-                    ready_to_confirm: false,
                 },
                 now(),
             )
             .unwrap(),
         );
-        let event = confirmation_event(
-            &state,
-            state.revision,
-            state.content_hash.as_deref().unwrap(),
-            "run-needs-input".into(),
-            now(),
-        )
-        .unwrap();
-        let confirmed = reduce_intake_event(Some(&state), &event).unwrap();
-        assert_eq!(confirmed.status, IntakeStatus::Confirmed);
-        assert!(confirmed.pending_questions().is_empty());
+        assert!(matches!(
+            confirmation_event(
+                &state,
+                state.revision,
+                state.content_hash.as_deref().unwrap(),
+                "run-needs-input".into(),
+                test_policy(),
+                now(),
+            ),
+            Err(IntakeError::InvalidTransition { .. })
+        ));
     }
 
     #[test]
@@ -1153,9 +1292,9 @@ mod tests {
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Ask,
                     brief_draft: brief(),
                     question: Some(question("q1")),
-                    ready_to_confirm: false,
                 },
                 now(),
             )
@@ -1166,9 +1305,9 @@ mod tests {
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Complete,
                     brief_draft: brief(),
                     question: None,
-                    ready_to_confirm: true,
                 },
                 now(),
             )
@@ -1198,9 +1337,9 @@ mod tests {
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Complete,
                     brief_draft: brief(),
                     question: None,
-                    ready_to_confirm: true,
                 },
                 now(),
             )
@@ -1212,28 +1351,38 @@ mod tests {
                 0,
                 state.content_hash.as_deref().unwrap(),
                 "run-1".into(),
+                test_policy(),
                 now()
             ),
             Err(IntakeError::StaleBrief { .. })
         ));
         assert!(matches!(
-            confirmation_event(&state, 1, "sha256:stale", "run-1".into(), now()),
+            confirmation_event(
+                &state,
+                1,
+                "sha256:stale",
+                "run-1".into(),
+                test_policy(),
+                now(),
+            ),
             Err(IntakeError::StaleContentHash { .. })
         ));
     }
 
     #[test]
-    fn initial_ready_output_is_rejected_until_model_asks_a_question() {
+    fn model_may_complete_on_the_initial_round() {
         let state = session();
         let output = serde_json::json!({
+            "decision": "complete",
             "brief_draft": brief(),
-            "question": null,
-            "ready_to_confirm": true
+            "question": null
         });
         assert!(matches!(
             parse_model_attempt(&state, &output.to_string(), 1, now()).unwrap(),
-            ModelParseOutcome::RetryCorrection { error }
-                if error.contains("initial model output must contain one clarification question")
+            ModelParseOutcome::Accepted(IntakeModelOutput {
+                decision: IntakeDecision::Complete,
+                ..
+            })
         ));
     }
 
@@ -1251,22 +1400,18 @@ mod tests {
         };
         let state = reduce_intake_event(Some(&state), &event).unwrap();
         assert_eq!(state.status, IntakeStatus::IntakeFailed);
-        let recovered =
-            reduce_intake_event(Some(&state), &minimal_brief_event(&state, now()).unwrap())
-                .unwrap();
-        assert_eq!(recovered.status, IntakeStatus::ReadyToConfirm);
     }
 
     #[test]
-    fn confirmed_event_replays_same_run_id_before_trace_exists() {
+    fn prepared_event_replays_same_run_id_before_trace_exists() {
         let dir = temp_dir("crash-window");
         let mut log = IntakeLog::create(&dir, started("clarification-1")).unwrap();
         let events = events_for_model_output(
             log.session(),
             IntakeModelOutput {
+                decision: IntakeDecision::Complete,
                 brief_draft: brief(),
                 question: None,
-                ready_to_confirm: true,
             },
             now(),
         )
@@ -1274,11 +1419,12 @@ mod tests {
         for event in &events {
             log.append(event).unwrap();
         }
-        let confirmation = confirmation_event(
+        let confirmation = run_prepared_event(
             log.session(),
             log.session().revision,
             log.session().content_hash.as_deref().unwrap(),
             "run-fixed".into(),
+            test_policy(),
             now(),
         )
         .unwrap();
@@ -1286,8 +1432,10 @@ mod tests {
         drop(log);
 
         let replayed = replay_intake(&dir, "clarification-1").unwrap();
-        assert_eq!(replayed.status, IntakeStatus::Confirmed);
-        assert_eq!(replayed.confirmation.unwrap().run_id, "run-fixed");
+        assert_eq!(replayed.status, IntakeStatus::Prepared);
+        let confirmation = replayed.confirmation.unwrap();
+        assert_eq!(confirmation.run_id, "run-fixed");
+        assert_eq!(confirmation.policy, Some(test_policy()));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -1298,9 +1446,9 @@ mod tests {
         for event in events_for_model_output(
             log.session(),
             IntakeModelOutput {
+                decision: IntakeDecision::Ask,
                 brief_draft: brief(),
                 question: Some(question("q1")),
-                ready_to_confirm: false,
             },
             now(),
         )
@@ -1345,9 +1493,9 @@ mod tests {
             &events_for_model_output(
                 &base,
                 IntakeModelOutput {
+                    decision: IntakeDecision::Complete,
                     brief_draft: brief(),
                     question: None,
-                    ready_to_confirm: true,
                 },
                 now(),
             )
@@ -1358,7 +1506,11 @@ mod tests {
         assert!(matches!(
             reduce_intake_event(
                 Some(&cancelled),
-                &minimal_brief_event(&cancelled, now()).unwrap()
+                &IntakeEvent::new(IntakeEventKind::IntakeFailed {
+                    revision: cancelled.revision,
+                    message: "late failure".into(),
+                    failed_at: now(),
+                })
             ),
             Err(IntakeError::InvalidTransition { .. })
         ));
@@ -1377,11 +1529,56 @@ mod tests {
     }
 
     #[test]
+    fn event_constructors_reject_invalid_policy() {
+        let base = session();
+        let complete = apply_all(
+            base.clone(),
+            &events_for_model_output(
+                &base,
+                IntakeModelOutput {
+                    decision: IntakeDecision::Complete,
+                    brief_draft: brief(),
+                    question: None,
+                },
+                now(),
+            )
+            .unwrap(),
+        );
+        let invalid = TracePolicy {
+            rounds: 0,
+            input_budget: 0,
+            max_snapshots: 0,
+        };
+        assert!(matches!(
+            run_prepared_event(
+                &complete,
+                complete.revision,
+                complete.content_hash.as_deref().unwrap(),
+                "run-invalid".into(),
+                invalid.clone(),
+                now(),
+            ),
+            Err(IntakeError::InvalidEvent(message)) if message.contains("policy rounds")
+        ));
+        assert!(matches!(
+            confirmation_event(
+                &complete,
+                complete.revision,
+                complete.content_hash.as_deref().unwrap(),
+                "run-invalid".into(),
+                invalid,
+                now(),
+            ),
+            Err(IntakeError::InvalidEvent(message)) if message.contains("policy rounds")
+        ));
+    }
+
+    #[test]
     fn model_json_schema_rejects_unknown_fields() {
         let value = serde_json::json!({
+            "decision": "complete",
             "brief_draft": brief(),
-            "questions": [],
-            "ready_to_confirm": true,
+            "question": null,
             "surprise": true
         });
         assert!(parse_model_output(&value.to_string(), QUESTION).is_err());

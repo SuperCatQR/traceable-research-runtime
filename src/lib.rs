@@ -6,8 +6,7 @@
 //! P4 orchestration (fixed 3-round explore + synthesize; three pure functions),
 //! P5 program validations + E2E.
 //!
-//! The crate is split lib + bin so the three pure functions (`plan_queries`,
-//! `select_sources`, `synthesize_answer`) stay fixture-testable without a runtime.
+//! The crate is library-only; pure functions remain fixture-testable without a transport runtime.
 
 pub mod adapters;
 pub mod app;
@@ -22,20 +21,25 @@ pub mod types;
 // Flat public surface: downstream phases import from the crate root, not deep
 // module paths.
 pub use adapters::{CrawlClient, SearxngClient, StrongClient, validate_public_url};
-pub use app::{AppConfig, PublicAnswer, PublicClaim, PublicSource, ResearchService};
-pub use backend::{INTAKE_PROMPT, LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT};
+pub use app::{
+    AppConfig, IntakeCommandError, PrepareRunError, PreparedRun, PublicAnswer, PublicClaim,
+    PublicSource, ResearchService,
+};
+pub use backend::{
+    INTAKE_FINAL_PROMPT, INTAKE_PROMPT, LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT,
+};
 pub use error::{ErrorClass, PipelineStage, Result, SearchError};
 pub use intake::{
-    ClarificationAnswer, ClarificationQuestion, INTAKE_EVENT_SCHEMA_VERSION, IntakeError,
-    IntakeEvent, IntakeEventKind, IntakeLog, IntakeModelOutput, IntakeResult, IntakeSession,
-    IntakeSessionLocks, IntakeStatus, MAX_TOTAL_QUESTIONS, ModelParseOutcome, cancellation_event,
-    confirmation_event, events_for_model_output, minimal_brief_event, parse_model_attempt,
-    parse_model_output, reduce_intake_event, replay_intake, user_reply_event,
+    ClarificationAnswer, ClarificationQuestion, INTAKE_EVENT_SCHEMA_VERSION, IntakeDecision,
+    IntakeError, IntakeEvent, IntakeEventKind, IntakeLog, IntakeModelOutput, IntakeResult,
+    IntakeSession, IntakeSessionLocks, IntakeStatus, MAX_TOTAL_QUESTIONS, ModelParseOutcome,
+    cancellation_event, confirmation_event, events_for_model_output, parse_model_attempt,
+    parse_model_output, reduce_intake_event, replay_intake, run_prepared_event, user_reply_event,
 };
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{
     ReplayedRunHeader, RunHeader, RunReplay, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent,
-    TracePolicy, TraceWriter, replay_run_header,
+    TracePolicy, TraceWriter, replay_run_header, validate_trace_policy,
 };
 pub use types::{
     Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlBodyKind, CrawlMeta, Excerpt,

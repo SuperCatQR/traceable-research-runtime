@@ -9,14 +9,14 @@ use chrono::Utc;
 use serde::Serialize;
 
 use crate::{
-    Claim, ConfirmedResearchBrief, CrawlClient, INTAKE_PROMPT, IntakeError, IntakeEvent,
-    IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks, IntakeStatus, LiveBackend,
-    MAX_TOTAL_QUESTIONS, ModelParseOutcome, ReplayedRunHeader, RunHeader, SearchError,
+    Claim, ConfirmedResearchBrief, CrawlClient, INTAKE_FINAL_PROMPT, INTAKE_PROMPT, IntakeError,
+    IntakeEvent, IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks, IntakeStatus,
+    LiveBackend, MAX_TOTAL_QUESTIONS, ModelParseOutcome, ReplayedRunHeader, RunHeader, SearchError,
     SearxngClient, SnapshotReader, SnapshotRef, SnapshotWriter, StrongClient, TracePolicy,
-    TraceWriter, cancellation_event, confirmation_event, events_for_model_output,
-    minimal_brief_event,
+    TraceWriter, cancellation_event, events_for_model_output,
     orchestration::{AnswerSource, ResearchResult, ResearchSession},
-    parse_model_attempt, replay_run_header, user_reply_event,
+    parse_model_attempt, replay_run_header, run_prepared_event, user_reply_event,
+    validate_trace_policy,
 };
 
 static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -85,6 +85,10 @@ pub enum IntakeCommandError {
 pub struct ResearchService {
     config: AppConfig,
     intake_locks: IntakeSessionLocks,
+}
+
+fn validate_policy(policy: &TracePolicy) -> Result<(), IntakeError> {
+    validate_trace_policy(policy).map_err(IntakeError::InvalidEvent)
 }
 
 fn require_failed_intake(
@@ -174,18 +178,28 @@ impl ResearchService {
         Ok(log.session().clone())
     }
 
-    pub async fn use_minimal_brief(
+    /// Prepares a model-completed intake for research. This freezes execution
+    /// policy; it is not a user confirmation of the brief.
+    pub async fn prepare_run(
         &self,
         clarification_id: &str,
-        revision: u32,
-    ) -> Result<IntakeSession, IntakeCommandError> {
-        let _guard = self.intake_locks.lock(clarification_id).await?;
-        let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
-        require_failed_intake(log.session(), revision)?;
-        log.append(&minimal_brief_event(log.session(), Utc::now())?)?;
-        Ok(log.session().clone())
+        policy: TracePolicy,
+    ) -> Result<PreparedRun, IntakeCommandError> {
+        let session = {
+            let _guard = self.intake_locks.lock(clarification_id).await?;
+            IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?
+                .session()
+                .clone()
+        };
+        let content_hash = session.content_hash.as_deref().ok_or_else(|| {
+            IntakeError::InvalidEvent("completed intake has no content_hash".into())
+        })?;
+        Ok(self
+            .prepare_confirmed_run(clarification_id, session.revision, content_hash, policy)
+            .await?)
     }
 
+    #[deprecated(note = "use prepare_run; model completion no longer requires user confirmation")]
     pub async fn confirm_intake(
         &self,
         clarification_id: &str,
@@ -224,8 +238,12 @@ impl ResearchService {
         )?;
         let base_input = serde_json::to_string(&serde_json::json!({
             "session": log.session(),
-            "remaining_questions": MAX_TOTAL_QUESTIONS.saturating_sub(log.session().questions.len()),
         }))?;
+        let prompt = if log.session().questions.len() >= MAX_TOTAL_QUESTIONS {
+            INTAKE_FINAL_PROMPT
+        } else {
+            INTAKE_PROMPT
+        };
         let mut correction = None;
         for attempt in 1..=2 {
             let user = match correction.take() {
@@ -234,7 +252,7 @@ impl ResearchService {
                 ),
                 None => base_input.clone(),
             };
-            let value: serde_json::Value = match client.complete_json(INTAKE_PROMPT, &user).await {
+            let content = match client.complete_text(prompt, &user).await {
                 Ok(value) => value,
                 Err(error) => {
                     let event = IntakeEvent::new(IntakeEventKind::IntakeFailed {
@@ -246,7 +264,7 @@ impl ResearchService {
                     return Ok(());
                 }
             };
-            match parse_model_attempt(log.session(), &value.to_string(), attempt, Utc::now())? {
+            match parse_model_attempt(log.session(), &content, attempt, Utc::now())? {
                 ModelParseOutcome::Accepted(output) => {
                     for event in events_for_model_output(log.session(), output, Utc::now())? {
                         log.append(&event)?;
@@ -256,19 +274,14 @@ impl ResearchService {
                 ModelParseOutcome::RetryCorrection { error } => correction = Some(error),
                 ModelParseOutcome::Failed(event) => {
                     log.append(&event)?;
-                    return Err(IntakeCommandError::ModelOutput(
-                        log.session()
-                            .failure
-                            .clone()
-                            .unwrap_or_else(|| "invalid model output".into()),
-                    ));
+                    return Ok(());
                 }
             }
         }
         unreachable!("two model attempts always return")
     }
 
-    /// Freezes one intake exactly once, then creates its v3 trace header.
+    /// Freezes execution policy for one model-completed intake, then creates its v3 trace header.
     /// Repeating confirmation reuses the persisted run id; a crash after the
     /// intake append but before trace creation is repaired on the next call.
     pub async fn prepare_confirmed_run(
@@ -281,7 +294,7 @@ impl ResearchService {
         let _guard = self.intake_locks.lock(clarification_id).await?;
         let mut log = IntakeLog::open(self.config.data_dir.join("intake"), clarification_id)?;
 
-        let confirmation = if log.session().status == IntakeStatus::Confirmed {
+        let mut confirmation = if log.session().status == IntakeStatus::Prepared {
             if requested_revision != log.session().revision {
                 return Err(IntakeError::StaleBrief {
                     current_revision: log.session().revision,
@@ -303,11 +316,13 @@ impl ResearchService {
             }
             confirmation
         } else {
-            let event = confirmation_event(
+            validate_policy(&policy)?;
+            let event = run_prepared_event(
                 log.session(),
                 requested_revision,
                 requested_content_hash,
                 self.new_run_id(),
+                policy.clone(),
                 Utc::now(),
             )?;
             log.append(&event)?;
@@ -317,12 +332,27 @@ impl ResearchService {
                 .expect("appended confirmed event must project confirmation")
         };
 
+        let frozen_policy = match confirmation.policy.clone() {
+            Some(policy) => policy,
+            None if self.trace_path(&confirmation.run_id).exists() => {
+                match replay_run_header(self.trace_path(&confirmation.run_id))? {
+                    ReplayedRunHeader::V3(existing) => existing.policy.clone(),
+                    ReplayedRunHeader::Legacy { policy, .. } => policy,
+                }
+            }
+            None => {
+                validate_policy(&policy)?;
+                policy
+            }
+        };
+        confirmation.policy = Some(frozen_policy.clone());
+
         let header = RunHeader {
             run_id: confirmation.run_id.clone(),
             clarification_id: clarification_id.to_owned(),
             brief: confirmation.brief.clone(),
             started_at: *confirmation.brief.confirmed_at(),
-            policy: policy.clone(),
+            policy: frozen_policy.clone(),
         };
         let trace_dir = self.config.data_dir.join("traces");
         match TraceWriter::create(&trace_dir, header.clone()) {
@@ -345,7 +375,7 @@ impl ResearchService {
         Ok(PreparedRun {
             run_id: confirmation.run_id,
             brief: confirmation.brief,
-            policy,
+            policy: frozen_policy,
         })
     }
 
@@ -373,10 +403,9 @@ impl ResearchService {
         let (trace, replay) = TraceWriter::resume(self.config.data_dir.join("traces"), &header)
             .map_err(setup_error)?;
         let reader = SnapshotReader::open(&store_path).map_err(setup_error)?;
-        let rounds = header.policy.rounds;
         let mut session = ResearchSession::resume(
             header.brief,
-            rounds,
+            header.policy,
             backend,
             snapshots,
             trace,
@@ -460,7 +489,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        Answer, IntakeEvent, IntakeEventKind, SnapshotRef, minimal_brief_event, replay_intake,
+        Answer, IntakeDecision, IntakeEvent, IntakeEventKind, IntakeModelOutput, SnapshotRef,
+        confirmation_event, events_for_model_output, replay_intake,
     };
 
     fn test_service(name: &str) -> ResearchService {
@@ -490,76 +520,26 @@ mod tests {
             created_at: Utc::now(),
         });
         let mut log = IntakeLog::create(service.config.data_dir.join("intake"), started).unwrap();
-        let revised = minimal_brief_event(log.session(), Utc::now()).unwrap();
-        log.append(&revised).unwrap();
+        let output = IntakeModelOutput {
+            decision: IntakeDecision::Complete,
+            brief_draft: crate::ResearchBrief {
+                schema_version: crate::RESEARCH_BRIEF_SCHEMA_VERSION,
+                original_question: log.session().original_question.clone(),
+                research_question: log.session().original_question.clone(),
+                desired_output: None,
+                scope: crate::ResearchScope::default(),
+                source_constraints: Vec::new(),
+                accepted_assumptions: Vec::new(),
+            },
+            question: None,
+        };
+        for event in events_for_model_output(log.session(), output, Utc::now()).unwrap() {
+            log.append(&event).unwrap();
+        }
         (
             log.session().revision,
             log.session().content_hash.clone().unwrap(),
         )
-    }
-
-    /// Drives an intake into INTAKE_FAILED and returns (current_revision, a
-    /// valid recovery brief). IntakeFailed does not bump the revision, so the
-    /// returned revision is still 0.
-    fn failed_intake(service: &ResearchService, clarification_id: &str) -> u32 {
-        let started = IntakeEvent::new(IntakeEventKind::IntakeStarted {
-            clarification_id: clarification_id.into(),
-            original_question: "Original question, byte for byte?".into(),
-            revision: 0,
-            created_at: Utc::now(),
-        });
-        let mut log = IntakeLog::create(service.config.data_dir.join("intake"), started).unwrap();
-        log.append(&IntakeEvent::new(IntakeEventKind::IntakeFailed {
-            revision: 0,
-            message: "model returned invalid structured output twice".into(),
-            failed_at: Utc::now(),
-        }))
-        .unwrap();
-        assert_eq!(log.session().status, IntakeStatus::IntakeFailed);
-        log.session().revision
-    }
-
-    #[tokio::test]
-    async fn failed_intake_recovers_with_server_generated_minimal_brief() {
-        let service = test_service("intake-failed-recovery");
-        let clarification_id = "clarification-failed-recovery";
-        let revision = failed_intake(&service, clarification_id);
-
-        let session = service
-            .use_minimal_brief(clarification_id, revision)
-            .await
-            .unwrap();
-
-        assert_eq!(session.status, IntakeStatus::ReadyToConfirm);
-        assert_eq!(session.revision, revision + 1);
-        assert!(session.failure.is_none());
-        assert!(session.content_hash.is_some());
-
-        let replayed =
-            replay_intake(service.config.data_dir.join("intake"), clarification_id).unwrap();
-        assert_eq!(replayed.status, IntakeStatus::ReadyToConfirm);
-        fs::remove_dir_all(&service.config.data_dir).unwrap();
-    }
-
-    #[tokio::test]
-    async fn failed_intake_recovery_rejects_stale_revision() {
-        let service = test_service("intake-failed-stale");
-        let clarification_id = "clarification-failed-stale";
-        let revision = failed_intake(&service, clarification_id);
-
-        let error = service
-            .use_minimal_brief(clarification_id, revision + 7)
-            .await
-            .unwrap_err();
-
-        assert!(
-            matches!(
-                error,
-                IntakeCommandError::Intake(IntakeError::StaleBrief { .. })
-            ),
-            "expected StaleBrief, got {error:?}"
-        );
-        fs::remove_dir_all(&service.config.data_dir).unwrap();
     }
 
     fn test_policy() -> TracePolicy {
@@ -567,6 +547,58 @@ mod tests {
             rounds: 3,
             input_budget: 1_000,
             max_snapshots: 10,
+        }
+    }
+
+    #[tokio::test]
+    async fn invalid_policy_is_rejected_before_confirmation() {
+        for (name, policy) in [
+            (
+                "too-few-rounds",
+                TracePolicy {
+                    rounds: 2,
+                    ..test_policy()
+                },
+            ),
+            (
+                "too-many-rounds",
+                TracePolicy {
+                    rounds: 6,
+                    ..test_policy()
+                },
+            ),
+            (
+                "zero-budget",
+                TracePolicy {
+                    input_budget: 0,
+                    ..test_policy()
+                },
+            ),
+            (
+                "zero-snapshots",
+                TracePolicy {
+                    max_snapshots: 0,
+                    ..test_policy()
+                },
+            ),
+        ] {
+            let service = test_service(name);
+            let clarification_id = format!("clarification-{name}");
+            let (revision, content_hash) = ready_intake(&service, &clarification_id);
+
+            let error = service
+                .prepare_confirmed_run(&clarification_id, revision, &content_hash, policy)
+                .await
+                .unwrap_err();
+
+            assert!(matches!(
+                error,
+                PrepareRunError::Intake(IntakeError::InvalidEvent(_))
+            ));
+            let replayed =
+                replay_intake(service.config.data_dir.join("intake"), &clarification_id).unwrap();
+            assert_eq!(replayed.status, IntakeStatus::Complete);
+            fs::remove_dir_all(&service.config.data_dir).unwrap();
         }
     }
 
@@ -589,12 +621,17 @@ mod tests {
                 "clarification-idempotent",
                 revision,
                 &content_hash,
-                test_policy(),
+                TracePolicy {
+                    rounds: 5,
+                    input_budget: 99,
+                    max_snapshots: 1,
+                },
             )
             .await
             .unwrap();
 
         assert_eq!(second, first);
+        assert_eq!(second.policy, test_policy());
         let replayed = replay_intake(
             service.config.data_dir.join("intake"),
             "clarification-idempotent",
@@ -621,6 +658,7 @@ mod tests {
             revision,
             &content_hash,
             "run-before-crash".into(),
+            test_policy(),
             Utc::now(),
         )
         .unwrap();
@@ -634,6 +672,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(repaired.run_id, "run-before-crash");
+        assert_eq!(repaired.policy, test_policy());
         assert!(matches!(
             replay_run_header(service.trace_path(&repaired.run_id)).unwrap(),
             ReplayedRunHeader::V3(header)

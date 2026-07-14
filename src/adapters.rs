@@ -618,7 +618,7 @@ impl StrongClient {
         })
     }
 
-    pub async fn complete_json<T: DeserializeOwned>(&self, system: &str, user: &str) -> Result<T> {
+    pub async fn complete_text(&self, system: &str, user: &str) -> Result<String> {
         let mut request = self.client.post(self.endpoint.clone()).json(&ChatRequest {
             model: &self.model,
             messages: [
@@ -670,7 +670,12 @@ impl StrongClient {
             .message
             .content
             .trim();
-        serde_json::from_str(content).map_err(|error| SearchError::ModelOutput {
+        Ok(content.to_owned())
+    }
+
+    pub async fn complete_json<T: DeserializeOwned>(&self, system: &str, user: &str) -> Result<T> {
+        let content = self.complete_text(system, user).await?;
+        serde_json::from_str(&content).map_err(|error| SearchError::ModelOutput {
             message: format!("invalid JSON content: {error}"),
         })
     }

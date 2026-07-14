@@ -342,6 +342,9 @@ fn apply_run_prepared(
     policy: Option<TracePolicy>,
     event: &'static str,
 ) -> IntakeResult<IntakeSession> {
+    if let Some(policy) = &policy {
+        validate_trace_policy(policy).map_err(IntakeError::InvalidEvent)?;
+    }
     if session.status != IntakeStatus::Complete {
         return transition_error(session, event);
     }

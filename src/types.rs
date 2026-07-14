@@ -380,6 +380,14 @@ impl SearchResult {
     }
 }
 
+/// Which crawl4ai markdown representation became the archived body.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CrawlBodyKind {
+    RawMarkdown,
+    FitMarkdown,
+}
+
 /// Fetch provenance recorded alongside a snapshot (§8 抓取凭证和时间).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CrawlMeta {
@@ -387,6 +395,34 @@ pub struct CrawlMeta {
     pub final_url: String,
     pub http_status: u16,
     pub fetched_at: DateTime<Utc>,
+    /// Page metadata returned by crawl4ai.
+    #[serde(default)]
+    pub metadata: serde_json::Value,
+    #[serde(default)]
+    pub raw_markdown_bytes: usize,
+    #[serde(default)]
+    pub fit_markdown_bytes: usize,
+    pub body_kind: Option<CrawlBodyKind>,
+    /// True when the selected body exceeded the archive limit.
+    #[serde(default)]
+    pub truncated: bool,
+}
+
+impl CrawlMeta {
+    /// Minimal provenance for non-crawl4ai fixtures and legacy callers.
+    #[must_use]
+    pub fn basic(final_url: String, http_status: u16, fetched_at: DateTime<Utc>) -> Self {
+        Self {
+            final_url,
+            http_status,
+            fetched_at,
+            metadata: serde_json::Value::Null,
+            raw_markdown_bytes: 0,
+            fit_markdown_bytes: 0,
+            body_kind: None,
+            truncated: false,
+        }
+    }
 }
 
 /// An immutable archived page — the sole source of truth for the final answer
@@ -485,11 +521,7 @@ mod tests {
 
     #[test]
     fn snapshot_new_derives_agreeing_ids() {
-        let crawl = CrawlMeta {
-            final_url: FINAL_URL.to_string(),
-            http_status: 200,
-            fetched_at: Utc::now(),
-        };
+        let crawl = CrawlMeta::basic(FINAL_URL.to_string(), 200, Utc::now());
         let snap = Snapshot::new(U.to_string(), "T".into(), "hello world".into(), crawl);
         assert_eq!(snap.content_hash, content_hash("hello world"));
         assert_eq!(snap.snapshot_id, "d0790216187faeb6");

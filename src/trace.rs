@@ -75,6 +75,15 @@ pub enum TraceEvent {
         started_at: DateTime<Utc>,
         policy: TracePolicy,
     },
+    ModelCall {
+        operation: String,
+        round: u32,
+        input_snapshot_refs: Vec<SnapshotRef>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_chars: Option<usize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        error_class: Option<ErrorClass>,
+    },
     Query {
         round: u32,
         query: String,
@@ -117,11 +126,23 @@ pub enum TraceEvent {
         answer: String,
         claims: Vec<Claim>,
     },
+    RoundCompleted {
+        round: u32,
+        previous_queries: Vec<String>,
+        archived_snapshot_refs: Vec<SnapshotRef>,
+    },
     RunFailed {
         error_class: ErrorClass,
         stage: PipelineStage,
         message: String,
     },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct RunReplay {
+    pub completed_round: u32,
+    pub previous_queries: Vec<String>,
+    pub archived_snapshot_refs: Vec<SnapshotRef>,
 }
 
 /// Owns the only write direction: construction writes the mandatory first line,
@@ -196,23 +217,73 @@ impl TraceWriter<BufWriter<File>> {
         Self::new(BufWriter::new(file), header)
     }
 
-    /// Reopens only the exact v3 trace created by the confirmation handshake.
-    pub(crate) fn resume(trace_dir: impl AsRef<Path>, header: &RunHeader) -> Result<Self> {
+    /// Reopens only a matching, non-terminal v3 trace and returns its last committed round.
+    pub(crate) fn resume(
+        trace_dir: impl AsRef<Path>,
+        header: &RunHeader,
+    ) -> Result<(Self, RunReplay)> {
         validate_run_id(&header.run_id)?;
         let path = trace_dir.as_ref().join(format!("{}.jsonl", header.run_id));
-        match replay_run_header(&path)? {
-            ReplayedRunHeader::V3(existing) if existing.as_ref() == header => {}
-            _ => {
-                return Err(invalid_trace(
-                    "existing trace header does not match confirmed run",
-                ));
-            }
-        }
+        let replay = replay_run(&path, header)?;
         let file = OpenOptions::new().append(true).open(path)?;
-        Ok(Self {
-            sink: BufWriter::new(file),
-        })
+        Ok((
+            Self {
+                sink: BufWriter::new(file),
+            },
+            replay,
+        ))
     }
+}
+
+fn replay_run(path: &Path, expected: &RunHeader) -> Result<RunReplay> {
+    match replay_run_header(path)? {
+        ReplayedRunHeader::V3(existing) if existing.as_ref() == expected => {}
+        _ => {
+            return Err(invalid_trace(
+                "existing trace header does not match confirmed run",
+            ));
+        }
+    }
+
+    let contents = fs::read_to_string(path)?;
+    if !contents.ends_with('\n') {
+        return Err(invalid_trace("truncated trace event"));
+    }
+    let mut replay = RunReplay::default();
+    for (index, line) in contents.lines().enumerate().skip(1) {
+        if line.is_empty() {
+            return Err(invalid_trace(format!(
+                "empty trace event at line {}",
+                index + 1
+            )));
+        }
+        let event: TraceEvent = serde_json::from_str(line)
+            .map_err(|error| invalid_trace(format!("line {}: {error}", index + 1)))?;
+        match event {
+            TraceEvent::RoundCompleted {
+                round,
+                previous_queries,
+                archived_snapshot_refs,
+            } => {
+                if round != replay.completed_round + 1 || round > expected.policy.rounds {
+                    return Err(invalid_trace("invalid round_completed sequence"));
+                }
+                replay = RunReplay {
+                    completed_round: round,
+                    previous_queries,
+                    archived_snapshot_refs,
+                };
+            }
+            TraceEvent::RunHeader { .. } => {
+                return Err(invalid_trace("duplicate run_header"));
+            }
+            TraceEvent::Answer { .. } | TraceEvent::RunFailed { .. } => {
+                return Err(invalid_trace("trace is already terminal"));
+            }
+            _ => {}
+        }
+    }
+    Ok(replay)
 }
 
 pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
@@ -453,6 +524,76 @@ mod tests {
             serde_json::from_str::<Value>(&text).unwrap()["type"],
             "run_header"
         );
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_projects_only_the_last_completed_round() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "traceable-search-resume-{}-{nonce}",
+            std::process::id()
+        ));
+        let header = header("r-resume");
+        let snapshot_ref = SnapshotRef("snapshot:web/resume".into());
+        let mut writer = TraceWriter::create(&dir, header.clone()).unwrap();
+        writer
+            .append(&TraceEvent::RoundCompleted {
+                round: 1,
+                previous_queries: vec!["committed query".into()],
+                archived_snapshot_refs: vec![snapshot_ref.clone()],
+            })
+            .unwrap();
+        writer
+            .append(&TraceEvent::Query {
+                round: 2,
+                query: "uncommitted query".into(),
+                gap: "uncommitted gap".into(),
+            })
+            .unwrap();
+        drop(writer);
+
+        let (writer, replay) = TraceWriter::resume(&dir, &header).unwrap();
+        drop(writer);
+        assert_eq!(replay.completed_round, 1);
+        assert_eq!(replay.previous_queries, ["committed query"]);
+        assert_eq!(replay.archived_snapshot_refs, [snapshot_ref]);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn resume_rejects_terminal_and_truncated_traces() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "traceable-search-resume-invalid-{}-{nonce}",
+            std::process::id()
+        ));
+
+        let terminal = header("r-terminal");
+        let mut writer = TraceWriter::create(&dir, terminal.clone()).unwrap();
+        writer
+            .append(&TraceEvent::Answer {
+                answer: "done".into(),
+                claims: Vec::new(),
+            })
+            .unwrap();
+        drop(writer);
+        assert!(TraceWriter::resume(&dir, &terminal).is_err());
+
+        let truncated = header("r-truncated");
+        let writer = TraceWriter::create(&dir, truncated.clone()).unwrap();
+        drop(writer);
+        let path = dir.join("r-truncated.jsonl");
+        let mut text = fs::read_to_string(&path).unwrap();
+        text.push_str(r#"{"type":"query""#);
+        fs::write(path, text).unwrap();
+        assert!(TraceWriter::resume(&dir, &truncated).is_err());
         fs::remove_dir_all(dir).unwrap();
     }
 

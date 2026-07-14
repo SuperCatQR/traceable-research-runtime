@@ -18,8 +18,23 @@ use crate::{
 };
 
 const INDEX_HTML: &str = include_str!("web/index.html");
-const DEFAULT_INPUT_BUDGET: u32 = 200_000;
-const DEFAULT_MAX_SNAPSHOTS: u32 = 50;
+const DEFAULT_ROUNDS: u32 = 3;
+const MIN_ROUNDS: u32 = 3;
+const MAX_ROUNDS: u32 = 5;
+const DEFAULT_INPUT_BUDGET: u32 = crate::orchestration::MAX_STRONG_INPUT_TOKENS as u32;
+const DEFAULT_MAX_SNAPSHOTS: u32 = crate::orchestration::MAX_SNAPSHOTS as u32;
+
+const fn default_rounds() -> u32 {
+    DEFAULT_ROUNDS
+}
+
+fn validate_rounds(rounds: u32) -> Result<(), &'static str> {
+    if (MIN_ROUNDS..=MAX_ROUNDS).contains(&rounds) {
+        Ok(())
+    } else {
+        Err("rounds must be between 3 and 5")
+    }
+}
 
 #[derive(Clone)]
 pub struct WebState {
@@ -70,6 +85,7 @@ struct ReplyIntakeRequest {
 struct ConfirmIntakeRequest {
     revision: u32,
     content_hash: String,
+    #[serde(default = "default_rounds")]
     rounds: u32,
 }
 
@@ -155,6 +171,9 @@ async fn confirm_intake(
     Path(clarification_id): Path<String>,
     Json(request): Json<ConfirmIntakeRequest>,
 ) -> Response {
+    if let Err(message) = validate_rounds(request.rounds) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid_request", message);
+    }
     let policy = TracePolicy {
         rounds: request.rounds,
         input_budget: DEFAULT_INPUT_BUDGET,
@@ -380,9 +399,40 @@ mod tests {
         )
     }
 
+    #[test]
+    fn rounds_contract_has_one_default_and_inclusive_bounds() {
+        let request: ConfirmIntakeRequest = serde_json::from_value(serde_json::json!({
+            "revision": 1,
+            "content_hash": "hash"
+        }))
+        .unwrap();
+        assert_eq!(request.rounds, DEFAULT_ROUNDS);
+        assert!(validate_rounds(2).is_err());
+        assert!(validate_rounds(3).is_ok());
+        assert!(validate_rounds(5).is_ok());
+        assert!(validate_rounds(6).is_err());
+        assert_eq!(DEFAULT_INPUT_BUDGET, 1_000_000);
+        assert_eq!(DEFAULT_MAX_SNAPSHOTS, 300);
+        assert!(INDEX_HTML.contains("min=\"3\" max=\"5\" value=\"3\""));
+    }
+
     #[tokio::test]
     async fn intake_endpoints_return_contract_statuses() {
         let (state, data_dir) = test_state("statuses");
+
+        for rounds in [2, 6] {
+            let bad_rounds = confirm_intake(
+                State(state.clone()),
+                Path("missing".into()),
+                Json(ConfirmIntakeRequest {
+                    revision: 0,
+                    content_hash: "hash".into(),
+                    rounds,
+                }),
+            )
+            .await;
+            assert_eq!(bad_rounds.status(), StatusCode::BAD_REQUEST);
+        }
 
         let bad = start_intake(
             State(state.clone()),
@@ -422,7 +472,7 @@ mod tests {
             Json(ConfirmIntakeRequest {
                 revision,
                 content_hash: "stale".into(),
-                rounds: 1,
+                rounds: 3,
             }),
         )
         .await;
@@ -434,7 +484,7 @@ mod tests {
             Json(ConfirmIntakeRequest {
                 revision,
                 content_hash,
-                rounds: 1,
+                rounds: 3,
             }),
         )
         .await;

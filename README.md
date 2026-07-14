@@ -237,7 +237,7 @@ POST /api/research/intakes/{clarification_id}/cancel
 
 创建后先回答互斥问题或编辑 Brief；即使问题已清晰，也必须预览并确认。只有携当前 `revision` 与 `content_hash` 的 confirm 才会分配 `run_id` 并启动研究；旧版本返回 409，WebUI 保留尚未提交的输入。`INTAKE_FAILED` 可经 reply 重试或生成最小 Brief；cancel 进入不可恢复终态且不创建 run。各命令按 `clarification_id` 从 `data/intake/` 惰性回放，故进程重启后可用原 ID 重试 reply、confirm 或 cancel。
 
-确认时可选择 1–8 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
+确认时可选择 3–5 轮查询，默认 3 轮；达到 1,000,000 token 输入预算或 300 份快照时仍会提前收敛。页面经 SSE 展示 query、搜索、归档、选源与作答进度。
 
 ## Podman 容器
 

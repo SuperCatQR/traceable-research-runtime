@@ -20,6 +20,7 @@ CREATE TABLE IF NOT EXISTS snapshots (
     final_url     TEXT NOT NULL,
     http_status   INTEGER NOT NULL CHECK (http_status BETWEEN 100 AND 599),
     fetched_at    TEXT NOT NULL,
+    crawl_meta_json TEXT,
     CHECK (snapshot_ref = 'snapshot:web/' || snapshot_id),
     CHECK (content_hash GLOB 'sha256:*')
 ) STRICT;
@@ -35,19 +36,24 @@ impl SnapshotWriter {
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open(path)?;
         conn.execute_batch(SCHEMA)?;
+        if !has_crawl_meta_column(&conn)? {
+            conn.execute_batch("ALTER TABLE snapshots ADD COLUMN crawl_meta_json TEXT;")?;
+        }
         Ok(Self { conn })
     }
 
     /// Archives one immutable snapshot. Re-saving the same identity is a no-op.
     pub fn save(&mut self, snapshot: &Snapshot) -> Result<()> {
         validate_snapshot(snapshot)?;
+        let crawl_meta_json = serde_json::to_string(&snapshot.crawl)
+            .map_err(|error| SearchError::InvalidSnapshot(format!("crawl metadata: {error}")))?;
 
         let tx = self.conn.transaction()?;
         tx.execute(
             "INSERT INTO snapshots (
                 snapshot_id, snapshot_ref, requested_url, title, body,
-                content_hash, final_url, http_status, fetched_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                content_hash, final_url, http_status, fetched_at, crawl_meta_json
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
              ON CONFLICT(snapshot_id) DO NOTHING",
             params![
                 snapshot.snapshot_id,
@@ -59,6 +65,7 @@ impl SnapshotWriter {
                 snapshot.crawl.final_url,
                 i64::from(snapshot.crawl.http_status),
                 snapshot.crawl.fetched_at.to_rfc3339(),
+                crawl_meta_json,
             ],
         )?;
         tx.commit()?;
@@ -69,26 +76,35 @@ impl SnapshotWriter {
 /// Read-only capability used by research sessions.
 pub struct SnapshotReader {
     conn: Connection,
+    has_crawl_meta: bool,
 }
 
 impl SnapshotReader {
     /// Opens an existing snapshot database without write/create permission.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
         let conn = Connection::open_with_flags(path, OpenFlags::SQLITE_OPEN_READ_ONLY)?;
-        Ok(Self { conn })
+        let has_crawl_meta = has_crawl_meta_column(&conn)?;
+        Ok(Self {
+            conn,
+            has_crawl_meta,
+        })
     }
 
     /// Reads a snapshot by trace reference and re-verifies its content address.
     pub fn get(&self, reference: &SnapshotRef) -> Result<Option<Snapshot>> {
+        let metadata_column = if self.has_crawl_meta {
+            "crawl_meta_json"
+        } else {
+            "NULL"
+        };
+        let sql = format!(
+            "SELECT snapshot_id, snapshot_ref, requested_url, title, body,
+                    content_hash, final_url, http_status, fetched_at, {metadata_column}
+             FROM snapshots WHERE snapshot_ref = ?1"
+        );
         let snapshot = self
             .conn
-            .query_row(
-                "SELECT snapshot_id, snapshot_ref, requested_url, title, body,
-                        content_hash, final_url, http_status, fetched_at
-                 FROM snapshots WHERE snapshot_ref = ?1",
-                [reference.as_str()],
-                row_to_snapshot,
-            )
+            .query_row(&sql, [reference.as_str()], row_to_snapshot)
             .optional()?;
 
         if let Some(snapshot) = &snapshot {
@@ -96,6 +112,16 @@ impl SnapshotReader {
         }
         Ok(snapshot)
     }
+}
+
+fn has_crawl_meta_column(conn: &Connection) -> rusqlite::Result<bool> {
+    conn.query_row(
+        "SELECT EXISTS(
+            SELECT 1 FROM pragma_table_info('snapshots') WHERE name = 'crawl_meta_json'
+        )",
+        [],
+        |row| row.get(0),
+    )
 }
 
 fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
@@ -108,6 +134,17 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
         .map_err(|error| {
             rusqlite::Error::FromSqlConversionFailure(8, Type::Text, Box::new(error))
         })?;
+    let final_url: String = row.get(6)?;
+    let crawl_meta_json: Option<String> = row.get(9)?;
+    let mut crawl = match crawl_meta_json {
+        Some(value) => serde_json::from_str::<CrawlMeta>(&value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(9, Type::Text, Box::new(error))
+        })?,
+        None => CrawlMeta::basic(final_url.clone(), http_status, fetched_at),
+    };
+    crawl.final_url = final_url;
+    crawl.http_status = http_status;
+    crawl.fetched_at = fetched_at;
 
     Ok(Snapshot {
         snapshot_id: row.get(0)?,
@@ -116,11 +153,7 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
         title: row.get(3)?,
         body: row.get(4)?,
         content_hash: row.get(5)?,
-        crawl: CrawlMeta {
-            final_url: row.get(6)?,
-            http_status,
-            fetched_at,
-        },
+        crawl,
     })
 }
 
@@ -184,15 +217,21 @@ mod tests {
     }
 
     fn sample() -> Snapshot {
+        let mut crawl = CrawlMeta::basic(
+            "https://example.com/final".into(),
+            200,
+            Utc.with_ymd_and_hms(2026, 7, 11, 10, 0, 0).unwrap(),
+        );
+        crawl.metadata = serde_json::json!({"title": "Example", "language": "en"});
+        crawl.raw_markdown_bytes = 42;
+        crawl.fit_markdown_bytes = 21;
+        crawl.body_kind = Some(crate::CrawlBodyKind::RawMarkdown);
+        crawl.truncated = true;
         Snapshot::new(
             "https://example.com/original".into(),
             "Example".into(),
             "archived body".into(),
-            CrawlMeta {
-                final_url: "https://example.com/final".into(),
-                http_status: 200,
-                fetched_at: Utc.with_ymd_and_hms(2026, 7, 11, 10, 0, 0).unwrap(),
-            },
+            crawl,
         )
     }
 
@@ -235,6 +274,45 @@ mod tests {
         let error = reader.get(&snapshot.snapshot_ref).unwrap_err();
         assert!(matches!(error, SearchError::HashMismatch { .. }));
         assert_eq!(error.error_class(), ErrorClass::Internal);
+    }
+
+    #[test]
+    fn legacy_schema_is_readable_and_migrated_on_write_open() {
+        let db = TempDb::new("legacy");
+        let snapshot = sample();
+        let conn = Connection::open(&db.0).unwrap();
+        conn.execute_batch(&SCHEMA.replace("    crawl_meta_json TEXT,\n", ""))
+            .unwrap();
+        conn.execute(
+            "INSERT INTO snapshots (
+                snapshot_id, snapshot_ref, requested_url, title, body,
+                content_hash, final_url, http_status, fetched_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+            params![
+                snapshot.snapshot_id,
+                snapshot.snapshot_ref.as_str(),
+                snapshot.requested_url,
+                snapshot.title,
+                snapshot.body,
+                snapshot.content_hash,
+                snapshot.crawl.final_url,
+                i64::from(snapshot.crawl.http_status),
+                snapshot.crawl.fetched_at.to_rfc3339(),
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let reader = SnapshotReader::open(&db.0).unwrap();
+        let legacy = reader.get(&snapshot.snapshot_ref).unwrap().unwrap();
+        assert_eq!(legacy.crawl.final_url, snapshot.crawl.final_url);
+        assert_eq!(legacy.crawl.metadata, serde_json::Value::Null);
+        assert_eq!(legacy.crawl.body_kind, None);
+        drop(reader);
+
+        drop(SnapshotWriter::open(&db.0).unwrap());
+        let conn = Connection::open(&db.0).unwrap();
+        assert!(has_crawl_meta_column(&conn).unwrap());
     }
 
     #[test]

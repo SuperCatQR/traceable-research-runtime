@@ -12,8 +12,9 @@ use crate::{
     Claim, ClarificationAnswer, ConfirmedResearchBrief, CrawlClient, ErrorClass, INTAKE_PROMPT,
     IntakeError, IntakeEvent, IntakeEventKind, IntakeLog, IntakeSession, IntakeSessionLocks,
     IntakeStatus, LiveBackend, ModelParseOutcome, PipelineStage, ReplayedRunHeader, ResearchBrief,
-    RunHeader, SearchError, SearxngClient, SnapshotRef, SnapshotWriter, StrongClient, TracePolicy,
-    TraceWriter, cancellation_event, confirmation_event, events_for_model_output,
+    RunHeader, SearchError, SearxngClient, SnapshotReader, SnapshotRef, SnapshotWriter,
+    StrongClient, TracePolicy, TraceWriter, cancellation_event, confirmation_event,
+    events_for_model_output,
     orchestration::{AnswerSource, ResearchResult, ResearchSession},
     parse_model_attempt, replay_run_header,
 };
@@ -376,10 +377,20 @@ impl ResearchService {
             brief: prepared.brief,
             policy: prepared.policy,
         };
-        let trace = TraceWriter::resume(self.config.data_dir.join("traces"), &header)
+        let (trace, replay) = TraceWriter::resume(self.config.data_dir.join("traces"), &header)
             .map_err(setup_error)?;
+        let reader = SnapshotReader::open(&store_path).map_err(setup_error)?;
         let rounds = header.policy.rounds;
-        let mut session = ResearchSession::new(header.brief, rounds, backend, snapshots, trace);
+        let mut session = ResearchSession::resume(
+            header.brief,
+            rounds,
+            backend,
+            snapshots,
+            trace,
+            replay,
+            &reader,
+        )
+        .map_err(setup_error)?;
         public_answer(session.run(store_path).await?)
     }
 }

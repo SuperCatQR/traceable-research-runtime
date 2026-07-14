@@ -6,7 +6,7 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    Answer, ConfirmedResearchBrief, Excerpt, PipelineStage, Query, Result, SearchError,
+    Answer, ConfirmedResearchBrief, Excerpt, PipelineStage, Query, Result, RunReplay, SearchError,
     SearchResult, Snapshot, SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection,
     TraceEvent, TraceWriter,
 };
@@ -25,6 +25,7 @@ pub enum StopReason {
     CompletedRounds,
     InputBudget,
     SnapshotLimit,
+    NoNewUrls,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
@@ -108,6 +109,43 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
         }
     }
 
+    pub fn resume(
+        brief: ConfirmedResearchBrief,
+        rounds: u32,
+        backend: B,
+        snapshots: SnapshotWriter,
+        trace: TraceWriter<W>,
+        replay: RunReplay,
+        reader: &SnapshotReader,
+    ) -> Result<Self> {
+        let mut archived = Vec::with_capacity(replay.archived_snapshot_refs.len());
+        for reference in &replay.archived_snapshot_refs {
+            archived.push(reader.get(reference)?.ok_or_else(|| {
+                SearchError::InvalidSnapshot(format!("missing replay snapshot {reference:?}"))
+            })?);
+        }
+        let seen_urls = archived
+            .iter()
+            .filter_map(|snapshot| normalized_url(&snapshot.requested_url).ok())
+            .collect();
+        Ok(Self {
+            brief,
+            rounds,
+            backend,
+            snapshots,
+            trace,
+            state: ResearchState {
+                round: replay.completed_round,
+                estimated_input_tokens: estimate_snapshot_tokens(&archived),
+                archived_snapshots: archived.len(),
+                stop_reason: None,
+            },
+            archived,
+            previous_queries: replay.previous_queries,
+            seen_urls,
+        })
+    }
+
     /// Runs the complete pipeline and records exactly one terminal failure event.
     pub async fn run(&mut self, snapshot_path: impl AsRef<Path>) -> Result<ResearchResult> {
         let result: Result<ResearchResult> = async {
@@ -141,6 +179,7 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
 
         match result {
             Ok(answer) => Ok(answer),
+            Err(error @ SearchError::FailureTrace { .. }) => Err(error),
             Err(error) => {
                 let failure = TraceEvent::RunFailed {
                     error_class: error.error_class(),
@@ -159,19 +198,34 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
     }
 
     pub async fn explore(&mut self) -> Result<&ResearchState> {
-        for round in 1..=self.rounds {
+        for round in self.state.round + 1..=self.rounds {
             self.state.round = round;
             self.state.estimated_input_tokens = estimate_snapshot_tokens(&self.archived);
             if self.state.estimated_input_tokens >= MAX_STRONG_INPUT_TOKENS {
                 self.state.stop_reason = Some(StopReason::InputBudget);
                 break;
             }
+            if self.archived.len() >= MAX_SNAPSHOTS {
+                self.state.stop_reason = Some(StopReason::SnapshotLimit);
+                break;
+            }
 
-            let raw = self
+            let input_snapshot_refs = self
+                .archived
+                .iter()
+                .map(|snapshot| snapshot.snapshot_ref.clone())
+                .collect();
+            let result = self
                 .backend
                 .plan(&self.brief, &self.archived, &self.previous_queries)
-                .await
-                .map_err(|error| error.at(PipelineStage::Planning))?;
+                .await;
+            let raw = self.finish_model_call(
+                "plan",
+                round,
+                input_snapshot_refs,
+                result,
+                PipelineStage::Planning,
+            )?;
             let queries = plan_queries(&raw, &self.previous_queries)
                 .map_err(|error| error.at(PipelineStage::Planning))?;
             for query in &queries {
@@ -223,6 +277,9 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                 }
             }
 
+            if new_results.is_empty() {
+                self.state.stop_reason = Some(StopReason::NoNewUrls);
+            }
             for result in new_results {
                 if self.archived.len() >= MAX_SNAPSHOTS {
                     self.state.stop_reason = Some(StopReason::SnapshotLimit);
@@ -254,6 +311,17 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
                         .map_err(|error| error.at(PipelineStage::Trace))?,
                 }
             }
+            self.trace
+                .append(&TraceEvent::RoundCompleted {
+                    round,
+                    previous_queries: self.previous_queries.clone(),
+                    archived_snapshot_refs: self
+                        .archived
+                        .iter()
+                        .map(|snapshot| snapshot.snapshot_ref.clone())
+                        .collect(),
+                })
+                .map_err(|error| error.at(PipelineStage::Trace))?;
             if self.state.stop_reason.is_some() {
                 break;
             }
@@ -285,11 +353,18 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             .iter()
             .map(|excerpt| excerpt.snapshot_ref.clone())
             .collect();
-        let raw = self
-            .backend
-            .select(&self.brief, &excerpts)
-            .await
-            .map_err(|error| error.at(PipelineStage::Selection))?;
+        let input_snapshot_refs = excerpts
+            .iter()
+            .map(|excerpt| excerpt.snapshot_ref.clone())
+            .collect();
+        let result = self.backend.select(&self.brief, &excerpts).await;
+        let raw = self.finish_model_call(
+            "select",
+            self.state.round,
+            input_snapshot_refs,
+            result,
+            PipelineStage::Selection,
+        )?;
         let selected = select_sources(&raw, &run_snapshots)
             .map_err(|error| error.at(PipelineStage::Selection))?;
         if selected.is_empty() {
@@ -337,11 +412,18 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             .map(|snapshot| snapshot.snapshot_ref.clone())
             .collect();
         drop(reader);
-        let raw = self
-            .backend
-            .synthesize(&self.brief, &evidence)
-            .await
-            .map_err(|error| error.at(PipelineStage::Synthesis))?;
+        let input_snapshot_refs = evidence
+            .iter()
+            .map(|snapshot| snapshot.snapshot_ref.clone())
+            .collect();
+        let result = self.backend.synthesize(&self.brief, &evidence).await;
+        let raw = self.finish_model_call(
+            "synthesize",
+            self.state.round,
+            input_snapshot_refs,
+            result,
+            PipelineStage::Synthesis,
+        )?;
         let answer = synthesize_answer(&raw, &supplied)
             .map_err(|error| error.at(PipelineStage::Synthesis))?;
         for claim in &answer.claims {
@@ -359,6 +441,47 @@ impl<B: ResearchBackend, W: Write> ResearchSession<B, W> {
             })
             .map_err(|error| error.at(PipelineStage::Trace))?;
         Ok(answer)
+    }
+
+    fn finish_model_call(
+        &mut self,
+        operation: &str,
+        round: u32,
+        input_snapshot_refs: Vec<SnapshotRef>,
+        result: Result<String>,
+        stage: PipelineStage,
+    ) -> Result<String> {
+        match result {
+            Ok(output) => {
+                self.trace
+                    .append(&TraceEvent::ModelCall {
+                        operation: operation.to_owned(),
+                        round,
+                        input_snapshot_refs,
+                        output_chars: Some(output.chars().count()),
+                        error_class: None,
+                    })
+                    .map_err(|error| error.at(PipelineStage::Trace))?;
+                Ok(output)
+            }
+            Err(error) => {
+                let event = TraceEvent::ModelCall {
+                    operation: operation.to_owned(),
+                    round,
+                    input_snapshot_refs,
+                    output_chars: None,
+                    error_class: Some(error.error_class()),
+                };
+                let original = error.at(stage);
+                match self.trace.append(&event) {
+                    Ok(()) => Err(original),
+                    Err(trace) => Err(SearchError::FailureTrace {
+                        original: Box::new(original),
+                        trace: Box::new(trace.at(PipelineStage::Trace)),
+                    }),
+                }
+            }
+        }
     }
 
     #[must_use]
@@ -634,11 +757,7 @@ mod tests {
                     url.into(),
                     url.into(),
                     format!("body for {url}"),
-                    CrawlMeta {
-                        final_url: url.into(),
-                        http_status: 200,
-                        fetched_at: Utc::now(),
-                    },
+                    CrawlMeta::basic(url.into(), 200, Utc::now()),
                 ))
             };
             std::future::ready(result)
@@ -781,6 +900,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn resume_restores_committed_state_and_starts_at_the_next_round() {
+        let db = TempDb::new("resume");
+        let mut original = session_with_rounds(&db, 1);
+        original.explore().await.unwrap();
+        let replay = RunReplay {
+            completed_round: original.state.round,
+            previous_queries: original.previous_queries.clone(),
+            archived_snapshot_refs: original
+                .archived
+                .iter()
+                .map(|snapshot| snapshot.snapshot_ref.clone())
+                .collect(),
+        };
+        let restored_count = replay.archived_snapshot_refs.len();
+        drop(original);
+
+        let brief = confirmed_brief();
+        let trace = TraceWriter::new(
+            Vec::new(),
+            RunHeader {
+                run_id: "resumed-fixture".into(),
+                clarification_id: brief.clarification_id().into(),
+                brief: brief.clone(),
+                started_at: Utc::now(),
+                policy: TracePolicy {
+                    rounds: DEFAULT_EXPLORE_ROUNDS,
+                    input_budget: MAX_STRONG_INPUT_TOKENS as u32,
+                    max_snapshots: MAX_SNAPSHOTS as u32,
+                },
+            },
+        )
+        .unwrap();
+        let reader = SnapshotReader::open(&db.0).unwrap();
+        let backend = FixtureBackend {
+            plan_calls: 1,
+            ..FixtureBackend::default()
+        };
+        let mut resumed = ResearchSession::resume(
+            brief,
+            DEFAULT_EXPLORE_ROUNDS,
+            backend,
+            SnapshotWriter::open(&db.0).unwrap(),
+            trace,
+            replay,
+            &reader,
+        )
+        .unwrap();
+
+        assert_eq!(resumed.state.round, 1);
+        assert_eq!(resumed.archived.len(), restored_count);
+        assert_eq!(resumed.seen_urls.len(), restored_count);
+        resumed.explore().await.unwrap();
+        assert_eq!(resumed.state.round, DEFAULT_EXPLORE_ROUNDS);
+        assert_eq!(resumed.backend.plan_calls, DEFAULT_EXPLORE_ROUNDS);
+    }
+
+    #[tokio::test]
     async fn run_records_external_selection_failure_as_the_only_terminal_event() {
         let db = TempDb::new("run-selection-failure");
         let mut session = session(&db);
@@ -904,37 +1080,26 @@ mod tests {
         assert_eq!(result["query"], "q1-0");
     }
 
-    #[tokio::test]
-    async fn explore_accepts_five_rounds() {
-        let db = TempDb::new("five-rounds");
-        let mut session = session_with_rounds(&db, MAX_EXPLORE_ROUNDS);
+    #[test]
+    fn explore_accepts_max_rounds() {
+        let db = TempDb::new("max-rounds");
+        let session = session_with_rounds(&db, MAX_EXPLORE_ROUNDS);
 
-        let state = session.explore().await.unwrap().clone();
-
-        assert_eq!(state.round, MAX_EXPLORE_ROUNDS);
-        assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
-        assert_eq!(session.backend.plan_calls, MAX_EXPLORE_ROUNDS);
-        assert_eq!(
-            session.backend.search_calls,
-            MAX_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
-        );
+        assert_eq!(session.rounds, MAX_EXPLORE_ROUNDS);
     }
 
     #[tokio::test]
-    async fn explore_runs_all_rounds_when_every_search_repeats_the_same_url() {
+    async fn explore_stops_when_every_search_repeats_seen_urls() {
         let db = TempDb::new("duplicate-search-results");
         let mut session = session(&db);
         session.backend.duplicate_urls = true;
 
         let state = session.explore().await.unwrap().clone();
 
-        assert_eq!(state.round, DEFAULT_EXPLORE_ROUNDS);
-        assert_eq!(state.stop_reason, Some(StopReason::CompletedRounds));
-        assert_eq!(session.backend.plan_calls, DEFAULT_EXPLORE_ROUNDS);
-        assert_eq!(
-            session.backend.search_calls,
-            DEFAULT_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
-        );
+        assert_eq!(state.round, 2);
+        assert_eq!(state.stop_reason, Some(StopReason::NoNewUrls));
+        assert_eq!(session.backend.plan_calls, 2);
+        assert_eq!(session.backend.search_calls, 2 * QUERIES_PER_ROUND as u32);
         assert_eq!(session.backend.crawl_calls, 1);
         assert_eq!(session.archived.len(), 1);
     }
@@ -947,17 +1112,33 @@ mod tests {
             "https://example.com/large".into(),
             "large".into(),
             "x".repeat(MAX_STRONG_INPUT_TOKENS * 4),
-            CrawlMeta {
-                final_url: "https://example.com/large".into(),
-                http_status: 200,
-                fetched_at: Utc::now(),
-            },
+            CrawlMeta::basic("https://example.com/large".into(), 200, Utc::now()),
         ));
 
         let state = session.explore().await.unwrap().clone();
 
         assert_eq!(state.stop_reason, Some(StopReason::InputBudget));
         assert_eq!(session.backend.plan_calls, 0);
+    }
+
+    #[tokio::test]
+    async fn explore_stops_before_external_calls_at_snapshot_limit() {
+        let db = TempDb::new("snapshot-limit");
+        let mut session = session(&db);
+        let snapshot = Snapshot::new(
+            "https://example.com/archived".into(),
+            "archived".into(),
+            "body".into(),
+            CrawlMeta::basic("https://example.com/archived".into(), 200, Utc::now()),
+        );
+        session.archived = vec![snapshot; MAX_SNAPSHOTS];
+
+        let state = session.explore().await.unwrap().clone();
+
+        assert_eq!(state.stop_reason, Some(StopReason::SnapshotLimit));
+        assert_eq!(session.backend.plan_calls, 0);
+        assert_eq!(session.backend.search_calls, 0);
+        assert_eq!(session.backend.crawl_calls, 0);
     }
 
     #[tokio::test]
@@ -968,11 +1149,7 @@ mod tests {
             "https://example.com/large".into(),
             "large".into(),
             "x".repeat(MAX_STRONG_INPUT_TOKENS * 4),
-            CrawlMeta {
-                final_url: "https://example.com/large".into(),
-                http_status: 200,
-                fetched_at: Utc::now(),
-            },
+            CrawlMeta::basic("https://example.com/large".into(), 200, Utc::now()),
         );
         session.snapshots.save(&snapshot).unwrap();
         session.backend.selected_ref = Some(snapshot.snapshot_ref.clone());

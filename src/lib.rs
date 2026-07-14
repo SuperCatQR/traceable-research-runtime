@@ -36,12 +36,12 @@ pub use intake::{
 };
 pub use snapshot::{SnapshotReader, SnapshotWriter};
 pub use trace::{
-    ReplayedRunHeader, RunHeader, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent, TracePolicy,
-    TraceWriter, replay_run_header,
+    ReplayedRunHeader, RunHeader, RunReplay, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent,
+    TracePolicy, TraceWriter, replay_run_header,
 };
 pub use types::{
-    Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlMeta, Excerpt, Query,
-    RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief, ResearchScope, SearchResult, Snapshot,
+    Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlBodyKind, CrawlMeta, Excerpt,
+    Query, RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief, ResearchScope, SearchResult, Snapshot,
     SnapshotRef, content_hash, search_result_id, snapshot_id, snapshot_ref,
 };
 pub use web::router;

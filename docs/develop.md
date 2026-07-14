@@ -1,306 +1,224 @@
-# Research Intake 单问质询改造计划
+# Research Intake 对话体验修正计划
 
-> 状态：已完成（2026-07-14）
+> 状态：待实施
 >
-> 依据：[`web-search-architecture.md`](./web-search-architecture.md)“Research Intake”章节
+> 日期：2026-07-14
 >
-> 基线：`43dfda6`。现有 Intake 已可创建、修订、确认、取消、失败恢复及 JSONL 回放；本计划只修正其“每次至多一个质询、累计至多五个、任一草案均可确认”的契约。
+> 依据：[`web-search-architecture.md`](./web-search-architecture.md) §4.4
+>
+> 基线：`18f430e`。现有后端已实现“模型生成 Brief、每轮至多一个质询、累计至多五问、用户可随时确认”；本计划只修正 WebUI 将其呈现成单问表单而非连续对话的问题。
 
-## 1. 目标与边界
+## 1. 问题与目标
 
-### 1.1 目标行为
+当前 `IntakeSession` 已保存 `original_question`、按顺序排列的 `questions` 与 `answers`、当前 `brief_draft`，模型每次回复后也会修订 Brief。缺口在 HTTP 响应未投影历史、前端只显示当前问题，用户看不到自己与模型如何逐步确定 Brief。
+
+目标流程：
 
 ```text
-create(question)
-  -> 模型生成完整 brief_draft
-  -> question = null：READY_TO_CONFIRM
-  -> question = one：NEEDS_INPUT
-
-reply(revision, answer)
-  -> 只回答当前待答 question
-  -> 模型结合原问题、当前草案及完整问答史修订草案
-  -> questions_asked < 5：可再返回零或一个 question
-  -> questions_asked == 5：不得再问，保持 READY_TO_CONFIRM
-
-confirm(revision, content_hash)
-  -> NEEDS_INPUT 或 READY_TO_CONFIRM 均可确认
-  -> 复用既有幂等确认协议，启动同一 run_id
+用户提出研究问题
+  -> 页面显示用户消息
+  -> 模型生成 Brief，并显示一个质询（若有）
+  -> 用户在同一对话区回答
+  -> 页面保留旧消息，追加用户回答与模型新质询
+  -> 右侧/下方持续显示模型生成的当前 Brief
+  -> 用户任一时刻确认当前 Brief
+  -> 进入既有 Research 流程
 ```
 
-每版草案均完整展示。模型认为问题清晰时可零质询，但不能自动确认。达到五次只停止质询，不自动启动 Research。
+完成后，“对话”是既有 Intake 状态的可见投影，不另建聊天子系统。
 
-### 1.2 不做
+## 2. 最小实现原则
 
-- 不改 `ResearchSession`、Explore 轮数、搜索、抓取、快照、选源或作答链。
-- 不新增模型、依赖、配置、数据库、聊天服务、worker 或跨进程锁。
-- 不改 `ResearchBrief`、`ConfirmedResearchBrief`、content hash 或 trace schema。
-- 不迁移或重写既有 Intake JSONL；旧日志必须继续可回放。
-- 不让客户端创建或编辑 `brief_draft`。
+1. 复用 `IntakeSession.questions` 与 `IntakeSession.answers`，不新增事件、不改 JSONL schema、不迁移数据。
+2. 保留现有四类 Intake 写操作及请求体；用户回答仍只对应当前 pending question，不开放任意轮次编辑。
+3. Brief 仍由模型生成、客户端只读；不恢复人工填写 `brief_draft`。
+4. 不增加 WebSocket/SSE、前端框架、数据库表或新依赖；每次写请求仍返回完整 Intake 投影。
+5. 保持五问上限、显式确认、revision/hash 并发保护、失败恢复与确认幂等语义不变。
 
-`ponytail:` 继续使用 `src/intake.rs` 与 append-only JSONL；待需多人并发、会话检索或数据库事务时再迁移。
+懒惰替代：只改 CSS 把现表单画成聊天样式虽更短，但无法显示历史，不能满足“在对话中确定 Brief”，故不采用。
 
-## 2. 已核实的代码现状
+## 3. 影响范围
 
-| 层 | 当前实现 | 与目标之差 |
+### 3.1 必改
+
+| 文件 | 最小改动 | 理由 |
 |---|---|---|
-| `src/intake.rs` 模型契约 | `IntakeModelOutput.questions: Vec<_>` | 应为 `question: Option<_>` |
-| `src/intake.rs` 限额 | 每轮最多 3 问、最多 2 轮、总计 5 问 | 应为每次至多 1 问、累计展示 5 问 |
-| `src/intake.rs` 会话 | 暴露全部 `questions`、`answers`、`clarification_rounds` | API 应暴露当前 `question` 与累计 `questions_asked` |
-| `src/intake.rs` 回复 | `UserReplied.answers` 可批量回答当前所有待答问题 | HTTP 每次只答当前一个问题 |
-| `src/intake.rs` 确认 | `confirmation_event` 仅接受 `READY_TO_CONFIRM` | `NEEDS_INPUT` 亦可手动确认当前草案 |
-| `src/backend.rs` | Prompt 要求 `questions` 数组、每轮最多 3 个 | 应要求 `question` 为对象或 `null`，每次最多一个 |
-| `src/app.rs` | `reply_intake(..., answers, edited_brief)` | 应收单个 `answer`；客户端不得提交编辑后 Brief |
-| `src/web.rs` | reply JSON 为 `{revision, answers, edited_brief}` | 应为 `{revision, answer}`，未知字段仍拒绝 |
-| `src/web/index.html` | 同页渲染多个历史问题，可提交多个答案并编辑 Brief | 应只显示当前问题；草案只读；任一有效草案均显示确认按钮 |
-| 内嵌测试 | 覆盖多问、两轮、批答和仅 READY 确认 | fixtures 与断言须换成单问五次契约 |
+| `src/web.rs` | 在 `IntakeResponse` 增加只读 `messages`；由现有 `original_question + questions + answers` 生成有序消息 | 页面刷新及每轮响应均可重建完整对话，无需前端另存状态 |
+| `src/web/index.html` | 将当前单问区改成消息流；保留当前回答输入、选项、确认、取消、重试及最小 Brief 操作 | 修复用户可见体验，复用全部既有 API |
 
-既有正确能力应保留：`revision + content_hash` 防陈旧确认、每会话进程内锁、两次模型 JSON 尝试、`INTAKE_FAILED`、取消、幂等 `run_id`、崩溃恢复、确认前无 Research 副作用。
+### 3.2 仅测试随同修改
 
-## 3. 契约决策
+测试优先放回上述文件的既有 `#[cfg(test)]` 模块或静态页面断言中，不新建测试框架。只有现有测试结构无法清楚覆盖时，才新增一个最小测试文件。
 
-### 3.1 模型输出
+### 3.3 明确不改
 
-```json
-{
-  "brief_draft": { "...": "完整 ResearchBrief" },
-  "question": {
-    "id": "stable_id",
-    "question": "one material clarification",
-    "options": []
-  },
-  "ready_to_confirm": false
+- `src/intake.rs`：事件、reducer、五问计数、revision/hash、恢复逻辑已足够。
+- `src/app.rs`：模型调用已携带完整问答史，服务命令无需变化。
+- `src/backend.rs`：模型输出协议仍为 `brief_draft + question + ready_to_confirm`。
+- Research 执行、搜索、抓取、快照与 trace。
+- `data/intake/*.jsonl` 和现网历史数据。
+- `docs/web-search-architecture.md`：本次按其既有契约补齐实现，不重写架构。
+
+若实施中发现必须改上述边界才能显示历史，先停止扩面并复核现状，不静默升级协议。
+
+## 4. 响应投影设计
+
+### 4.1 最小 DTO
+
+在 `src/web.rs` 增加仅用于序列化的消息 DTO：
+
+```rust
+struct IntakeMessage<'a> {
+    role: &'static str, // "user" | "assistant"
+    kind: &'static str, // "original_question" | "clarification" | "answer"
+    text: &'a str,
 }
 ```
 
-- `question` 允许为 `null`，不再接受 `questions`。
-- `ready_to_confirm=true` 时 `question` 必须为 `null`。
-- `ready_to_confirm=false` 且尚有额度时，允许一个问题；不得返回数组或额外字段。
-- 服务端而非模型执行五问上限。已展示五问后丢弃模型新问题并令状态为 `READY_TO_CONFIRM`。
-- `original_question` 仍逐字一致；Brief 仍规范化并重算 hash。
+`IntakeResponse.messages` 顺序固定为：
 
-### 3.2 HTTP 表面
+1. 原始问题：`user / original_question`。
+2. 第一个质询：`assistant / clarification`。
+3. 该质询的回答：`user / answer`。
+4. 后续质询与回答依次交替。
+5. 当前尚未回答的 pending question 位于末尾。
 
-```text
-POST /api/research/intakes
-  {question}
+`question` 字段暂时保留，供现有输入控件取得 `id/options`，避免把消息 DTO 扩成另一套问题模型。`brief_draft` 仍独立返回并持续展示，不把每个 Brief revision 复制进消息史。
 
-POST /api/research/intakes/{id}/reply
-  {revision, answer}
+### 4.2 配对规则
 
-POST /api/research/intakes/{id}/confirm
-  {revision, content_hash, rounds?}
+按 `ClarificationAnswer.question_id` 与 `ClarificationQuestion.id` 配对，不依赖数组下标。历史兼容规则：
 
-POST /api/research/intakes/{id}/cancel
-  {revision}
-```
+- 有问题无回答：显示问题。
+- 有匹配回答：紧随对应问题显示。
+- 旧日志中的多个问题：按 `questions` 原顺序显示各问题及匹配回答。
+- 孤立回答属于损坏/遗留异常状态，不暴露为无上下文消息；reducer 的既有校验仍是数据正确性的主防线。
 
-Intake 会话响应至少保留：
+投影函数保持纯函数，便于单元测试；不写盘、不改变 session。
 
-```json
-{
-  "clarification_id": "...",
-  "revision": 2,
-  "status": "NEEDS_INPUT",
-  "original_question": "...",
-  "brief_draft": {},
-  "content_hash": "...",
-  "question": {},
-  "questions_asked": 2,
-  "failure": null,
-  "confirmation": null
-}
-```
+## 5. WebUI 设计
 
-决策如下：
+### 5.1 页面结构
 
-1. reply 的 `answer` 为单个非空字符串；服务端自动绑定当前待答问题 ID，客户端不得自报 `question_id`。
-2. `question` 只返回当前未答问题；已答历史仍保存在 JSONL/reducer 内，不扩张公共响应。
-3. `questions_asked` 指已展示问题总数，而非模型调用轮数或已回答数。
-4. `edited_brief` 从 HTTP 请求删除；前端 Brief 改只读。既有“生成最小 Brief”仍由服务端 `minimal_brief_event` 产生，不接受客户端伪造草案。
-5. `rounds` 属 Research policy，暂保留现有可选字段；此项不属于 Intake 质询次数。
+保留当前单页应用，只调整 Intake 区：
 
-### 3.3 JSONL 兼容
+- 对话流：按 `messages` 渲染用户与模型消息，使用语义化列表和清晰的角色标签。
+- 回答区：仅在存在 `session.question` 时显示；继续支持预设选项与“其他”文本输入。
+- Brief 区：显示当前模型草案及 revision；保持只读。
+- 操作区：`确认 Brief` 始终受既有 status、revision、content_hash 约束；取消、失败重试、使用最小 Brief 保持现状。
 
-不升 `INTAKE_EVENT_SCHEMA_VERSION`，不改既有事件 JSON 形状：
+### 5.2 交互规则
 
-- `clarification_asked.questions` 与 `user_replied.answers` 继续使用数组，以便回放旧日志；新 writer 强制数组长度恰为 1。
-- reducer 继续接受旧日志中的 1–3 个问题及批量答案；新命令路径永不再生成批量事件。
-- 会话内部保留完整 `questions`、`answers` 与 pending ID，另以序列化视图输出单个当前问题和 `questions_asked`。
-- 旧日志若同时有多个 pending 问题，按原规则完成回放；新单答 API 对该遗留状态应返回明确 `409 invalid_transition`，不得猜测回答对象。运维可用旧版本完成该会话，或取消后新建。
+1. 创建成功即渲染原始问题、首个模型质询和当前 Brief。
+2. 回复成功后用服务端返回的完整 `messages` 重绘，不在浏览器本地猜测追加结果。
+3. 新消息出现后滚动对话容器至末尾，但不抢走回答输入焦点。
+4. `READY_TO_CONFIRM` 时若无新问题，消息流保留历史，回答区隐藏，确认操作可见。
+5. `NEEDS_INPUT` 时用户仍可跳过回答、直接确认当前 Brief。
+6. 刷新恢复暂不新增 GET Intake API；本计划不扩大现有页面生命周期。服务端重启回放能力保持，但浏览器刷新后恢复当前 Intake 属独立需求。
+7. 所有动态文本继续通过 `textContent`/DOM 属性写入，禁止拼接未转义 HTML。
 
-此法避免破坏已落盘审计记录；若实现发现 serde 无法在不污染内部模型的情况下稳定输出新视图，再引入专用 `PublicIntakeSession`，而非改事件 schema。
+### 5.3 可访问性与响应式
 
-## 4. 文件影响范围
+- 对话区用 `role="log"`、`aria-live="polite"`、`aria-relevant="additions text"`。
+- 用户和模型不只靠颜色区分，须有可见角色名。
+- 选项仍使用原生 radio，文本回答仍有 `<label>`，错误状态保持可读。
+- 移动端单列：对话、回答、Brief、操作依次排列；桌面可用两列，但不嵌套卡片。
+- 对话区设稳定的 `max-height` 与滚动，不使长历史挤出确认操作。
 
-### 必改生产文件
+## 6. 实施步骤
 
-| 文件 | 最小改动 |
+### P0：锁定现状
+
+1. 记录当前 `IntakeResponse` JSON 字段及页面关键选择器。
+2. 运行现有 Web/Intake 定向测试，确保基线为绿。
+3. 增加失败测试：包含两轮问答的 session 必须投影为“原问、质询、回答、质询”的有序消息。
+
+完成判据：新增测试先因缺少 `messages` 失败，既有测试无回归。
+
+### P1：增加只读消息投影
+
+1. 在 `src/web.rs` 定义最小 `IntakeMessage` DTO 和纯投影函数。
+2. 将 `messages` 加入所有 Intake 响应，不改任何请求结构与路由。
+3. 覆盖首问、两轮、pending 末问、旧多问事件回放的顺序测试。
+4. 更新既有 API shape 断言，仅允许新增 `messages`。
+
+完成判据：Web 定向测试通过；创建、回复、重试、最小 Brief 均返回一致消息史。
+
+### P2：把 Intake 呈现改为对话流
+
+1. 用一个消息列表替换“只显示当前质询”的视觉区域。
+2. `renderSession` 先渲染 `session.messages`，再依据 `session.question` 渲染回答控件。
+3. 保留既有 `post()`、`act()`、confirm/cancel/retry/minimal-brief 调用，不复制 API 状态机。
+4. 将 Brief 标题明确为“当前 Brief”，并显示模型每轮更新后的最新值。
+5. 补 `role=log`、角色标签、移动端布局和长文本换行。
+
+完成判据：连续两轮后页面同时可见原问、两次模型质询、第一次用户回答及当前 Brief；所有既有按钮仍工作。
+
+### P3：回归与浏览器验收
+
+1. 运行格式、静态检查、全量测试及 release build。
+2. 用真实服务完成：创建、回答两轮、直接确认、进入 Research。
+3. 另验：首轮直接确认、第五问后待确认、失败重试、最小 Brief、取消。
+4. 在桌面与移动视口截图检查：消息顺序、长文本、滚动、按钮无重叠。
+5. 检查网络请求：回复体不含客户端提交的 Brief；确认仍携带当前 revision/hash。
+
+完成判据：质量门全绿，浏览器流程可见且无控制台错误；部署前保留验收记录。
+
+## 7. 测试矩阵
+
+| 场景 | 预期 |
 |---|---|
-| `src/intake.rs` | 单问题模型输出；五问计数；单答事件构造；`NEEDS_INPUT` 可确认；兼容旧事件回放；更新单元测试 |
-| `src/backend.rs` | 更新 `INTAKE_PROMPT` JSON 示例、单问规则与剩余额度约束；补 Prompt 断言 |
-| `src/app.rs` | `reply_intake` 改收单个答案；删除客户端 `edited_brief` 路径；保持失败重试、最小 Brief、确认恢复协议；更新服务测试 |
-| `src/web.rs` | reply DTO 改为 `answer: String`；映射新服务命令；更新 HTTP 测试及 400/409 断言 |
-| `src/web/index.html` | 单问题控件、单答提交、只读 Brief、问数显示、NEEDS_INPUT 确认；删除批答和客户端 Brief 编辑逻辑 |
+| 创建后模型提出一问 | 原始用户消息、模型质询、当前 Brief 同时可见 |
+| 回答一问后模型继续问 | 旧问答保留，新质询追加，Brief 更新 |
+| 模型不再提问 | 历史保留，回答区隐藏，可确认 |
+| `NEEDS_INPUT` 直接确认 | 不必回答当前问题，进入既有 Research |
+| 回答第五问 | 不产生第六问，历史完整，等待人工确认 |
+| stale revision/hash | 仍由服务端拒绝，页面显示错误，不伪造成功消息 |
+| 模型失败后重试 | 既有历史不丢，重试结果重绘 |
+| 使用最小 Brief | 消息史保留，Brief 更新为服务端结果 |
+| 旧多问 JSONL 回放 | 消息按问题顺序和 question_id 配对显示 |
+| 恶意文本 | 作为纯文本显示，不执行 HTML/脚本 |
+| 移动端长问答 | 可换行、可滚动、确认按钮不被遮挡 |
 
-### 视编译结果决定
-
-| 文件 | 触发条件 |
-|---|---|
-| `src/lib.rs` | 仅当公共 re-export 因删除/改名 `ClarificationAnswer` 或新增公共响应视图而需同步 |
-| `docs/web-search-architecture.md` | 实现发现契约不可行或原文歧义时先停工回修设计；正常实现不改 |
-
-### 明确不改
-
-`src/orchestration.rs`、`src/trace.rs`、`src/types.rs`、`src/store.rs`、`src/crawl.rs`、`src/search.rs`、部署文件及数据目录。
-
-预计改面：5 个生产文件，另 0–1 个 re-export 文件；无新依赖、无数据重写。
-
-## 5. 原子实施步骤
-
-### P0：锁定基线与 fixtures
-
-**依赖：** 无。
-
-1. 记录 `git status --short`、`git rev-parse HEAD`。
-2. 运行现有 Intake、App、Web 定向测试，保存真实测试数，不沿用旧文档数字。
-3. 先增加失败测试：模型数组输出被拒、每次单问、第五问封顶、NEEDS_INPUT 可确认、单答 API、客户端不能提交 `edited_brief`。
-
-**完成判据：** 新测试以预期原因失败；旧测试仍能区分回放兼容与新写入契约。
-
-**回滚：** 只删新增测试。
-
-### P1：收紧纯状态机
-
-**依赖：** P0。
-
-1. 将 `IntakeModelOutput.questions` 改为 `question: Option<ClarificationQuestion>`。
-2. 删除“每轮 3 问/最多 2 轮”控制；只保留 `MAX_TOTAL_QUESTIONS = 5`。
-3. 以已追加的 `clarification_asked` 问题总数计算 `questions_asked`；每次新事件至多含一个问题。
-4. 单答仅匹配唯一 pending ID；空答案、无 pending、多个遗留 pending、错误状态均机械拒绝。
-5. 第五问已展示后，后续回复仍调用模型修订 Brief，但不再接受新问题，并转 `READY_TO_CONFIRM`。
-6. 放宽确认前态为 `NEEDS_INPUT | READY_TO_CONFIRM`；仍校验 revision、hash 与 Brief 存在。
-7. 保持旧 `ClarificationAsked.questions`、`UserReplied.answers` reducer 可回放。
-
-**完成判据：** `cargo test --locked intake::tests` 全绿；包含 0、1、5、6 问边界，旧多问 JSONL fixture 可恢复。
-
-**风险门：** 若必须更改已落盘事件字段方能实现，停止 P1，不得静默升 schema。
-
-**回滚：** 回退 `src/intake.rs`；无数据副作用。
-
-### P2：更新 Prompt 与服务编排
-
-**依赖：** P1。
-
-1. `INTAKE_PROMPT` 改为 `question: object|null`，明示一次至多一问。
-2. `advance_intake` 输入继续传原问题、当前草案、完整问答史，并显式传剩余额度；模型不得自行决定突破五问。
-3. `reply_intake` 仅接一个 answer，由服务绑定当前问题并追加单元素 `UserReplied.answers`。
-4. 删除 HTTP 来源的 `edited_brief`；保留服务端生成最小 Brief 的纯函数及 `INTAKE_FAILED` 重试路径。
-5. 确认与 `prepare_confirmed_run` 不重写，只验证新增的 NEEDS_INPUT 路径仍复用原幂等协议。
-
-**完成判据：** Prompt shape 测试、App create/reply/confirm/cancel/recovery 测试全绿；确认前仍无 trace 和 snapshot。
-
-**回滚：** 同时回退 `src/backend.rs`、`src/app.rs`，恢复与 P1 之前一致的契约。
-
-### P3：切换 HTTP API
-
-**依赖：** P2。
-
-1. `ReplyIntakeRequest` 改为 `{revision, answer}`，保留 `deny_unknown_fields`。
-2. 空白 answer 返回 `400 invalid_request`；陈旧 revision 返回 `409 stale_brief`；状态冲突返回 `409 invalid_transition`。
-3. 响应改为当前 `question` 与 `questions_asked`；不得泄露内部 pending ID 列表之外的信息。
-4. 验证 NEEDS_INPUT 确认返回 `202 + run_id`，重复确认仍返回同一 run_id 或既有幂等语义。
-
-**完成判据：** Web handler 测试覆盖创建、逐答、提前确认、第五问、取消、失败、未知字段与 stale 请求。
-
-**回滚：** API 与 App 必须成对回退，禁止只回退一层造成半切换。
-
-### P4：切换 WebUI
-
-**依赖：** P3。
-
-1. 每次只渲染 `session.question`；选项外保留可访问的自定义文本输入。
-2. 提交一个 answer 后禁用按钮直至响应，避免重复 reply。
-3. `questions_asked / 5` 取代 `clarification_rounds`。
-4. Brief 全字段只读展示；移除组装并回传 `edited_brief` 的 JS。
-5. `NEEDS_INPUT` 与 `READY_TO_CONFIRM` 均显示确认；确认仍发送当前 revision/hash。
-6. `INTAKE_FAILED` 保留重试、服务端最小 Brief、取消入口；不把失败静默降级为研究。
-7. 保持键盘操作、label 关联、focus、错误提示与窄屏布局。
-
-**完成判据：** 浏览器手测清晰问题、两问后提前确认、五问封顶、取消、失败恢复五条流程；网络面板中 reply 仅含 revision/answer。
-
-**回滚：** UI 与 API 使用同一提交或同一部署批次；失败则整体回退镜像。
-
-### P5：全量回归与部署门
-
-**依赖：** P4。
-
-依次执行：
+## 8. 质量门与命令
 
 ```bash
 cargo fmt --all -- --check
+cargo test --locked web::tests
+cargo test --locked intake::tests
 cargo clippy --all-targets --all-features --locked -- -D warnings
-cargo test --locked
+cargo test --all-targets --all-features --locked
 cargo build --release --locked
 git diff --check
-git status --short
 ```
 
-另以临时 `TRACEABLE_SEARCH_DATA_DIR` 做进程级黑盒检查：
+浏览器验收必须使用实际 HTTP 服务，不以静态 HTML 截图代替。计划阶段不部署；实现验收全绿后，方可构建新镜像并切换现网。
 
-1. create 后仅有 Intake JSONL，无 trace；
-2. 每次 reply 只追加一组单问/单答事件；
-3. 第五问后为 `READY_TO_CONFIRM` 且无第六问；
-4. 第一问出现时直接 confirm 可启动；
-5. stale revision/hash 被拒；
-6. 重启后会话回放一致；
-7. confirm 后仅一个 `run_id`、一个 trace header；
-8. 旧多问 fixture 仍可读取且不会被新 API 错配回答。
+## 9. 风险与回退
 
-**完成判据：** 命令全为 0；黑盒八项全过；Git 差异仅含计划内文件且无凭据。
+- **消息错配**：只按 `question_id` 配对，并以旧多问 fixture 锁定兼容行为。
+- **API 兼容**：只新增响应字段，保留 `question` 及全部现有字段；旧客户端可忽略 `messages`。
+- **XSS**：消息文本仅经安全 DOM API 写入；不得用 `innerHTML` 渲染模型或用户内容。
+- **状态漂移**：前端每次以服务端完整响应重绘，不维护独立对话真相。
+- **部署回退**：改动不触及持久化格式；若 UI 回归，直接切回旧镜像即可，数据无需回滚。
 
-**回滚：** 发布前不改生产数据；发布后保留 Intake JSONL、trace 与 snapshots，回退上一镜像并暂停创建新 Intake，不删除审计记录。
+## 10. 完成定义
 
-## 6. 测试矩阵
+以下条件须同时满足：
 
-| 场景 | 关键断言 |
-|---|---|
-| 清晰问题 | `question=null`、`READY_TO_CONFIRM`、仍需人工确认 |
-| 首轮质询 | 仅一个 `question`、`questions_asked=1` |
-| 连续质询 | 每答一次最多新增一问，Brief revision 单调递增 |
-| 第五问 | `questions_asked=5`；答后无第六问且 READY |
-| 模型越界 | 数组/额外字段/第六问不能进入新日志 |
-| 提前确认 | NEEDS_INPUT 的当前 revision/hash 可确认 |
-| 陈旧确认 | 旧 revision 或 hash 为 409，不启动 Research |
-| 单答边界 | 空答、无 pending、多 pending 遗留状态均明确拒绝 |
-| 坏 JSON | 一次纠错；第二次失败写 `intake_failed` |
-| 失败恢复 | 重试或服务端最小 Brief 后仍须预览确认 |
-| 取消 | 任一非终态可取消，不启动 Research |
-| 重启回放 | 当前问题、问数、Brief、revision/hash 一致 |
-| 旧日志 | 旧批问批答事件可读；不改写原文件 |
-| 幂等确认 | 崩溃窗口与重复确认不产生第二 run_id |
-| UI | 单问题、只读 Brief、键盘可用、重复提交受抑制 |
+1. 用户能在单一消息流中看到原始问题、模型历次质询与自己的历次回答。
+2. 每次回答后当前 Brief 由模型更新并保持只读。
+3. 用户可在任一有效草案上确认并进入原 Research 流程。
+4. 五问上限、显式确认、revision/hash、失败恢复与幂等行为无变化。
+5. 仅 `src/web.rs`、`src/web/index.html` 及其就地测试发生必要修改；若扩面，须在实现前说明原因。
+6. 全部质量门与桌面/移动浏览器验收通过。
 
-## 7. 风险、依赖与回滚
+## 11. 推荐提交
 
-| 风险 | 防护 | 回滚 |
-|---|---|---|
-| 新 API 无法回答旧日志的多个 pending 问题 | 回放兼容但命令拒绝歧义；取消重建或旧版本处理 | 回退旧镜像，日志不动 |
-| `questions_asked` 被误算为回复数 | 从持久化 `clarification_asked.questions.len()` 求和 | 回退派生视图，不改事件 |
-| 第五答后模型仍返回问题 | 服务端硬截断；边界测试 | 回退状态机提交 |
-| NEEDS_INPUT 提前确认绕过一致性 | 仍强制当前 revision/hash 与完整 Brief | 禁用 UI 提前确认并回退对应提交 |
-| UI/API 半切换 | 同批部署、HTTP contract 测试 | 整体回退镜像 |
-| 删除客户端编辑影响失败恢复 | 保留服务端 `minimal_brief_event` 与显式重试 | 临时恢复旧 UI/API，不接受未校验草案 |
-| 日志 schema 被误改 | P1 风险门、旧 fixture、禁止原地重写 | 停工；恢复代码，保留日志 |
+最小改动宜合为一个提交：
 
-外部依赖仅为现有 strong model；模型输出不可信，所有数量、状态、revision/hash 约束均由 Rust 执行。
+```text
+fix: present research intake as a conversation
+```
 
-## 8. 推荐提交顺序
-
-1. `test: lock single-question intake contract`
-2. `intake: ask one question up to five times`
-3. `app: accept one clarification answer`
-4. `web: expose single-question intake api`
-5. `ui: render one intake question at a time`
-6. `docs: record intake migration and verification`
-
-每个提交须可编译、定向测试通过、无真实数据与凭据。部署只在 P5 全绿后进行。
+提交内同时包含响应投影、UI 与测试，避免出现“API 已变但页面未消费”的中间版本。文档计划可先独立提交；部署另行执行。

@@ -598,7 +598,15 @@ pub fn parse_model_attempt(
             "model parse attempt must be 1 or 2".into(),
         ));
     }
-    match parse_model_output(json, &session.original_question) {
+    let parsed = parse_model_output(json, &session.original_question).and_then(|output| {
+        if session.questions.is_empty() && output.ready_to_confirm {
+            return Err(IntakeError::InvalidEvent(
+                "initial model output must contain one clarification question".into(),
+            ));
+        }
+        Ok(output)
+    });
+    match parsed {
         Ok(output) => Ok(ModelParseOutcome::Accepted(output)),
         Err(error) if attempt == 1 => Ok(ModelParseOutcome::RetryCorrection {
             error: error.to_string(),
@@ -1211,6 +1219,21 @@ mod tests {
         assert!(matches!(
             confirmation_event(&state, 1, "sha256:stale", "run-1".into(), now()),
             Err(IntakeError::StaleContentHash { .. })
+        ));
+    }
+
+    #[test]
+    fn initial_ready_output_is_rejected_until_model_asks_a_question() {
+        let state = session();
+        let output = serde_json::json!({
+            "brief_draft": brief(),
+            "question": null,
+            "ready_to_confirm": true
+        });
+        assert!(matches!(
+            parse_model_attempt(&state, &output.to_string(), 1, now()).unwrap(),
+            ModelParseOutcome::RetryCorrection { error }
+                if error.contains("initial model output must contain one clarification question")
         ));
     }
 

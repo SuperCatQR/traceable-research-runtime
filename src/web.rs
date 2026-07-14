@@ -94,6 +94,40 @@ struct RevisionIntakeRequest {
 }
 
 #[derive(Serialize)]
+struct IntakeMessage<'a> {
+    role: &'static str,
+    kind: &'static str,
+    text: &'a str,
+}
+
+fn intake_messages(session: &IntakeSession) -> Vec<IntakeMessage<'_>> {
+    let mut messages = vec![IntakeMessage {
+        role: "user",
+        kind: "original_question",
+        text: &session.original_question,
+    }];
+    for question in &session.questions {
+        messages.push(IntakeMessage {
+            role: "assistant",
+            kind: "clarification",
+            text: &question.question,
+        });
+        if let Some(answer) = session
+            .answers
+            .iter()
+            .find(|answer| answer.question_id == question.id)
+        {
+            messages.push(IntakeMessage {
+                role: "user",
+                kind: "answer",
+                text: &answer.answer,
+            });
+        }
+    }
+    messages
+}
+
+#[derive(Serialize)]
 struct IntakeResponse<'a> {
     clarification_id: &'a str,
     original_question: &'a str,
@@ -102,6 +136,7 @@ struct IntakeResponse<'a> {
     brief_draft: Option<&'a ResearchBrief>,
     question: Option<&'a ClarificationQuestion>,
     questions_asked: usize,
+    messages: Vec<IntakeMessage<'a>>,
     content_hash: Option<&'a str>,
     failure: Option<&'a str>,
 }
@@ -116,6 +151,7 @@ impl<'a> From<&'a IntakeSession> for IntakeResponse<'a> {
             brief_draft: session.brief_draft.as_ref(),
             question: session.pending_questions().into_iter().next(),
             questions_asked: session.questions.len(),
+            messages: intake_messages(session),
             content_hash: session.content_hash.as_deref(),
             failure: session.failure.as_deref(),
         }
@@ -543,6 +579,7 @@ mod tests {
                 "clarification_id",
                 "content_hash",
                 "failure",
+                "messages",
                 "original_question",
                 "question",
                 "questions_asked",
@@ -551,6 +588,14 @@ mod tests {
             ]
             .into_iter()
             .collect()
+        );
+        assert_eq!(
+            response["messages"],
+            serde_json::json!([{
+                "role": "user",
+                "kind": "original_question",
+                "text": "What changed in Rust 2024?"
+            }])
         );
 
         let clarification_id = "ready-for-confirm";

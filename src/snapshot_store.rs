@@ -6,7 +6,8 @@ use chrono::{DateTime, Utc};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, params, types::Type};
 
 use crate::{
-    CrawlMeta, Result, SearchError, Snapshot, SnapshotRef, content_hash, snapshot_id, snapshot_ref,
+    CrawlMeta, ResearchError, Result, Snapshot, SnapshotRef, content_hash, snapshot_id,
+    snapshot_ref,
 };
 
 const SCHEMA: &str = r#"
@@ -46,7 +47,7 @@ impl SnapshotWriter {
     pub fn save(&mut self, snapshot: &Snapshot) -> Result<()> {
         validate_snapshot(snapshot)?;
         let crawl_meta_json = serde_json::to_string(&snapshot.crawl)
-            .map_err(|error| SearchError::InvalidSnapshot(format!("crawl metadata: {error}")))?;
+            .map_err(|error| ResearchError::InvalidSnapshot(format!("crawl metadata: {error}")))?;
 
         let tx = self.conn.transaction()?;
         tx.execute(
@@ -160,7 +161,7 @@ fn row_to_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<Snapshot> {
 fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
     let actual_hash = content_hash(&snapshot.body);
     if actual_hash != snapshot.content_hash {
-        return Err(SearchError::HashMismatch {
+        return Err(ResearchError::HashMismatch {
             reference: snapshot.snapshot_ref.to_string(),
             expected: snapshot.content_hash.clone(),
             actual: actual_hash,
@@ -169,7 +170,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
 
     let expected_id = snapshot_id(&snapshot.crawl.final_url, &snapshot.content_hash);
     if snapshot.snapshot_id != expected_id {
-        return Err(SearchError::InvalidSnapshot(format!(
+        return Err(ResearchError::InvalidSnapshot(format!(
             "snapshot_id: expected {expected_id}, got {}",
             snapshot.snapshot_id
         )));
@@ -177,7 +178,7 @@ fn validate_snapshot(snapshot: &Snapshot) -> Result<()> {
 
     let expected_ref = snapshot_ref(&snapshot.snapshot_id);
     if snapshot.snapshot_ref.as_str() != expected_ref {
-        return Err(SearchError::InvalidSnapshot(format!(
+        return Err(ResearchError::InvalidSnapshot(format!(
             "snapshot_ref: expected {expected_ref}, got {}",
             snapshot.snapshot_ref
         )));
@@ -272,7 +273,7 @@ mod tests {
 
         let reader = SnapshotReader::open(&db.0).unwrap();
         let error = reader.get(&snapshot.snapshot_ref).unwrap_err();
-        assert!(matches!(error, SearchError::HashMismatch { .. }));
+        assert!(matches!(error, ResearchError::HashMismatch { .. }));
         assert_eq!(error.error_class(), ErrorClass::Internal);
     }
 
@@ -323,7 +324,7 @@ mod tests {
         let mut writer = SnapshotWriter::open(&db.0).unwrap();
         assert!(matches!(
             writer.save(&snapshot).unwrap_err(),
-            SearchError::InvalidSnapshot(_)
+            ResearchError::InvalidSnapshot(_)
         ));
     }
 }

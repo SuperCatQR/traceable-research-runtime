@@ -2,15 +2,17 @@
 //! and the public-HTTP SSRF boundary shared by every page fetch.
 
 use std::{
+    io::Cursor,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
 use chrono::Utc;
+use quick_xml::de::from_reader as deserialize_xml;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::{Host, Url};
 
-use crate::{CrawlBodyKind, CrawlMeta, Result, SearchError, SearchResult, Snapshot};
+use crate::{CrawlBodyKind, CrawlMeta, ResearchError, Result, SearchResult, Snapshot};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const SEARCH_RETRY_DELAYS: [Duration; 4] = [
@@ -27,12 +29,12 @@ const BLOCKED_DOMAINS: &[&str] = &["talk-doubao.com.cn"];
 /// Accept only public HTTP(S) URLs. Every DNS answer is checked: a hostname with
 /// even one private/special address is rejected rather than gambling on which
 /// address the fetcher chooses.
-pub async fn validate_public_url(raw: &str) -> Result<Url> {
+pub async fn validate_public_web_url(raw: &str) -> Result<Url> {
     resolve_public_url(raw).await.map(|(url, _)| url)
 }
 
 async fn resolve_public_url(raw: &str) -> Result<(Url, Option<(String, Vec<SocketAddr>)>)> {
-    let url = Url::parse(raw).map_err(|error| SearchError::Ssrf {
+    let url = Url::parse(raw).map_err(|error| ResearchError::Ssrf {
         url: raw.to_owned(),
         reason: format!("invalid URL: {error}"),
     })?;
@@ -89,8 +91,8 @@ fn ensure_public(raw: &str, ip: IpAddr) -> Result<()> {
     }
 }
 
-fn ssrf(url: &str, reason: &str) -> SearchError {
-    SearchError::Ssrf {
+fn ssrf(url: &str, reason: &str) -> ResearchError {
+    ResearchError::Ssrf {
         url: url.to_owned(),
         reason: reason.to_owned(),
     }
@@ -135,7 +137,7 @@ fn http_client() -> Result<reqwest::Client> {
         .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
         .user_agent(concat!("traceable-search/", env!("CARGO_PKG_VERSION")))
         .build()
-        .map_err(|error| SearchError::Search {
+        .map_err(|error| ResearchError::Search {
             message: format!("HTTP client setup failed: {error}"),
         })
 }
@@ -149,7 +151,7 @@ fn pinned_page_client(raw: &str, pin: Option<(&str, &[SocketAddr])>) -> Result<r
     if let Some((domain, addresses)) = pin {
         builder = builder.resolve_to_addrs(domain, addresses);
     }
-    builder.build().map_err(|error| SearchError::Fetch {
+    builder.build().map_err(|error| ResearchError::Fetch {
         url: raw.to_owned(),
         reason: format!("HTTP client setup failed: {error}"),
     })
@@ -176,13 +178,13 @@ async fn fetch_public_page(raw: &str) -> Result<FetchedPage> {
                 .get(url.clone())
                 .send()
                 .await
-                .map_err(|error| SearchError::Fetch {
+                .map_err(|error| ResearchError::Fetch {
                     url: url.to_string(),
                     reason: error.to_string(),
                 })?;
         if response.status().is_redirection() {
             if redirect_count == MAX_REDIRECTS {
-                return Err(SearchError::Fetch {
+                return Err(ResearchError::Fetch {
                     url: url.to_string(),
                     reason: format!("more than {MAX_REDIRECTS} redirects"),
                 });
@@ -190,18 +192,18 @@ async fn fetch_public_page(raw: &str) -> Result<FetchedPage> {
             let location = response
                 .headers()
                 .get(reqwest::header::LOCATION)
-                .ok_or_else(|| SearchError::Fetch {
+                .ok_or_else(|| ResearchError::Fetch {
                     url: url.to_string(),
                     reason: "redirect has no Location header".into(),
                 })?
                 .to_str()
-                .map_err(|error| SearchError::Fetch {
+                .map_err(|error| ResearchError::Fetch {
                     url: url.to_string(),
                     reason: format!("invalid redirect Location header: {error}"),
                 })?;
             current = url
                 .join(location)
-                .map_err(|error| SearchError::Fetch {
+                .map_err(|error| ResearchError::Fetch {
                     url: url.to_string(),
                     reason: format!("invalid redirect target: {error}"),
                 })?
@@ -221,12 +223,16 @@ async fn fetch_public_page(raw: &str) -> Result<FetchedPage> {
 
 async fn read_page_body(mut response: reqwest::Response, url: &str) -> Result<String> {
     let mut body = Vec::new();
-    while let Some(chunk) = response.chunk().await.map_err(|error| SearchError::Fetch {
-        url: url.to_owned(),
-        reason: format!("failed to read response body: {error}"),
-    })? {
+    while let Some(chunk) = response
+        .chunk()
+        .await
+        .map_err(|error| ResearchError::Fetch {
+            url: url.to_owned(),
+            reason: format!("failed to read response body: {error}"),
+        })?
+    {
         if chunk.len() > MAX_PAGE_BYTES - body.len() {
-            return Err(SearchError::Fetch {
+            return Err(ResearchError::Fetch {
                 url: url.to_owned(),
                 reason: format!("response body exceeds {MAX_PAGE_BYTES} bytes"),
             });
@@ -299,26 +305,41 @@ fn sanitize_for_offline_crawl(html: &str) -> String {
 }
 
 /// Thin client for a self-hosted SearXNG instance configured with Bing only.
-pub struct SearxngClient {
-    client: reqwest::Client,
-    endpoint: Url,
+pub struct SearxngSearchClient {
+    http_client: reqwest::Client,
+    search_endpoint: Url,
+    bing_rss_endpoint: Url,
 }
 
-impl SearxngClient {
+impl SearxngSearchClient {
     pub fn new(base_url: &str) -> Result<Self> {
-        let endpoint = Url::parse(base_url)
+        let search_endpoint = Url::parse(base_url)
             .and_then(|base| base.join("search"))
-            .map_err(|error| SearchError::Search {
+            .map_err(|error| ResearchError::Search {
                 message: format!("invalid SearXNG endpoint: {error}"),
             })?;
         Ok(Self {
-            client: http_client()?,
-            endpoint,
+            http_client: http_client()?,
+            search_endpoint,
+            bing_rss_endpoint: Url::parse("https://www.bing.com/search?format=rss").map_err(
+                |error| ResearchError::Search {
+                    message: format!("invalid Bing RSS fallback endpoint: {error}"),
+                },
+            )?,
         })
     }
 
-    pub async fn search(&self, query: &str) -> Result<Vec<SearchResult>> {
-        self.search_with_delays(query, &SEARCH_RETRY_DELAYS).await
+    pub async fn search_web(&self, query: &str) -> Result<Vec<SearchResult>> {
+        match self.search_with_delays(query, &SEARCH_RETRY_DELAYS).await {
+            Ok(results) => Ok(results),
+            Err(searxng_error) => self.search_bing_rss(query).await.map_err(|bing_error| {
+                ResearchError::Search {
+                    message: format!(
+                        "SearXNG returned no usable result ({searxng_error}); Bing RSS fallback failed ({bing_error})"
+                    ),
+                }
+            }),
+        }
     }
 
     async fn search_with_delays(
@@ -327,12 +348,12 @@ impl SearxngClient {
         retry_delays: &[Duration],
     ) -> Result<Vec<SearchResult>> {
         if query.trim().is_empty() {
-            return Err(SearchError::Search {
+            return Err(ResearchError::Search {
                 message: "query is empty".into(),
             });
         }
-        let mut endpoint = self.endpoint.clone();
-        endpoint.query_pairs_mut().extend_pairs([
+        let mut search_url = self.search_endpoint.clone();
+        search_url.query_pairs_mut().extend_pairs([
             ("q", query),
             ("format", "json"),
             ("categories", "general"),
@@ -341,18 +362,18 @@ impl SearxngClient {
 
         for attempt in 0..=retry_delays.len() {
             let response = self
-                .client
-                .get(endpoint.clone())
+                .http_client
+                .get(search_url.clone())
                 .send()
                 .await
-                .map_err(|error| SearchError::Search {
+                .map_err(|error| ResearchError::Search {
                     message: error.to_string(),
                 })?;
             let status = response.status();
             let body = response
                 .bytes()
                 .await
-                .map_err(|error| SearchError::Search {
+                .map_err(|error| ResearchError::Search {
                     message: error.to_string(),
                 })?;
             if status == reqwest::StatusCode::TOO_MANY_REQUESTS || body_reports_rate_limit(&body) {
@@ -360,18 +381,44 @@ impl SearxngClient {
                     tokio::time::sleep(*delay).await;
                     continue;
                 }
-                return Err(SearchError::Search {
+                return Err(ResearchError::Search {
                     message: "SearXNG rate limit persisted after 4 retries".into(),
                 });
             }
             if !status.is_success() {
-                return Err(SearchError::Search {
+                return Err(ResearchError::Search {
                     message: format!("SearXNG returned HTTP {status}"),
                 });
             }
             return parse_searxng_results(query, &body);
         }
         unreachable!("search retry loop always returns")
+    }
+
+    async fn search_bing_rss(&self, query: &str) -> Result<Vec<SearchResult>> {
+        let mut url = self.bing_rss_endpoint.clone();
+        url.query_pairs_mut().append_pair("q", query);
+        let response =
+            self.http_client
+                .get(url)
+                .send()
+                .await
+                .map_err(|error| ResearchError::Search {
+                    message: error.to_string(),
+                })?;
+        let status = response.status();
+        let body = response
+            .bytes()
+            .await
+            .map_err(|error| ResearchError::Search {
+                message: error.to_string(),
+            })?;
+        if !status.is_success() {
+            return Err(ResearchError::Search {
+                message: format!("Bing RSS returned HTTP {status}"),
+            });
+        }
+        parse_bing_rss_results(query, &body)
     }
 }
 
@@ -410,7 +457,7 @@ struct SearxngResult {
 
 fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
     let raw: SearxngEnvelope =
-        serde_json::from_slice(body).map_err(|error| SearchError::Search {
+        serde_json::from_slice(body).map_err(|error| ResearchError::Search {
             message: format!("invalid SearXNG JSON: {error}"),
         })?;
     let results: Vec<_> = raw
@@ -426,7 +473,7 @@ fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> 
         })
         .collect();
     if results.is_empty() {
-        Err(SearchError::Search {
+        Err(ResearchError::Search {
             message: "SearXNG/Bing returned no valid result".into(),
         })
     } else {
@@ -434,54 +481,111 @@ fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> 
     }
 }
 
-/// Thin client for the crawl4ai `/crawl` API. The service endpoint may be on a
-/// private network; only the untrusted page URL is subject to the SSRF guard.
-pub struct CrawlClient {
-    client: reqwest::Client,
-    endpoint: Url,
-    token: String,
+#[derive(Deserialize)]
+struct BingRssEnvelope {
+    channel: BingRssChannel,
 }
 
-impl CrawlClient {
-    pub fn new(base_url: &str, token: impl Into<String>) -> Result<Self> {
-        let endpoint = Url::parse(base_url)
+#[derive(Deserialize)]
+struct BingRssChannel {
+    #[serde(default)]
+    item: Vec<BingRssItem>,
+}
+
+#[derive(Deserialize)]
+struct BingRssItem {
+    title: String,
+    link: String,
+    #[serde(default)]
+    description: String,
+}
+
+fn parse_bing_rss_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
+    let raw: BingRssEnvelope =
+        deserialize_xml(Cursor::new(body)).map_err(|error| ResearchError::Search {
+            message: format!("invalid Bing RSS XML: {error}"),
+        })?;
+    let results: Vec<_> = raw
+        .channel
+        .item
+        .into_iter()
+        .filter(|item| {
+            Url::parse(&item.link).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+        })
+        .take(10)
+        .enumerate()
+        .map(|(index, item)| {
+            SearchResult::new(
+                query,
+                item.title,
+                item.description,
+                item.link,
+                index as u32 + 1,
+            )
+        })
+        .collect();
+    if results.is_empty() {
+        return Err(ResearchError::Search {
+            message: "Bing RSS returned no valid result".into(),
+        });
+    }
+    Ok(results)
+}
+
+/// Thin client for the crawl4ai `/crawl` API. The service endpoint may be on a
+/// private network; only the untrusted page URL is subject to the SSRF guard.
+pub struct Crawl4AiSnapshotClient {
+    http_client: reqwest::Client,
+    crawl_endpoint: Url,
+    api_token: String,
+}
+
+impl Crawl4AiSnapshotClient {
+    pub fn new(base_url: &str, api_token: impl Into<String>) -> Result<Self> {
+        let crawl_endpoint = Url::parse(base_url)
             .and_then(|base| base.join("crawl"))
-            .map_err(|error| SearchError::Fetch {
+            .map_err(|error| ResearchError::Fetch {
                 url: base_url.to_owned(),
                 reason: format!("invalid crawl4ai endpoint: {error}"),
             })?;
         Ok(Self {
-            client: http_client()?,
-            endpoint,
-            token: token.into(),
+            http_client: http_client()?,
+            crawl_endpoint,
+            api_token: api_token.into(),
         })
     }
 
-    pub async fn crawl(&self, raw_url: &str) -> Result<Snapshot> {
+    pub async fn capture_web_snapshot(&self, raw_url: &str) -> Result<Snapshot> {
         let fetched = fetch_public_page(raw_url).await?;
         let offline_url = format!("raw:{}", sanitize_for_offline_crawl(&fetched.html));
-        let mut request = self.client.post(self.endpoint.clone()).json(&CrawlRequest {
-            urls: [offline_url.as_str()],
-        });
-        if !self.token.is_empty() {
-            request = request.bearer_auth(&self.token);
+        let mut request = self
+            .http_client
+            .post(self.crawl_endpoint.clone())
+            .json(&CrawlRequest {
+                urls: [offline_url.as_str()],
+            });
+        if !self.api_token.is_empty() {
+            request = request.bearer_auth(&self.api_token);
         }
-        let response = request.send().await.map_err(|error| SearchError::Fetch {
+        let response = request.send().await.map_err(|error| ResearchError::Fetch {
             url: raw_url.to_owned(),
             reason: error.to_string(),
         })?;
         let status = response.status();
         if !status.is_success() {
-            return Err(SearchError::Fetch {
+            return Err(ResearchError::Fetch {
                 url: raw_url.to_owned(),
                 reason: format!("crawl4ai returned HTTP {status}"),
             });
         }
         let envelope: CrawlEnvelope =
-            response.json().await.map_err(|error| SearchError::Fetch {
-                url: raw_url.to_owned(),
-                reason: format!("invalid crawl4ai response: {error}"),
-            })?;
+            response
+                .json()
+                .await
+                .map_err(|error| ResearchError::Fetch {
+                    url: raw_url.to_owned(),
+                    reason: format!("invalid crawl4ai response: {error}"),
+                })?;
         snapshot_from_crawl(raw_url, fetched.final_url, fetched.status, envelope)
     }
 }
@@ -528,12 +632,12 @@ fn snapshot_from_crawl(
         .results
         .drain(..)
         .next()
-        .ok_or_else(|| SearchError::Fetch {
+        .ok_or_else(|| ResearchError::Fetch {
             url: requested_url.to_owned(),
             reason: "crawl4ai returned no result".into(),
         })?;
     if !envelope.success || !result.success {
-        return Err(SearchError::Fetch {
+        return Err(ResearchError::Fetch {
             url: requested_url.to_owned(),
             reason: if result.error_message.is_empty() {
                 "crawl4ai reported failure".into()
@@ -548,7 +652,7 @@ fn snapshot_from_crawl(
         (&result.markdown.raw_markdown, CrawlBodyKind::RawMarkdown)
     };
     if selected_body.trim().is_empty() {
-        return Err(SearchError::Fetch {
+        return Err(ResearchError::Fetch {
             url: requested_url.to_owned(),
             reason: "crawl4ai returned empty markdown".into(),
         });
@@ -592,79 +696,82 @@ fn truncate_utf8(value: &str, max_bytes: usize) -> (String, bool) {
 
 /// Minimal OpenAI-compatible JSON client. Secrets stay in caller-owned runtime
 /// configuration and are never read from or written to the repository.
-pub struct StrongClient {
-    client: reqwest::Client,
-    endpoint: Url,
-    api_key: String,
-    model: String,
+pub struct OpenAiCompatibleModelClient {
+    http_client: reqwest::Client,
+    chat_completions_endpoint: Url,
+    model_api_key: String,
+    model_id: String,
 }
 
-impl StrongClient {
+impl OpenAiCompatibleModelClient {
     pub fn new(
-        base_url: &str,
-        api_key: impl Into<String>,
-        model: impl Into<String>,
+        api_base_url: &str,
+        model_api_key: impl Into<String>,
+        model_id: impl Into<String>,
     ) -> Result<Self> {
-        let endpoint = Url::parse(base_url)
+        let chat_completions_endpoint = Url::parse(api_base_url)
             .and_then(|base| base.join("chat/completions"))
-            .map_err(|error| SearchError::ModelCall {
+            .map_err(|error| ResearchError::ModelCall {
                 message: format!("invalid model endpoint: {error}"),
             })?;
         Ok(Self {
-            client: http_client()?,
-            endpoint,
-            api_key: api_key.into(),
-            model: model.into(),
+            http_client: http_client()?,
+            chat_completions_endpoint,
+            model_api_key: model_api_key.into(),
+            model_id: model_id.into(),
         })
     }
 
-    pub async fn complete_text(&self, system: &str, user: &str) -> Result<String> {
-        let mut request = self.client.post(self.endpoint.clone()).json(&ChatRequest {
-            model: &self.model,
-            messages: [
-                ChatMessage {
-                    role: "system",
-                    content: system,
+    pub async fn generate_text(&self, system_prompt: &str, user_prompt: &str) -> Result<String> {
+        let mut request = self
+            .http_client
+            .post(self.chat_completions_endpoint.clone())
+            .json(&ChatRequest {
+                model: &self.model_id,
+                messages: [
+                    ChatMessage {
+                        role: "system",
+                        content: system_prompt,
+                    },
+                    ChatMessage {
+                        role: "user",
+                        content: user_prompt,
+                    },
+                ],
+                response_format: ResponseFormat {
+                    kind: "json_object",
                 },
-                ChatMessage {
-                    role: "user",
-                    content: user,
-                },
-            ],
-            response_format: ResponseFormat {
-                kind: "json_object",
-            },
-        });
-        if !self.api_key.is_empty() {
-            request = request.bearer_auth(&self.api_key);
+            });
+        if !self.model_api_key.is_empty() {
+            request = request.bearer_auth(&self.model_api_key);
         }
         let response = request
             .send()
             .await
-            .map_err(|error| SearchError::ModelCall {
+            .map_err(|error| ResearchError::ModelCall {
                 message: error.to_string(),
             })?;
         let status = response.status();
         let body = response
             .text()
             .await
-            .map_err(|error| SearchError::ModelCall {
+            .map_err(|error| ResearchError::ModelCall {
                 message: error.to_string(),
             })?;
         if !status.is_success() {
-            return Err(SearchError::ModelCall {
+            return Err(ResearchError::ModelCall {
                 // Upstream bodies may echo secrets or prompts; status is diagnostic enough.
                 message: format!("model returned HTTP {status}"),
             });
         }
         let completion: ChatResponse =
-            serde_json::from_str(&body).map_err(|error| SearchError::ModelOutput {
+            serde_json::from_str(&body).map_err(|error| ResearchError::ModelOutput {
                 message: format!("invalid completion envelope: {error}"),
             })?;
         let content = completion
             .choices
             .first()
-            .ok_or_else(|| SearchError::ModelOutput {
+            .ok_or_else(|| ResearchError::ModelOutput {
                 message: "completion has no choice".into(),
             })?
             .message
@@ -673,9 +780,13 @@ impl StrongClient {
         Ok(content.to_owned())
     }
 
-    pub async fn complete_json<T: DeserializeOwned>(&self, system: &str, user: &str) -> Result<T> {
-        let content = self.complete_text(system, user).await?;
-        serde_json::from_str(&content).map_err(|error| SearchError::ModelOutput {
+    pub async fn generate_structured_output<T: DeserializeOwned>(
+        &self,
+        system_prompt: &str,
+        user_prompt: &str,
+    ) -> Result<T> {
+        let content = self.generate_text(system_prompt, user_prompt).await?;
+        serde_json::from_str(&content).map_err(|error| ResearchError::ModelOutput {
             message: format!("invalid JSON content: {error}"),
         })
     }
@@ -744,7 +855,11 @@ mod tests {
 
     async fn search_fixture(
         handler: axum::routing::MethodRouter<Arc<AtomicUsize>>,
-    ) -> (SearxngClient, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+    ) -> (
+        SearxngSearchClient,
+        Arc<AtomicUsize>,
+        tokio::task::JoinHandle<()>,
+    ) {
         let attempts = Arc::new(AtomicUsize::new(0));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/", listener.local_addr().unwrap());
@@ -752,7 +867,11 @@ mod tests {
             .route("/search", handler)
             .with_state(attempts.clone());
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
-        (SearxngClient::new(&base_url).unwrap(), attempts, server)
+        (
+            SearxngSearchClient::new(&base_url).unwrap(),
+            attempts,
+            server,
+        )
     }
 
     #[tokio::test]
@@ -790,7 +909,7 @@ mod tests {
             "https://talk-doubao.com.cn/",
             "https://www.talk-doubao.com.cn/login",
         ] {
-            let error = validate_public_url(url).await.unwrap_err();
+            let error = validate_public_web_url(url).await.unwrap_err();
             assert!(error.to_string().contains("domain is blocked"));
         }
         assert!(!BLOCKED_DOMAINS.contains(&"talk.doubao.com.cn"));
@@ -884,6 +1003,16 @@ mod tests {
     fn searxng_rejects_bad_json_and_empty_results() {
         assert!(parse_searxng_results("query", b"not json").is_err());
         assert!(parse_searxng_results("query", br#"{"results":[]}"#).is_err());
+    }
+
+    #[test]
+    fn bing_rss_fallback_maps_valid_items_and_rejects_empty_feeds() {
+        let feed = br#"<?xml version="1.0"?><rss><channel><item><title>Rust</title><link>https://www.rust-lang.org/</link><description>Language</description></item><item><title>Invalid</title><link>javascript:alert(1)</link></item></channel></rss>"#;
+        let results = parse_bing_rss_results("rust", feed).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(results[0].title, "Rust");
+        assert_eq!(results[0].rank, 1);
+        assert!(parse_bing_rss_results("rust", b"<rss><channel/></rss>").is_err());
     }
 
     #[test]

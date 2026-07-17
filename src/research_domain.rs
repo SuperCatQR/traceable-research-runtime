@@ -50,7 +50,7 @@ pub fn snapshot_id(final_url: &str, content_hash: &str) -> String {
 }
 
 /// `"snapshot:web/<snapshot_id>"` — the reference form carried through
-/// selection, Claims, and the trace (§3.3).
+/// selection, composed claims, and the trace (§3.3).
 #[must_use]
 pub fn snapshot_ref(snapshot_id: &str) -> String {
     format!("snapshot:web/{snapshot_id}")
@@ -65,6 +65,25 @@ pub const MAX_QUESTION_CHARS: usize = 10_000;
 pub const MAX_BRIEF_STRING_CHARS: usize = 4_000;
 pub const MAX_BRIEF_ARRAY_ITEMS: usize = 32;
 pub const MAX_BRIEF_ARRAY_ITEM_CHARS: usize = 2_000;
+pub const MIN_DECISION_RATIONALE_CHARS: usize = 8;
+pub const MAX_DECISION_RATIONALE_CHARS: usize = 480;
+
+pub fn validate_decision_rationale(value: &str) -> std::result::Result<(), String> {
+    let char_count = value.trim().chars().count();
+    if !(MIN_DECISION_RATIONALE_CHARS..=MAX_DECISION_RATIONALE_CHARS).contains(&char_count) {
+        return Err(format!(
+            "decision rationale must contain {MIN_DECISION_RATIONALE_CHARS}..={MAX_DECISION_RATIONALE_CHARS} characters"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RationaleAuditStatus {
+    LegacyUnverified,
+    RequiredAndValidated,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub struct ResearchScope {
@@ -226,23 +245,23 @@ fn hash_normalized_brief(brief: &ResearchBrief) -> String {
     format!("sha256:{}", hex::encode(hash.finalize()))
 }
 
-/// A confirmed brief has no mutable fields or setters. Construction verifies
-/// the exact hash displayed to the user; deserialization repeats that check.
+/// A frozen brief has no mutable fields or setters. Construction verifies the
+/// model-approved content hash; deserialization repeats that check.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub struct ConfirmedResearchBrief {
+pub struct FrozenResearchBrief {
     brief: ResearchBrief,
     clarification_id: String,
     content_hash: String,
-    confirmed_at: DateTime<Utc>,
+    frozen_at: DateTime<Utc>,
 }
 
-impl ConfirmedResearchBrief {
+impl FrozenResearchBrief {
     pub fn new(
         brief: ResearchBrief,
         expected_original_question: &str,
         clarification_id: String,
         expected_content_hash: &str,
-        confirmed_at: DateTime<Utc>,
+        frozen_at: DateTime<Utc>,
     ) -> std::result::Result<Self, BriefValidationError> {
         let brief = brief.normalized(expected_original_question)?;
         let actual = hash_normalized_brief(&brief);
@@ -259,7 +278,7 @@ impl ConfirmedResearchBrief {
             brief,
             clarification_id,
             content_hash: expected_content_hash.to_owned(),
-            confirmed_at,
+            frozen_at,
         })
     }
 
@@ -279,25 +298,25 @@ impl ConfirmedResearchBrief {
     }
 
     #[must_use]
-    pub const fn confirmed_at(&self) -> &DateTime<Utc> {
-        &self.confirmed_at
+    pub const fn frozen_at(&self) -> &DateTime<Utc> {
+        &self.frozen_at
     }
 }
 
 #[derive(Deserialize)]
-struct ConfirmedResearchBriefWire {
+struct FrozenResearchBriefWire {
     brief: ResearchBrief,
     clarification_id: String,
     content_hash: String,
-    confirmed_at: DateTime<Utc>,
+    frozen_at: DateTime<Utc>,
 }
 
-impl<'de> Deserialize<'de> for ConfirmedResearchBrief {
+impl<'de> Deserialize<'de> for FrozenResearchBrief {
     fn deserialize<D>(deserializer: D) -> std::result::Result<Self, D::Error>
     where
         D: serde::Deserializer<'de>,
     {
-        let wire = ConfirmedResearchBriefWire::deserialize(deserializer)?;
+        let wire = FrozenResearchBriefWire::deserialize(deserializer)?;
         let normalized = wire
             .brief
             .clone()
@@ -311,7 +330,7 @@ impl<'de> Deserialize<'de> for ConfirmedResearchBrief {
             &wire.brief.original_question,
             wire.clarification_id,
             &wire.content_hash,
-            wire.confirmed_at,
+            wire.frozen_at,
         )
         .map_err(serde::de::Error::custom)
     }
@@ -350,7 +369,7 @@ impl std::fmt::Display for SnapshotRef {
 /// One query the strong model emits per explore round, with the evidence gap
 /// it is meant to close (§5.1 schema; §7 query rationale).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Query {
+pub struct SearchQuery {
     pub query: String,
     pub gap: String,
 }
@@ -462,30 +481,88 @@ impl Snapshot {
 }
 
 /// Deterministic navigation material (title + first paragraph + URL) the strong
-/// model reads to pick pages. Explicitly *not* evidence — Claims cite the
+/// model reads to pick pages. Explicitly *not* evidence — composed claims cite the
 /// snapshot body, never the excerpt (§5.2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Excerpt {
+pub struct SnapshotNavigationExcerpt {
     pub snapshot_ref: SnapshotRef,
     pub content_hash: String,
     pub title: String,
     pub excerpt: String,
 }
 
-/// A single fact with the snapshot(s) it rests on. Every Claim must cite at
-/// least one `snapshot_ref` that was actually fed to the final call (§5.3 / §6
-/// v6); enforcement lives in P4, the shape is frozen here.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Claim {
-    pub text: String,
-    pub snapshot_refs: Vec<SnapshotRef>,
+/// Controls the balance between model knowledge and newly retrieved Web evidence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchAnswerStyle {
+    #[default]
+    WebFirst,
+    KnowledgeFirst,
 }
 
-/// The final answer: prose plus the Claims that source it (§5.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Answer {
+impl ResearchAnswerStyle {
+    #[must_use]
+    pub const fn knowledge_weight_percent(self) -> u8 {
+        match self {
+            Self::WebFirst => 20,
+            Self::KnowledgeFirst => 80,
+        }
+    }
+
+    #[must_use]
+    pub const fn web_weight_percent(self) -> u8 {
+        100 - self.knowledge_weight_percent()
+    }
+}
+
+/// A model-only answer generated before it can inspect this run's Web evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ModelKnowledgeDraft {
     pub answer: String,
-    pub claims: Vec<Claim>,
+    pub claims: Vec<String>,
+    pub uncertainty: String,
+    #[serde(default)]
+    pub basis_summary: String,
+}
+
+/// The declared provenance of a final answer claim.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResearchClaimOrigin {
+    ModelKnowledge,
+    #[default]
+    WebEvidence,
+}
+
+/// One final claim with an explicit provenance contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposedResearchClaim {
+    pub text: String,
+    #[serde(default)]
+    pub origin: ResearchClaimOrigin,
+    #[serde(default)]
+    pub snapshot_refs: Vec<SnapshotRef>,
+    #[serde(default)]
+    pub rationale: String,
+}
+
+/// The model's comparison of independent knowledge and selected Web evidence.
+#[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct ResearchAnswerComparison {
+    #[serde(default)]
+    pub agreements: Vec<String>,
+    #[serde(default)]
+    pub differences: Vec<String>,
+    pub synthesis_rationale: String,
+}
+
+/// The weighted final answer after reflection over both answer sources.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ComposedResearchAnswer {
+    pub answer: String,
+    pub claims: Vec<ComposedResearchClaim>,
+    #[serde(default)]
+    pub comparison: ResearchAnswerComparison,
 }
 
 #[cfg(test)]
@@ -547,17 +624,27 @@ mod tests {
     }
 
     #[test]
-    fn answer_json_roundtrips() {
-        let ans = Answer {
-            answer: "42".into(),
-            claims: vec![Claim {
-                text: "the answer".into(),
-                snapshot_refs: vec![SnapshotRef::from_id("d0790216187faeb6")],
-            }],
-        };
-        let json = serde_json::to_string(&ans).unwrap();
-        let back: Answer = serde_json::from_str(&json).unwrap();
-        assert_eq!(ans, back);
+    fn answer_styles_have_stable_weights_and_default() {
+        assert_eq!(
+            ResearchAnswerStyle::default(),
+            ResearchAnswerStyle::WebFirst
+        );
+        assert_eq!(ResearchAnswerStyle::WebFirst.knowledge_weight_percent(), 20);
+        assert_eq!(ResearchAnswerStyle::WebFirst.web_weight_percent(), 80);
+        assert_eq!(
+            ResearchAnswerStyle::KnowledgeFirst.knowledge_weight_percent(),
+            80
+        );
+        assert_eq!(ResearchAnswerStyle::KnowledgeFirst.web_weight_percent(), 20);
+    }
+
+    #[test]
+    fn decision_rationale_length_is_bounded_for_auditable_summaries() {
+        assert!(validate_decision_rationale("short").is_err());
+        assert!(validate_decision_rationale("A concise and reviewable reason.").is_ok());
+        assert!(
+            validate_decision_rationale(&"x".repeat(MAX_DECISION_RATIONALE_CHARS + 1)).is_err()
+        );
     }
 
     fn intake_brief() -> ResearchBrief {
@@ -642,32 +729,35 @@ mod tests {
     }
 
     #[test]
-    fn confirmed_research_brief_roundtrips_and_rejects_wrong_hash() {
+    fn frozen_research_brief_roundtrips_and_rejects_wrong_hash() {
         let brief = intake_brief();
         let hash = brief.content_hash().unwrap();
-        let confirmed_at = DateTime::parse_from_rfc3339("2026-07-11T10:00:00Z")
+        let frozen_at = DateTime::parse_from_rfc3339("2026-07-11T10:00:00Z")
             .unwrap()
             .with_timezone(&Utc);
-        let confirmed = ConfirmedResearchBrief::new(
+        let frozen = FrozenResearchBrief::new(
             brief.clone(),
             &brief.original_question,
             "clarification-1".into(),
             &hash,
-            confirmed_at,
+            frozen_at,
         )
         .unwrap();
-        let json = serde_json::to_string(&confirmed).unwrap();
-        let back: ConfirmedResearchBrief = serde_json::from_str(&json).unwrap();
-        assert_eq!(confirmed, back);
+        let json = serde_json::to_string(&frozen).unwrap();
+        let back: FrozenResearchBrief = serde_json::from_str(&json).unwrap();
+        assert_eq!(frozen, back);
         assert_eq!(back.brief(), &brief);
+        let value: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert!(value.get("frozen_at").is_some());
+        assert!(value.get("confirmed_at").is_none());
 
         assert!(matches!(
-            ConfirmedResearchBrief::new(
+            FrozenResearchBrief::new(
                 brief.clone(),
                 &brief.original_question,
                 "clarification-1".into(),
                 "sha256:wrong",
-                confirmed_at,
+                frozen_at,
             ),
             Err(BriefValidationError::ContentHashMismatch { .. })
         ));

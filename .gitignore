@@ -20,6 +20,12 @@ __pycache__/
 /target/
 /data/
 
+# Frontend demo artifacts
+/demo/node_modules/
+/demo/dist/
+/demo-host/target/
+/.playwright-cli/
+
 # dev scratch (detached build/test logs)
 /build_*.log
 /build_*.pid

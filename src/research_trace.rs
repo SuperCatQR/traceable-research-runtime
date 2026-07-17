@@ -11,10 +11,12 @@ use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    Claim, ConfirmedResearchBrief, ErrorClass, PipelineStage, Result, SearchError, SnapshotRef,
+    ComposedResearchClaim, ErrorClass, FrozenResearchBrief, ModelKnowledgeDraft,
+    RationaleAuditStatus, ResearchAnswerComparison, ResearchAnswerStyle, ResearchError,
+    ResearchStage, Result, SnapshotRef, validate_decision_rationale,
 };
 
-pub const TRACE_SCHEMA_VERSION: u32 = 3;
+pub const TRACE_SCHEMA_VERSION: u32 = 6;
 
 impl Default for TracePolicy {
     fn default() -> Self {
@@ -34,7 +36,7 @@ pub struct TracePolicy {
 }
 
 pub fn validate_trace_policy(policy: &TracePolicy) -> std::result::Result<(), String> {
-    use crate::orchestration::{
+    use crate::research_run::{
         MAX_EXPLORE_ROUNDS, MAX_SNAPSHOTS, MAX_STRONG_INPUT_TOKENS, MIN_EXPLORE_ROUNDS,
     };
 
@@ -60,9 +62,15 @@ pub fn validate_trace_policy(policy: &TracePolicy) -> std::result::Result<(), St
 pub struct RunHeader {
     pub run_id: String,
     pub clarification_id: String,
-    pub brief: ConfirmedResearchBrief,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn: Option<u64>,
+    pub brief: FrozenResearchBrief,
     pub started_at: DateTime<Utc>,
     pub policy: TracePolicy,
+    #[serde(default)]
+    pub answer_style: ResearchAnswerStyle,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -74,7 +82,17 @@ pub enum ReplayedRunHeader {
         started_at: DateTime<Utc>,
         policy: TracePolicy,
     },
-    V3(Box<RunHeader>),
+    V6(Box<RunHeader>),
+}
+
+impl ReplayedRunHeader {
+    #[must_use]
+    pub const fn rationale_audit_status(&self) -> RationaleAuditStatus {
+        match self {
+            Self::V6(_) => RationaleAuditStatus::RequiredAndValidated,
+            Self::Legacy { .. } => RationaleAuditStatus::LegacyUnverified,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -92,7 +110,7 @@ pub struct SourceSelection {
     pub reason: String,
 }
 
-/// Stable v2 trace contract. New fields/variants may be appended; old ones stay.
+/// Current v6 trace contract. New fields and variants require explicit schema validation.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum TraceEvent {
@@ -100,13 +118,19 @@ pub enum TraceEvent {
         schema_version: u32,
         run_id: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        turn: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         question: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         clarification_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
-        brief: Option<Box<ConfirmedResearchBrief>>,
+        brief: Option<Box<FrozenResearchBrief>>,
         started_at: DateTime<Utc>,
         policy: TracePolicy,
+        #[serde(default)]
+        answer_style: ResearchAnswerStyle,
     },
     ModelCall {
         operation: String,
@@ -117,7 +141,11 @@ pub enum TraceEvent {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         error_class: Option<ErrorClass>,
     },
-    Query {
+    KnowledgeDraft {
+        draft: ModelKnowledgeDraft,
+    },
+    #[serde(rename = "query")]
+    SearchQuery {
         round: u32,
         query: String,
         gap: String,
@@ -142,7 +170,8 @@ pub enum TraceEvent {
         reason: String,
         error_class: ErrorClass,
     },
-    Excerpt {
+    #[serde(rename = "excerpt")]
+    SnapshotNavigationExcerpt {
         snapshot_ref: SnapshotRef,
         content_hash: String,
         title: String,
@@ -151,13 +180,22 @@ pub enum TraceEvent {
     SnapshotSelection {
         selected: Vec<SourceSelection>,
     },
-    Claim {
+    #[serde(rename = "claim")]
+    ResearchClaim {
         text: String,
+        #[serde(default)]
+        origin: crate::ResearchClaimOrigin,
+        #[serde(default)]
         snapshot_refs: Vec<SnapshotRef>,
+        #[serde(default)]
+        rationale: String,
     },
-    Answer {
+    #[serde(rename = "answer")]
+    ComposedResearchAnswer {
         answer: String,
-        claims: Vec<Claim>,
+        claims: Vec<ComposedResearchClaim>,
+        #[serde(default)]
+        comparison: ResearchAnswerComparison,
     },
     RoundCompleted {
         round: u32,
@@ -166,7 +204,7 @@ pub enum TraceEvent {
     },
     RunFailed {
         error_class: ErrorClass,
-        stage: PipelineStage,
+        stage: ResearchStage,
         message: String,
     },
 }
@@ -176,25 +214,33 @@ pub struct RunReplay {
     pub completed_round: u32,
     pub previous_queries: Vec<String>,
     pub archived_snapshot_refs: Vec<SnapshotRef>,
+    pub model_knowledge_draft: Option<ModelKnowledgeDraft>,
 }
 
 /// Owns the only write direction: construction writes the mandatory first line,
 /// then `append` only adds subsequent events.
 pub struct TraceWriter<W: Write> {
     sink: W,
+    schema_version: u32,
 }
 
 impl<W: Write> TraceWriter<W> {
     pub fn new(sink: W, header: RunHeader) -> Result<Self> {
-        let mut writer = Self { sink };
+        let mut writer = Self {
+            sink,
+            schema_version: TRACE_SCHEMA_VERSION,
+        };
         writer.write_event(&TraceEvent::RunHeader {
             schema_version: TRACE_SCHEMA_VERSION,
             run_id: header.run_id,
+            session_id: header.session_id,
+            turn: header.turn,
             question: None,
             clarification_id: Some(header.clarification_id),
             brief: Some(Box::new(header.brief)),
             started_at: header.started_at,
             policy: header.policy,
+            answer_style: header.answer_style,
         })?;
         Ok(writer)
     }
@@ -202,26 +248,33 @@ impl<W: Write> TraceWriter<W> {
     // ponytail: test-only bridge for generating v1/v2 fixtures to verify legacy replay.
     #[cfg(test)]
     pub(crate) fn new_legacy(sink: W, header: LegacyRunHeader) -> Result<Self> {
-        let mut writer = Self { sink };
+        let mut writer = Self {
+            sink,
+            schema_version: 2,
+        };
         writer.write_event(&TraceEvent::RunHeader {
             schema_version: 2,
             run_id: header.run_id,
+            session_id: None,
+            turn: None,
             question: Some(header.question),
             clarification_id: None,
             brief: None,
             started_at: header.started_at,
             policy: header.policy,
+            answer_style: ResearchAnswerStyle::WebFirst,
         })?;
         Ok(writer)
     }
 
     pub fn append(&mut self, event: &TraceEvent) -> Result<()> {
         if matches!(event, TraceEvent::RunHeader { .. }) {
-            return Err(SearchError::Trace(std::io::Error::new(
+            return Err(ResearchError::Trace(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "run_header is only valid as the first trace line",
             )));
         }
+        validate_trace_event_for_schema(self.schema_version, event)?;
         self.write_event(event)
     }
 
@@ -250,33 +303,34 @@ impl TraceWriter<BufWriter<File>> {
         Self::new(BufWriter::new(file), header)
     }
 
-    /// Reopens only a matching, non-terminal v3 trace and returns its last committed round.
+    /// Reopens only a matching, non-terminal v6 trace and returns its last committed round.
     pub(crate) fn resume(
         trace_dir: impl AsRef<Path>,
         header: &RunHeader,
     ) -> Result<(Self, RunReplay)> {
         validate_run_id(&header.run_id)?;
         let path = trace_dir.as_ref().join(format!("{}.jsonl", header.run_id));
-        let replay = replay_run(&path, header)?;
+        let (replay, schema_version) = replay_run(&path, header)?;
         let file = OpenOptions::new().append(true).open(path)?;
         Ok((
             Self {
                 sink: BufWriter::new(file),
+                schema_version,
             },
             replay,
         ))
     }
 }
 
-fn replay_run(path: &Path, expected: &RunHeader) -> Result<RunReplay> {
-    match replay_run_header(path)? {
-        ReplayedRunHeader::V3(existing) if existing.as_ref() == expected => {}
+fn replay_run(path: &Path, expected: &RunHeader) -> Result<(RunReplay, u32)> {
+    let schema_version = match replay_run_header(path)? {
+        ReplayedRunHeader::V6(existing) if existing.as_ref() == expected => TRACE_SCHEMA_VERSION,
         _ => {
             return Err(invalid_trace(
-                "existing trace header does not match confirmed run",
+                "existing trace header does not match frozen run",
             ));
         }
-    }
+    };
 
     let contents = fs::read_to_string(path)?;
     if !contents.ends_with('\n') {
@@ -292,6 +346,7 @@ fn replay_run(path: &Path, expected: &RunHeader) -> Result<RunReplay> {
         }
         let event: TraceEvent = serde_json::from_str(line)
             .map_err(|error| invalid_trace(format!("line {}: {error}", index + 1)))?;
+        validate_trace_event_for_schema(schema_version, &event)?;
         match event {
             TraceEvent::RoundCompleted {
                 round,
@@ -305,18 +360,24 @@ fn replay_run(path: &Path, expected: &RunHeader) -> Result<RunReplay> {
                     completed_round: round,
                     previous_queries,
                     archived_snapshot_refs,
+                    model_knowledge_draft: replay.model_knowledge_draft,
                 };
+            }
+            TraceEvent::KnowledgeDraft { draft } => {
+                if replay.model_knowledge_draft.replace(draft).is_some() {
+                    return Err(invalid_trace("trace contains multiple knowledge drafts"));
+                }
             }
             TraceEvent::RunHeader { .. } => {
                 return Err(invalid_trace("duplicate run_header"));
             }
-            TraceEvent::Answer { .. } | TraceEvent::RunFailed { .. } => {
+            TraceEvent::ComposedResearchAnswer { .. } | TraceEvent::RunFailed { .. } => {
                 return Err(invalid_trace("trace is already terminal"));
             }
             _ => {}
         }
     }
-    Ok(replay)
+    Ok((replay, schema_version))
 }
 
 pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
@@ -325,25 +386,45 @@ pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
     if bytes == 0 || !first_line.ends_with('\n') {
         return Err(invalid_trace("missing or truncated run_header"));
     }
-    let event: TraceEvent = serde_json::from_str(first_line.trim_end())
+    let raw_header: serde_json::Value = serde_json::from_str(first_line.trim_end())
         .map_err(|error| invalid_trace(error.to_string()))?;
+    let declared_schema_version = raw_header
+        .get("schema_version")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|value| (value <= u64::from(u32::MAX)).then_some(value as u32))
+        .ok_or_else(|| invalid_trace("run_header schema_version must be a u32"))?;
+    if !matches!(declared_schema_version, 1 | 2 | TRACE_SCHEMA_VERSION) {
+        return Err(invalid_trace(format!(
+            "unsupported trace schema version {declared_schema_version}"
+        )));
+    }
+    let event: TraceEvent =
+        serde_json::from_value(raw_header).map_err(|error| invalid_trace(error.to_string()))?;
     let TraceEvent::RunHeader {
         schema_version,
         run_id,
+        session_id,
+        turn,
         question,
         clarification_id,
         brief,
         started_at,
         policy,
+        answer_style,
     } = event
     else {
         return Err(invalid_trace("first trace event is not run_header"));
     };
+    if schema_version != declared_schema_version {
+        return Err(invalid_trace(
+            "run_header schema_version changed while decoding",
+        ));
+    }
     validate_run_id(&run_id)?;
     validate_trace_policy(&policy).map_err(invalid_trace)?;
     match schema_version {
-        1 | 2 => match (question, clarification_id, brief) {
-            (Some(question), None, None) => Ok(ReplayedRunHeader::Legacy {
+        1 | 2 => match (session_id, turn, question, clarification_id, brief) {
+            (None, None, Some(question), None, None) => Ok(ReplayedRunHeader::Legacy {
                 schema_version,
                 run_id,
                 question,
@@ -352,19 +433,25 @@ pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
             }),
             _ => Err(invalid_trace("invalid legacy run_header fields")),
         },
-        TRACE_SCHEMA_VERSION => match (question, clarification_id, brief) {
-            (None, Some(clarification_id), Some(brief))
-                if clarification_id == brief.clarification_id() =>
+        TRACE_SCHEMA_VERSION => match (session_id, turn, question, clarification_id, brief) {
+            (session_id, turn, None, Some(clarification_id), Some(brief))
+                if clarification_id == brief.clarification_id()
+                    && session_id.is_some() == turn.is_some()
+                    && !matches!(turn, Some(0)) =>
             {
-                Ok(ReplayedRunHeader::V3(Box::new(RunHeader {
+                let header = Box::new(RunHeader {
                     run_id,
                     clarification_id,
+                    session_id,
+                    turn,
                     brief: *brief,
                     started_at,
                     policy,
-                })))
+                    answer_style,
+                });
+                Ok(ReplayedRunHeader::V6(header))
             }
-            _ => Err(invalid_trace("invalid v3 run_header fields")),
+            _ => Err(invalid_trace("invalid current run_header fields")),
         },
         version => Err(invalid_trace(format!(
             "unsupported trace schema version {version}"
@@ -372,8 +459,37 @@ pub fn replay_run_header(path: impl AsRef<Path>) -> Result<ReplayedRunHeader> {
     }
 }
 
-fn invalid_trace(message: impl Into<String>) -> SearchError {
-    SearchError::Trace(std::io::Error::new(
+pub fn validate_trace_event_for_schema(schema_version: u32, event: &TraceEvent) -> Result<()> {
+    if schema_version != TRACE_SCHEMA_VERSION {
+        return Ok(());
+    }
+
+    let validate = |rationale: &str| validate_decision_rationale(rationale).map_err(invalid_trace);
+    match event {
+        TraceEvent::KnowledgeDraft { draft } => validate(&draft.basis_summary),
+        TraceEvent::SearchQuery { gap, .. } => validate(gap),
+        TraceEvent::SnapshotSelection { selected } => {
+            for selection in selected {
+                validate(&selection.reason)?;
+            }
+            Ok(())
+        }
+        TraceEvent::ResearchClaim { rationale, .. } => validate(rationale),
+        TraceEvent::ComposedResearchAnswer {
+            claims, comparison, ..
+        } => {
+            validate(&comparison.synthesis_rationale)?;
+            for claim in claims {
+                validate(&claim.rationale)?;
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+fn invalid_trace(message: impl Into<String>) -> ResearchError {
+    ResearchError::Trace(std::io::Error::new(
         std::io::ErrorKind::InvalidData,
         message.into(),
     ))
@@ -386,7 +502,7 @@ fn validate_run_id(run_id: &str) -> Result<()> {
         || run_id == ".."
         || path.file_name() != Some(OsStr::new(run_id))
     {
-        return Err(SearchError::Trace(std::io::Error::new(
+        return Err(ResearchError::Trace(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             "run_id must be one non-empty file-name component",
         )));
@@ -415,18 +531,20 @@ mod tests {
             accepted_assumptions: Vec::new(),
         };
         let content_hash = brief.content_hash().unwrap();
-        let confirmed_at = Utc.with_ymd_and_hms(2026, 7, 11, 9, 59, 0).unwrap();
-        let brief = ConfirmedResearchBrief::new(
+        let frozen_at = Utc.with_ymd_and_hms(2026, 7, 11, 9, 59, 0).unwrap();
+        let brief = FrozenResearchBrief::new(
             brief,
             "original question",
             "clarification-test".into(),
             &content_hash,
-            confirmed_at,
+            frozen_at,
         )
         .unwrap();
         RunHeader {
             run_id: run_id.into(),
             clarification_id: "clarification-test".into(),
+            session_id: None,
+            turn: None,
             brief,
             started_at: Utc.with_ymd_and_hms(2026, 7, 11, 10, 0, 0).unwrap(),
             policy: TracePolicy {
@@ -434,6 +552,7 @@ mod tests {
                 input_budget: 800_000,
                 max_snapshots: 300,
             },
+            answer_style: ResearchAnswerStyle::WebFirst,
         }
     }
 
@@ -441,7 +560,7 @@ mod tests {
     fn header_is_first_and_events_are_jsonl() {
         let mut writer = TraceWriter::new(Vec::new(), header("r-test")).unwrap();
         writer
-            .append(&TraceEvent::Query {
+            .append(&TraceEvent::SearchQuery {
                 round: 1,
                 query: "rust sqlite".into(),
                 gap: "need primary source".into(),
@@ -468,6 +587,8 @@ mod tests {
             lines[0]["brief"]["brief"]["original_question"],
             "original question"
         );
+        assert!(lines[0]["brief"]["frozen_at"].is_string());
+        assert!(lines[0]["brief"].get("confirmed_at").is_none());
         assert_eq!(lines[1]["type"], "query");
         assert_eq!(lines[2]["type"], "archive_skip");
         assert_eq!(lines[2]["error_class"], "external");
@@ -548,13 +669,100 @@ mod tests {
     fn successful_run_has_no_failed_terminal_event() {
         let mut writer = TraceWriter::new(Vec::new(), header("r-success")).unwrap();
         writer
-            .append(&TraceEvent::Answer {
+            .append(&TraceEvent::ComposedResearchAnswer {
                 answer: "grounded".into(),
                 claims: Vec::new(),
+                comparison: ResearchAnswerComparison {
+                    synthesis_rationale: "The final answer uses the requested evidence weighting."
+                        .into(),
+                    ..ResearchAnswerComparison::default()
+                },
             })
             .unwrap();
         let trace = String::from_utf8(writer.into_inner()).unwrap();
         assert!(!trace.contains("\"type\":\"run_failed\""));
+    }
+
+    #[test]
+    fn current_trace_writer_requires_each_decision_rationale() {
+        let mut writer = TraceWriter::new(Vec::new(), header("r-rationale-contract")).unwrap();
+        assert!(
+            writer
+                .append(&TraceEvent::KnowledgeDraft {
+                    draft: ModelKnowledgeDraft {
+                        answer: "knowledge".into(),
+                        claims: vec!["claim".into()],
+                        uncertainty: "uncertain".into(),
+                        basis_summary: String::new(),
+                    },
+                })
+                .is_err()
+        );
+        assert!(
+            writer
+                .append(&TraceEvent::SearchQuery {
+                    round: 1,
+                    query: "query".into(),
+                    gap: String::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            writer
+                .append(&TraceEvent::SnapshotSelection {
+                    selected: vec![SourceSelection {
+                        snapshot_ref: SnapshotRef("snapshot:web/rationale".into()),
+                        reason: String::new(),
+                    }],
+                })
+                .is_err()
+        );
+        assert!(
+            writer
+                .append(&TraceEvent::ResearchClaim {
+                    text: "claim".into(),
+                    origin: crate::ResearchClaimOrigin::ModelKnowledge,
+                    snapshot_refs: Vec::new(),
+                    rationale: String::new(),
+                })
+                .is_err()
+        );
+        assert!(
+            writer
+                .append(&TraceEvent::ComposedResearchAnswer {
+                    answer: "answer".into(),
+                    claims: vec![ComposedResearchClaim {
+                        text: "claim".into(),
+                        origin: crate::ResearchClaimOrigin::ModelKnowledge,
+                        snapshot_refs: Vec::new(),
+                        rationale: "The draft remains useful context for this answer.".into(),
+                    }],
+                    comparison: ResearchAnswerComparison::default(),
+                })
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn obsolete_v5_trace_schema_is_rejected_before_decoding_its_brief() {
+        let nonce = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "traceable-search-v5-obsolete-{}-{nonce}",
+            std::process::id()
+        ));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("r-v5-obsolete.jsonl");
+        fs::write(&path, "{\"type\":\"run_header\",\"schema_version\":5}\n").unwrap();
+        let error = replay_run_header(&path).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported trace schema version 5")
+        );
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -602,7 +810,7 @@ mod tests {
             })
             .unwrap();
         writer
-            .append(&TraceEvent::Query {
+            .append(&TraceEvent::SearchQuery {
                 round: 2,
                 query: "uncommitted query".into(),
                 gap: "uncommitted gap".into(),
@@ -632,9 +840,14 @@ mod tests {
         let terminal = header("r-terminal");
         let mut writer = TraceWriter::create(&dir, terminal.clone()).unwrap();
         writer
-            .append(&TraceEvent::Answer {
+            .append(&TraceEvent::ComposedResearchAnswer {
                 answer: "done".into(),
                 claims: Vec::new(),
+                comparison: ResearchAnswerComparison {
+                    synthesis_rationale: "The final answer uses the requested evidence weighting."
+                        .into(),
+                    ..ResearchAnswerComparison::default()
+                },
             })
             .unwrap();
         drop(writer);
@@ -658,11 +871,14 @@ mod tests {
         let duplicate = TraceEvent::RunHeader {
             schema_version: TRACE_SCHEMA_VERSION,
             run_id: "r-other".into(),
+            session_id: None,
+            turn: None,
             question: None,
             clarification_id: Some(unused.clarification_id),
             brief: Some(Box::new(unused.brief)),
             started_at: Utc::now(),
             policy: unused.policy,
+            answer_style: unused.answer_style,
         };
         assert!(writer.append(&duplicate).is_err());
     }

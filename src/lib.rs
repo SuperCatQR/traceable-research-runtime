@@ -1,48 +1,66 @@
 //! traceable-search — an auditable web-research pipeline.
 //!
-//! Design is frozen in `docs/web-search-architecture.md`. The build lands in phases:
-//! P1 domain types + `error_class`, P2 dual persistence (snapshot.sqlite + trace JSONL),
-//! P3 external adapters (Bing / crawl4ai / strong model) behind an SSRF guard,
-//! P4 orchestration (fixed 3-round explore + synthesize; three pure functions),
-//! P5 program validations + E2E.
+//! The current design is documented in `docs/web-search-architecture.md`: a model-led
+//! conversation freezes an internal research brief, then a bounded research run records
+//! snapshots and review-safe trace events.
 //!
 //! The crate is library-only; pure functions remain fixture-testable without a transport runtime.
 
-pub mod adapters;
-pub mod app;
-pub mod backend;
-pub mod error;
-pub mod intake;
-pub mod orchestration;
-pub mod snapshot;
-pub mod trace;
-pub mod types;
+pub mod clarification;
+pub mod conversation;
+pub mod external_adapters;
+pub mod live_research_backend;
+pub mod research_domain;
+pub mod research_error;
+pub mod research_run;
+pub mod research_trace;
+pub mod runtime;
+pub mod snapshot_store;
 
 // Flat public surface: downstream phases import from the crate root, not deep
 // module paths.
-pub use adapters::{CrawlClient, SearxngClient, StrongClient, validate_public_url};
-pub use app::{
-    AppConfig, IntakeCommandError, PrepareRunError, PreparedRun, PublicAnswer, PublicClaim,
-    PublicSource, ResearchService,
+pub use clarification::{
+    CLARIFICATION_EVENT_SCHEMA_VERSION, ClarificationDecision, ClarificationError,
+    ClarificationEvent, ClarificationEventKind, ClarificationEventLog, ClarificationLocks,
+    ClarificationModelOutput, ClarificationModelParseOutcome, ClarificationResult,
+    ClarificationState, ClarificationStatus, DialogueMessage, DialogueRole,
+    clarification_cancelled_event, clarification_model_request_failed_event,
+    clarification_user_message_event, events_from_clarification_model_output,
+    parse_clarification_model_attempt, parse_clarification_model_output,
+    reduce_clarification_event, replay_clarification,
+    research_run_prepared_event_with_answer_style,
 };
-pub use backend::{
-    INTAKE_FINAL_PROMPT, INTAKE_PROMPT, LiveBackend, PLAN_PROMPT, SELECT_PROMPT, SYNTHESIZE_PROMPT,
+pub use conversation::{
+    CONVERSATION_EVENT_SCHEMA_VERSION, CompletedResearchTurn, CompletedTurnContext,
+    ConversationError, ConversationEvent, ConversationEventKind, ConversationEventLog,
+    ConversationLocks, ConversationResult, ResearchConversation, UnansweredResearchTurn,
+    reduce_conversation_event, replay_conversation,
 };
-pub use error::{ErrorClass, PipelineStage, Result, SearchError};
-pub use intake::{
-    ClarificationAnswer, ClarificationQuestion, INTAKE_EVENT_SCHEMA_VERSION, IntakeDecision,
-    IntakeError, IntakeEvent, IntakeEventKind, IntakeLog, IntakeModelOutput, IntakeResult,
-    IntakeSession, IntakeSessionLocks, IntakeStatus, MAX_TOTAL_QUESTIONS, ModelParseOutcome,
-    cancellation_event, confirmation_event, events_for_model_output, parse_model_attempt,
-    parse_model_output, reduce_intake_event, replay_intake, run_prepared_event, user_reply_event,
+pub use external_adapters::{
+    Crawl4AiSnapshotClient, OpenAiCompatibleModelClient, SearxngSearchClient,
+    validate_public_web_url,
 };
-pub use snapshot::{SnapshotReader, SnapshotWriter};
-pub use trace::{
+pub use live_research_backend::{
+    CLARIFICATION_PROMPT, EVIDENCE_SELECTION_PROMPT, LiveResearchBackend,
+    MODEL_KNOWLEDGE_DRAFT_PROMPT, REFLECTIVE_COMPOSITION_PROMPT, SEARCH_QUERY_PLANNING_PROMPT,
+};
+pub use research_domain::{
+    BriefValidationError, ComposedResearchAnswer, ComposedResearchClaim, CrawlBodyKind, CrawlMeta,
+    FrozenResearchBrief, MAX_DECISION_RATIONALE_CHARS, MIN_DECISION_RATIONALE_CHARS,
+    ModelKnowledgeDraft, RESEARCH_BRIEF_SCHEMA_VERSION, RationaleAuditStatus,
+    ResearchAnswerComparison, ResearchAnswerStyle, ResearchBrief, ResearchClaimOrigin,
+    ResearchScope, SearchQuery, SearchResult, Snapshot, SnapshotNavigationExcerpt, SnapshotRef,
+    content_hash, search_result_id, snapshot_id, snapshot_ref, validate_decision_rationale,
+};
+pub use research_error::{ErrorClass, ResearchError, ResearchStage, Result};
+pub use research_trace::{
     ReplayedRunHeader, RunHeader, RunReplay, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent,
-    TracePolicy, TraceWriter, replay_run_header, validate_trace_policy,
+    TracePolicy, TraceWriter, replay_run_header, validate_trace_event_for_schema,
+    validate_trace_policy,
 };
-pub use types::{
-    Answer, BriefValidationError, Claim, ConfirmedResearchBrief, CrawlBodyKind, CrawlMeta, Excerpt,
-    Query, RESEARCH_BRIEF_SCHEMA_VERSION, ResearchBrief, ResearchScope, SearchResult, Snapshot,
-    SnapshotRef, content_hash, search_result_id, snapshot_id, snapshot_ref,
+pub use runtime::{
+    EvidenceSourceResponse, ModelAccessConfig, PreparedResearchRun, ResearchAnswerResponse,
+    ResearchClaimResponse, ResearchInfrastructureConfig, ResearchPreparationError,
+    ResearchRuntimeError, TraceableResearchRuntime,
 };
+pub use snapshot_store::{SnapshotReader, SnapshotWriter};

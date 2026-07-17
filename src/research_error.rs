@@ -25,7 +25,7 @@ pub enum ErrorClass {
 /// Fatal boundary at which a pipeline error occurred.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum PipelineStage {
+pub enum ResearchStage {
     Setup,
     Planning,
     Search,
@@ -41,7 +41,7 @@ pub enum PipelineStage {
 /// failures retain this typed form. Every variant maps to a specific program
 /// validation (§6) or failure mode (§8.1), and `error_class` pins its attribution.
 #[derive(Debug, thiserror::Error)]
-pub enum SearchError {
+pub enum ResearchError {
     /// SearXNG/Bing search failed: HTTP, JSON parse, or an empty result
     /// set for the query.
     #[error("search failed: {message}")]
@@ -69,7 +69,7 @@ pub enum SearchError {
 
     /// The model referenced an id that does not belong to this run: a
     /// `search_result_id` for archiving, or a `snapshot_ref` for selection or
-    /// a Claim (§6 validations 2, 5, 6).
+    /// a composed research claim (§6 validations 2, 5, 6).
     #[error("reference not in this run: {reference}")]
     RefNotInRun { reference: String },
 
@@ -78,6 +78,15 @@ pub enum SearchError {
     /// legitimate refusal driven by the outside world, hence external.
     #[error("no usable source to answer from")]
     NoUsableSource,
+
+    /// A prior execution durably ended with `run_failed`; replay preserves the
+    /// original public class, stage, and message.
+    #[error("persisted {error_class:?} failure at {stage:?}: {message}")]
+    PersistedFailure {
+        error_class: ErrorClass,
+        stage: ResearchStage,
+        message: String,
+    },
 
     /// Runtime construction or configuration failed before the pipeline began.
     #[error("setup failed: {message}")]
@@ -106,32 +115,31 @@ pub enum SearchError {
 
     /// Appending to the append-only trace log failed — file I/O, or serializing
     /// one of our own events. Our audit layer, so internal (§8.1).
-    // ponytail: `#[from] io::Error` claims *every* crate io::Error as a trace
-    // failure. True in P2 (io only arises in trace.rs); if a non-trace io path
-    // appears later (e.g. reading a local fixture), split this variant then.
+    // `#[from] io::Error` treats every current crate I/O error as a trace failure.
+    // Split this variant if another file-backed boundary is introduced.
     #[error("trace write failed: {0}")]
     Trace(#[from] std::io::Error),
 
     /// A fatal error annotated at its orchestration boundary.
     #[error("{source}")]
     Staged {
-        stage: PipelineStage,
+        stage: ResearchStage,
         #[source]
-        source: Box<SearchError>,
+        source: Box<ResearchError>,
     },
 
     /// Recording `run_failed` itself failed. Both failures remain inspectable.
     #[error("failed to record pipeline error ({original}): {trace}")]
     FailureTrace {
-        original: Box<SearchError>,
-        trace: Box<SearchError>,
+        original: Box<ResearchError>,
+        trace: Box<ResearchError>,
     },
 }
 
-impl SearchError {
+impl ResearchError {
     /// Attach the first (most specific) fatal pipeline boundary.
     #[must_use]
-    pub fn at(self, stage: PipelineStage) -> Self {
+    pub fn at(self, stage: ResearchStage) -> Self {
         if matches!(self, Self::Staged { .. } | Self::FailureTrace { .. }) {
             self
         } else {
@@ -143,10 +151,10 @@ impl SearchError {
     }
 
     #[must_use]
-    pub fn stage(&self) -> Option<PipelineStage> {
+    pub fn stage(&self) -> Option<ResearchStage> {
         match self {
-            Self::Staged { stage, .. } => Some(*stage),
-            Self::FailureTrace { .. } | Self::Trace(_) => Some(PipelineStage::Trace),
+            Self::Staged { stage, .. } | Self::PersistedFailure { stage, .. } => Some(*stage),
+            Self::FailureTrace { .. } | Self::Trace(_) => Some(ResearchStage::Trace),
             _ => None,
         }
     }
@@ -163,6 +171,7 @@ impl SearchError {
             | Self::ModelOutput { .. }
             | Self::RefNotInRun { .. }
             | Self::NoUsableSource => ErrorClass::External,
+            Self::PersistedFailure { error_class, .. } => *error_class,
             Self::Setup { .. }
             | Self::HashMismatch { .. }
             | Self::InvalidSnapshot(_)
@@ -175,7 +184,7 @@ impl SearchError {
 }
 
 /// Pipeline result alias — every fallible pipeline function returns this.
-pub type Result<T> = std::result::Result<T, SearchError>;
+pub type Result<T> = std::result::Result<T, ResearchError>;
 
 #[cfg(test)]
 mod tests {
@@ -184,7 +193,7 @@ mod tests {
     #[test]
     fn classifies_dependency_jitter_as_external_and_our_bug_as_internal() {
         assert_eq!(
-            SearchError::Fetch {
+            ResearchError::Fetch {
                 url: "https://example.com".into(),
                 reason: "timeout".into(),
             }
@@ -192,7 +201,7 @@ mod tests {
             ErrorClass::External
         );
         assert_eq!(
-            SearchError::HashMismatch {
+            ResearchError::HashMismatch {
                 reference: "snapshot:web/x".into(),
                 expected: "sha256:a".into(),
                 actual: "sha256:b".into(),

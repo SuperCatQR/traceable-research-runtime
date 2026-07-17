@@ -137,7 +137,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let static_dir =
-        PathBuf::from(env::var("DEMO_STATIC_DIR").unwrap_or_else(|_| "demo/dist".into()));
+        PathBuf::from(env::var("DEMO_STATIC_DIR").unwrap_or_else(|_| "web/dist".into()));
     let index = static_dir.join("index.html");
     let infrastructure = ResearchInfrastructureConfig::from_env()?;
     let catalog_path = env::var_os("DEMO_CATALOG_PATH")

@@ -4,8 +4,8 @@
 .reasonix
 .codegraph
 target
-demo/node_modules
-demo/dist
+web/node_modules
+web/dist
 demo-host/target
 data
 .playwright-cli

@@ -33,6 +33,7 @@ import {
   type ResearchTurnStatus,
   type UserAccount,
 } from "./research-workspace-client";
+import { ResearchTraceAuditCache } from "./research-trace-audit-cache";
 import "./styles.css";
 
 type AuthenticationMode = "login" | "register";
@@ -55,7 +56,7 @@ interface WorkspaceState {
   researchInspectorTurnId: string | null;
   researchInspectorView: ResearchInspectorView;
   researchTraceSummaries: Map<string, ResearchTraceSummary>;
-  researchTraceAudits: Map<string, ResearchTraceAuditPage>;
+  researchTraceAudits: ResearchTraceAuditCache<ResearchTraceAuditPage>;
   researchTraceLoading: boolean;
   researchTraceError: string | null;
   researchTraceAuditStage: string;
@@ -82,7 +83,7 @@ const workspaceState: WorkspaceState = {
   researchInspectorTurnId: null,
   researchInspectorView: "summary",
   researchTraceSummaries: new Map(),
-  researchTraceAudits: new Map(),
+  researchTraceAudits: new ResearchTraceAuditCache(),
   researchTraceLoading: false,
   researchTraceError: null,
   researchTraceAuditStage: "",
@@ -340,7 +341,10 @@ function renderResearchInspector(): string {
   if (!conversation || !selectedTurn) return "";
   const turnOptions = conversation.turns.map((turn) => `<option value="${escapeHtml(turn.turn_id)}" ${turn.turn_id === selectedTurn.turn_id ? "selected" : ""}>第 ${turn.turn_number} 轮 · ${statusLabels[turn.status]}</option>`).join("");
   const summary = workspaceState.researchTraceSummaries.get(selectedTurn.turn_id);
-  const audit = workspaceState.researchTraceAudits.get(selectedTurn.turn_id);
+  const audit = workspaceState.researchTraceAudits.get(
+    selectedTurn.turn_id,
+    workspaceState.researchTraceAuditStage,
+  );
   const isSummary = workspaceState.researchInspectorView === "summary";
   const body = workspaceState.researchTraceLoading
     ? `<div class="inspector-status"><i class="spin" data-lucide="loader-circle"></i><span>正在读取研究记录</span></div>`
@@ -394,12 +398,31 @@ function renderResearchTraceAudit(audit: ResearchTraceAuditPage | undefined): st
   const stage = workspaceState.researchTraceAuditStage;
   const filter = `<label class="audit-filter"><span>阶段</span><select id="research-trace-audit-stage"><option value="" ${stage === "" ? "selected" : ""}>全部</option><option value="dialogue" ${stage === "dialogue" ? "selected" : ""}>理解</option><option value="setup" ${stage === "setup" ? "selected" : ""}>准备</option><option value="planning" ${stage === "planning" ? "selected" : ""}>规划</option><option value="search" ${stage === "search" ? "selected" : ""}>搜索</option><option value="archive" ${stage === "archive" ? "selected" : ""}>归档</option><option value="selection" ${stage === "selection" ? "selected" : ""}>选源</option><option value="synthesis" ${stage === "synthesis" ? "selected" : ""}>结论</option><option value="failure" ${stage === "failure" ? "selected" : ""}>失败</option></select></label>`;
   const rows = entries.length
-    ? `<ol class="audit-entry-list">${entries.map((entry) => `<li><span>${escapeHtml(entry.label)}</span><p>${escapeHtml(entry.detail)}</p>${entry.rationale ? `<small>${escapeHtml(entry.rationale)}</small>` : ""}</li>`).join("")}</ol>`
+    ? `<ol class="audit-entry-list">${entries.map((entry) => {
+        const metadata = [
+          entry.sequence === null ? null : `#${entry.sequence}`,
+          entry.occurred_at ? formatTraceTimestamp(entry.occurred_at) : null,
+        ].filter((value): value is string => value !== null).join(" · ");
+        return `<li>${metadata ? `<time>${escapeHtml(metadata)}</time>` : ""}<span>${escapeHtml(entry.label)}</span><p>${escapeHtml(entry.detail)}</p>${entry.rationale ? `<small>${escapeHtml(entry.rationale)}</small>` : ""}</li>`;
+      }).join("")}</ol>`
     : '<div class="inspector-status"><span>这个筛选条件下没有审计事件。</span></div>';
   const more = audit?.next_cursor !== null && audit?.next_cursor !== undefined
     ? '<button class="icon-button audit-more" type="button" data-action="load-more-trace-audit" aria-label="加载更多审计记录" title="加载更多"><i data-lucide="chevron-right"></i></button>'
     : "";
   return `${filter}${rows}${more}`;
+}
+
+function formatTraceTimestamp(value: string): string {
+  const timestamp = new Date(value);
+  if (Number.isNaN(timestamp.getTime())) return value;
+  return new Intl.DateTimeFormat("zh-CN", {
+    month: "2-digit",
+    day: "2-digit",
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  }).format(timestamp);
 }
 
 function renderConversationTranscript(): string {
@@ -465,11 +488,7 @@ function renderDialogueMessage(
 
 function renderResearchAnswer(turn: ResearchTurn): string {
   const answer = turn.answer!;
-  const sourceMap = new Map<string, { title: string; url: string }>();
-  for (const claim of answer.claims) {
-    for (const source of claim.sources) sourceMap.set(`${source.title}|${source.url}`, source);
-  }
-  const sources = [...sourceMap.values()];
+  const sources = answer.sources;
   const sourceList = sources.length
     ? `<details class="answer-sources"><summary>来源 ${sources.length}</summary><ul>${sources.map((source) => {
         const safeUrl = safeEvidenceUrl(source.url);
@@ -758,7 +777,12 @@ async function loadResearchInspectorData(options: { force?: boolean; append?: bo
     renderWorkspaceWithoutLosingResearchDraft();
     return;
   }
-  if (!options.force && isAudit && workspaceState.researchTraceAudits.has(turnId) && !options.append) {
+  if (
+    !options.force
+    && isAudit
+    && workspaceState.researchTraceAudits.has(turnId, workspaceState.researchTraceAuditStage)
+    && !options.append
+  ) {
     renderWorkspaceWithoutLosingResearchDraft();
     return;
   }
@@ -768,15 +792,22 @@ async function loadResearchInspectorData(options: { force?: boolean; append?: bo
   const accountId = workspaceState.account?.user_id;
   try {
     if (isAudit) {
-      const existing = workspaceState.researchTraceAudits.get(turnId);
+      const existing = workspaceState.researchTraceAudits.get(
+        turnId,
+        workspaceState.researchTraceAuditStage,
+      );
       const page = await researchWorkspaceClient.loadResearchTraceAudit(conversation.conversation_id, turnId, {
         stage: workspaceState.researchTraceAuditStage || undefined,
         cursor: options.append ? existing?.next_cursor ?? undefined : undefined,
       });
       if (workspaceState.account?.user_id !== accountId) return;
-      workspaceState.researchTraceAudits.set(turnId, options.append && existing
-        ? { ...page, entries: [...existing.entries, ...page.entries] }
-        : page);
+      workspaceState.researchTraceAudits.set(
+        turnId,
+        workspaceState.researchTraceAuditStage,
+        options.append && existing
+          ? { ...page, entries: [...existing.entries, ...page.entries] }
+          : page,
+      );
     } else {
       const summary = await researchWorkspaceClient.loadResearchTraceSummary(conversation.conversation_id, turnId);
       if (workspaceState.account?.user_id !== accountId) return;
@@ -1130,7 +1161,9 @@ applicationRoot.addEventListener("change", (event) => {
   if (target.id === "research-trace-audit-stage") {
     workspaceState.researchTraceAuditStage = target.value;
     const turnId = workspaceState.researchInspectorTurnId;
-    if (turnId) workspaceState.researchTraceAudits.delete(turnId);
+    if (turnId) {
+      workspaceState.researchTraceAudits.delete(turnId, workspaceState.researchTraceAuditStage);
+    }
     void loadResearchInspectorData({ force: true });
   }
 });

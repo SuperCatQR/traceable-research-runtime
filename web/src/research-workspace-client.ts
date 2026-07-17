@@ -8,7 +8,6 @@ export type ResearchTurnStatus =
 
 export type DialogueStatus = "thinking" | "awaiting_message" | "research_started" | "failed" | "cancelled";
 export type ResearchAnswerStyle = "web_first" | "knowledge_first";
-export type ResearchClaimOrigin = "model_knowledge" | "web_evidence";
 export type RationaleAuditStatus = "legacy_unverified" | "required_and_validated";
 
 export interface UserAccount {
@@ -36,28 +35,9 @@ export interface EvidenceSource {
   title: string;
 }
 
-export interface ResearchClaim {
-  text: string;
-  origin: ResearchClaimOrigin;
-  rationale: string;
-  sources: EvidenceSource[];
-}
-
-export interface ResearchAnswer {
-  answer_style: ResearchAnswerStyle;
+export interface ChatResearchAnswer {
   answer: string;
-  knowledge_draft: {
-    answer: string;
-    claims: string[];
-    uncertainty: string;
-    basis_summary: string;
-  };
-  comparison: {
-    agreements: string[];
-    differences: string[];
-    synthesis_rationale: string;
-  };
-  claims: ResearchClaim[];
+  sources: EvidenceSource[];
 }
 
 export interface DialogueMessage {
@@ -103,6 +83,8 @@ export interface ResearchTraceSummary {
 }
 
 export interface TraceAuditEntry {
+  sequence: number | null;
+  occurred_at: string | null;
   stage: "dialogue" | "setup" | "planning" | "search" | "archive" | "selection" | "synthesis" | "failure";
   label: string;
   detail: string;
@@ -118,14 +100,9 @@ export interface ResearchTraceAuditPage {
 export interface ResearchTurn {
   turn_id: string;
   turn_number: number;
-  run_id: string | null;
   user_question: string;
   status: ResearchTurnStatus;
-  answer_style: ResearchAnswerStyle;
-  model_profile_id: string;
-  model_api_base_url: string;
-  model_id: string;
-  answer: ResearchAnswer | null;
+  answer: ChatResearchAnswer | null;
   dialogue: TurnDialogue | null;
   created_at: number;
   updated_at: number;

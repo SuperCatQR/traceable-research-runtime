@@ -1,8 +1,8 @@
 FROM docker.io/library/node:22-bookworm-slim AS frontend
-WORKDIR /workspace/demo
-COPY demo/package.json demo/package-lock.json ./
+WORKDIR /workspace/web
+COPY web/package.json web/package-lock.json ./
 RUN npm ci
-COPY demo ./
+COPY web ./
 RUN npm run build
 
 FROM docker.io/library/rust:1.96-bookworm AS builder
@@ -19,7 +19,7 @@ RUN apt-get update \
  && rm -rf /var/lib/apt/lists/*
 WORKDIR /app
 COPY --from=builder /workspace/demo-host/target/release/traceable-search-demo-host /usr/local/bin/demo-host
-COPY --from=frontend /workspace/demo/dist ./static
+COPY --from=frontend /workspace/web/dist ./static
 ENV DEMO_STATIC_DIR=/app/static \
     DEMO_BIND=127.0.0.1:8080 \
     TRACEABLE_SEARCH_DATA_DIR=/data

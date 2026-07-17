@@ -20,9 +20,9 @@ __pycache__/
 /target/
 /data/
 
-# Frontend demo artifacts
-/demo/node_modules/
-/demo/dist/
+# Frontend web artifacts
+/web/node_modules/
+/web/dist/
 /demo-host/target/
 /.playwright-cli/
 

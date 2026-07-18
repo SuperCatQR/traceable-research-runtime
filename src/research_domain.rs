@@ -374,10 +374,94 @@ pub struct SearchQuery {
     pub gap: String,
 }
 
-/// One SearXNG/Bing first-page hit (§3 web_search). `search_result_id` is derived from
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchEngine {
+    Google,
+    Bing,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchEngineUnavailability {
+    TransportFailure,
+    RequestTimeout,
+    RateLimited,
+    ServerError,
+    EngineUnresponsive,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SearchBoundaryContractFailure {
+    EmptyQuery,
+    UnexpectedHttpStatus,
+    InvalidResponse,
+    EngineSelectionViolation,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SearchEngineAttemptOutcome {
+    Completed {
+        valid_result_count: u32,
+    },
+    Unavailable {
+        reason: SearchEngineUnavailability,
+    },
+    ContractRejected {
+        reason: SearchBoundaryContractFailure,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SearchEngineAttempt {
+    pub engine: SearchEngine,
+    pub outcome: SearchEngineAttemptOutcome,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchFailureReason {
+    InvalidQuery,
+    PrimarySearchContractRejected,
+    FallbackSearchFailed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ExplorationStopReason {
+    CompletedRounds,
+    InputBudget,
+    SnapshotLimit,
+    NoNewUrls,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum WebSearchCompletion {
+    Completed {
+        selected_engine: SearchEngine,
+        results: Vec<SearchResult>,
+    },
+    Failed {
+        reason: WebSearchFailureReason,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchExecution {
+    pub attempts: Vec<SearchEngineAttempt>,
+    pub completion: WebSearchCompletion,
+}
+
+/// One SearXNG first-page hit (§3 web_search). `search_result_id` is derived from
 /// the issuing query + URL, so archiving can be gated to this run (§6 v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
+    pub search_engine: SearchEngine,
     pub search_result_id: String,
     pub title: String,
     pub snippet: String,
@@ -388,8 +472,16 @@ pub struct SearchResult {
 impl SearchResult {
     /// Build a hit, deriving `search_result_id` from the query that produced it.
     #[must_use]
-    pub fn new(query: &str, title: String, snippet: String, url: String, rank: u32) -> Self {
+    pub fn new(
+        search_engine: SearchEngine,
+        query: &str,
+        title: String,
+        snippet: String,
+        url: String,
+        rank: u32,
+    ) -> Self {
         Self {
+            search_engine,
             search_result_id: search_result_id(query, &url),
             title,
             snippet,
@@ -609,9 +701,46 @@ mod tests {
     }
 
     #[test]
-    fn search_result_new_derives_id() {
-        let r = SearchResult::new(Q, "T".into(), "snip".into(), U.to_string(), 1);
-        assert_eq!(r.search_result_id, "6b044c73d025");
+    fn search_result_identity_is_stable_across_engines_but_provenance_is_not() {
+        let google = SearchResult::new(
+            SearchEngine::Google,
+            Q,
+            "T".into(),
+            "snip".into(),
+            U.to_string(),
+            1,
+        );
+        let bing = SearchResult::new(
+            SearchEngine::Bing,
+            Q,
+            "T".into(),
+            "snip".into(),
+            U.to_string(),
+            1,
+        );
+        assert_eq!(google.search_result_id, "6b044c73d025");
+        assert_eq!(google.search_result_id, bing.search_result_id);
+        assert_eq!(
+            serde_json::to_value([google, bing]).unwrap(),
+            serde_json::json!([
+                {
+                    "search_engine": "google",
+                    "search_result_id": "6b044c73d025",
+                    "title": "T",
+                    "snippet": "snip",
+                    "url": U,
+                    "rank": 1
+                },
+                {
+                    "search_engine": "bing",
+                    "search_result_id": "6b044c73d025",
+                    "title": "T",
+                    "snippet": "snip",
+                    "url": U,
+                    "rank": 1
+                }
+            ])
+        );
     }
 
     #[test]

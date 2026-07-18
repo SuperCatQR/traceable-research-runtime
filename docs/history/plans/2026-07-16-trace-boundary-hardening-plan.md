@@ -1,8 +1,8 @@
 # Trace 边界强化计划
 
-- 状态：提议中，尚未执行
+- 状态：已完成并归档；本地实施与验收完成，192.168.1.71 部署另行执行
 - 日期：2026-07-16
-- 前置状态：[三级 Trace 展示计划](../history/plans/2026-07-16-three-level-trace-presentation-plan.md) 已实施
+- 前置状态：[三级 Trace 展示计划](2026-07-16-three-level-trace-presentation-plan.md) 已实施
 
 ## 已确认的产品边界
 
@@ -37,7 +37,7 @@
 
 1. **最小聊天投影**
    - 在 `src/runtime.rs`、`demo-host/src/workspace_api.rs` 和
-     `demo/src/research-workspace-client.ts` 拆出 Chat Turn/Answer DTO。
+     `web/src/research-workspace-client.ts` 拆出 Chat Turn/Answer DTO。
    - 聊天端点只返回 L1 所需字段；knowledge draft、主张理由、比较数据、快照引用等只能通过 L2/L3
      投影取得。
    - 保留服务端完整答案以支持重放和审计，不把完整内部对象当作公共聊天 DTO。
@@ -50,12 +50,12 @@
 3. **搜索决策与停止原因**
    - 在 `src/research_domain.rs`、`src/external_adapters.rs`、`src/research_run.rs` 记录搜索引擎、
      每次尝试、失败类别和回退理由；此项与
-     [Google 优先、Bing 回退待办](../todo/2026-07-16-google-first-searxng-search-fallback.md) 一起实施。
+     [Google 优先、Bing 回退计划](2026-07-16-google-first-searxng-search-fallback.md) 一起实施。
    - 新增可审计的探索停止事件，记录达到轮数/输入预算/快照上限、无新 URL 或正常完成等原因。
 
 4. **审阅安全投影与右侧栏**
    - 扩展 `demo-host/src/workspace_api.rs` 的 L2/L3 投影，不扩大原始事件暴露范围。
-   - 在 `demo/src/main.ts` 与 `demo/src/styles.css` 中让右侧栏显示事件时间、搜索引擎/回退和停止原因；
+   - 在 `web/src/main.ts` 与 `web/src/styles.css` 中让右侧栏显示事件时间、搜索引擎/回退和停止原因；
      L1 保持无技术元数据的普通对话。
    - 继续保留懒加载、所有权 404、阶段筛选、分页和窄屏抽屉。
 

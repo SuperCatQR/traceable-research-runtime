@@ -1,6 +1,6 @@
 # traceable-search
 
-可审计的 Web 研究运行时与 Demo 工作区。用户只通过自然语言聊天表达意图；模型在每个回合同时生成一条可见的理解回复和一个内部结构化 `ResearchBrief`，再自行决定继续对话或自动开始研究。用户不会看到、编辑或确认 Brief，也没有“开始研究”按钮。研究运行时经 SearXNG/Bing、crawl4ai 和 OpenAI-compatible 模型完成检索、快照锁定与带来源答案；内部以 `snapshot_ref`、内容哈希和追加式审计记录保持可回放性。
+可审计的 Web 研究运行时与 Demo 工作区。用户只通过自然语言聊天表达意图；模型在每个回合同时生成一条可见的理解回复和一个内部结构化 `ResearchBrief`，再自行决定继续对话或自动开始研究。用户不会看到、编辑或确认 Brief，也没有“开始研究”按钮。研究运行时经 SearXNG（Google 优先、Bing 回退）、crawl4ai 和 OpenAI-compatible 模型完成检索、快照锁定与带来源答案；内部以 `snapshot_ref`、内容哈希和追加式审计记录保持可回放性。
 
 ## 架构
 
@@ -12,7 +12,7 @@ Browser / Rust caller
             ├── Research Conversation：长期上下文与已完成 Turn
             ├── Clarification：模型主导的自然对话与内部 Brief
             ├── Research Run：检索、抓取、选源、合成
-            ├── HTTP ── SearXNG ── Bing（当前）
+            ├── HTTP ── SearXNG ── Google → Bing（仅 unavailable 时回退）
             ├── HTTP ── crawl4ai
             ├── HTTP ── upstream model
             └── data/
@@ -55,7 +55,7 @@ cargo test --all-targets
 
 - 聊天正文（L1）只展示自然对话、研究状态、最终答案和必要来源。
 - 右侧“研究概览”（L2）由服务端投影，展示理解摘要、检索方向、来源数量、主要来源和合成理由。
-- 右侧“审计详情”（L3）按阶段、分页返回审阅安全事件。它不包含系统提示词、隐藏推理、API Key、模型原始输入或完整快照正文。
+- 右侧“审计详情”（L3）按阶段、分页返回带 v7 序号/时间的审阅安全事件，包括搜索引擎尝试、回退和探索停止原因。它不包含系统提示词、隐藏推理、API Key、模型原始输入或完整快照正文。
 
 Demo Host 的拥有者受限端点为：
 
@@ -64,7 +64,7 @@ Demo Host 的拥有者受限端点为：
 - `GET /api/conversations/{conversation_id}/turns/{turn_id}/trace/summary`
 - `GET /api/conversations/{conversation_id}/turns/{turn_id}/trace/audit?stage=&cursor=&limit=`
 
-Conversation 事件 schema 已升级到 v2，Clarification 事件 schema 已升级到 v5，Research Trace 已升级到 v6；它们不能在旧 session、v2/v3/v4 `intake` 或 v5 trace 日志上继续写入或回放。部署这一版本时必须使用新的数据目录或持久卷；不要在原卷上原地混用两种 schema。
+Conversation 事件 schema 是 v2，Clarification 事件 schema 是 v5，Research Trace 已升级到 v7。v7 每行都有连续 `sequence` 和 `occurred_at`，并且只能通过完整 replay 校验读取；不能在旧 trace 日志上继续写入或回放。部署这一版本时必须使用新的数据目录或持久卷；不要在原卷上原地混用两种 schema。
 
 ## 外部服务
 
@@ -86,6 +86,7 @@ cat > ~/.config/searxng/settings.yml <<EOF
 use_default_settings:
   engines:
     keep_only:
+      - google
       - bing
 
 general:
@@ -107,6 +108,10 @@ search:
     - json
 
 engines:
+  - name: google
+    engine: google
+    shortcut: go
+    disabled: false
   - name: bing
     engine: bing
     shortcut: bi
@@ -123,22 +128,20 @@ podman run -d \
   docker.io/searxng/searxng@sha256:bf2700fa1e7b63c9ef577004513efef509f9c23bfa2cd6e56be08211508df95a
 ```
 
-验证 JSON Search API：
+分别强制单引擎请求，验证 JSON Search API：
 
 ```bash
-curl -fsS 'http://127.0.0.1:8888/search?q=Rust&format=json&categories=general' \
-  | python3 -c '
-import json, sys
-data = json.load(sys.stdin)
-engines = sorted({e for item in data.get("results", []) for e in item.get("engines", [])})
-print("results:", len(data.get("results", [])))
-print("engines:", engines)
-assert data.get("results") and engines == ["bing"]
-'
+curl -fsS --get 'http://127.0.0.1:8888/search' \
+  --data-urlencode 'q=Rust' --data-urlencode 'format=json' --data-urlencode 'engines=google'
+curl -fsS --get 'http://127.0.0.1:8888/search' \
+  --data-urlencode 'q=Rust' --data-urlencode 'format=json' --data-urlencode 'engines=bing'
 ```
 
 > [!NOTE]
-> 此配置仅保留 Bing engine，并使用 `https://cn.bing.com`。当前中英文 smoke test 均返回 10 条结果，且 `engines` 唯一为 `bing`。SearXNG 此处抓取 Bing 搜索页，并非调用官方 Bing Search API；仍可能受 CAPTCHA、限流或页面结构变化影响。
+> 应用对每个查询显式请求 Google；只有 Google transport/timeout/rate-limit/server-error/unresponsive 才显式请求 Bing。正常空结果不回退，契约错误也不回退。SearXNG 抓取公开搜索页而非官方付费 Search API，因此两台引擎仍可能受 CAPTCHA、限流、区域网络或页面结构变化影响。
+
+> [!IMPORTANT]
+> 上线前应确认 Google 和 Bing 各自至少返回一条带正确引擎元数据的 HTTP(S) 结果。任一失败都应阻止替换当前实例；不要通过关闭 Google 或改成永久 Bing 来绕过策略契约。
 
 > [!CAUTION]
 > 此配置关闭 limiter，仅适用于 localhost。若对外开放，须配置反向代理、HTTPS、访问控制及 Valkey/Redis limiter。
@@ -257,7 +260,7 @@ data/traces/<run_id>.jsonl
 
 | 现象 | 检查 |
 |---|---|
-| SearXNG 返回空结果 | 检查 Bing engine、`unresponsive_engines` 与 `SEARCH_BASE_URL` |
+| SearXNG 返回空结果 | 分别运行强制 Google/Bing 探针，检查 `unresponsive_engines`、引擎元数据与 `SEARCH_BASE_URL` |
 | crawl4ai 返回认证失败 | `CRAWL4AI_TOKEN` 是否为该服务签发的有效 token |
 | 模型返回 401 | `STRONG_MODEL_API_KEY` 是否有效 |
 | 模型端点 404 | `STRONG_MODEL_BASE_URL` 是否指向 OpenAI-compatible `/v1/` API |
@@ -266,27 +269,13 @@ data/traces/<run_id>.jsonl
 
 ## WSL2 Demo
 
-在 WSL2 已准备 SearXNG、crawl4ai 和项目 `.env` 后，运行：
+仓库只维护 `demo-host/Containerfile`，不维护环境专用的启动、停止或服务器替换脚本。在 WSL2 已准备 SearXNG、crawl4ai 和项目 `.env` 后，可从仓库根目录构建同源镜像：
 
 ```bash
-bash scripts/wsl-demo-up.sh
+podman build --tag traceable-search-demo --file demo-host/Containerfile .
 ```
 
-脚本会构建同源前端与 Demo Host，确保依赖容器运行，并在
-`~/.config/traceable-search-demo-v5/` 生成权限为 `0600` 的持久主密钥与运行时 env file。
-主密钥不得删除或替换，否则既有 Model Profile 的加密 API Key 无法解密。
+运行镜像时由部署环境显式提供 `.env.example` 中的变量、可写数据卷和端口映射。`DEMO_CREDENTIAL_ENCRYPTION_KEY` 必须是仓库外持久保存的 base64 编码 32-byte 密钥；不得删除或替换，否则既有 Model Profile 的加密 API Key 无法解密。Research Trace v7 必须使用新的空数据目录或 volume，不得继续写入旧 schema 数据。
 
-从 Windows 浏览器打开 <http://127.0.0.1:8080>。首次使用依次注册账户、添加 OpenAI-compatible
+Host 启动后从 Windows 浏览器打开其映射地址。首次使用依次注册账户、添加 OpenAI-compatible
 Model Profile、创建研究对话。用户只在聊天框中发送问题或补充；模型会自然回复理解，并在信息足够时自动开始研究。对话、对话式校准状态和已完成答案会保留在 Podman volume 中，重启 Host 后仍可恢复。
-
-停止 Demo Host：
-
-```bash
-bash scripts/wsl-demo-down.sh
-```
-
-面向服务器的容器启动脚本是 `scripts/server-demo-up.sh`；默认入口为
-`http://192.168.1.71:8090`。它默认使用
-`~/.config/traceable-search-server-demo-v5` 和
-`traceable-search-server-demo-data-v5`，以避免复用 Clarification schema v4 / Research Trace schema v5 数据；旧目录和卷会被保留。
-仅在明确指定一个新的空目录/卷时才覆盖 `TRACEABLE_SERVER_RUNTIME_DIR` 或 `DEMO_DATA_VOLUME`。

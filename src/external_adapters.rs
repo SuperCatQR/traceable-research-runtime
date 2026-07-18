@@ -2,25 +2,22 @@
 //! and the public-HTTP SSRF boundary shared by every page fetch.
 
 use std::{
-    io::Cursor,
     net::{IpAddr, SocketAddr},
     time::Duration,
 };
 
 use chrono::Utc;
-use quick_xml::de::from_reader as deserialize_xml;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use url::{Host, Url};
 
-use crate::{CrawlBodyKind, CrawlMeta, ResearchError, Result, SearchResult, Snapshot};
+use crate::{
+    CrawlBodyKind, CrawlMeta, ResearchError, Result, SearchBoundaryContractFailure, SearchEngine,
+    SearchEngineAttempt, SearchEngineAttemptOutcome, SearchEngineUnavailability, SearchResult,
+    Snapshot, WebSearchCompletion, WebSearchExecution, WebSearchFailureReason,
+};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
-const SEARCH_RETRY_DELAYS: [Duration; 4] = [
-    Duration::from_secs(1),
-    Duration::from_secs(3),
-    Duration::from_secs(5),
-    Duration::from_secs(9),
-];
+const SEARCH_REQUEST_TIMEOUT: Duration = Duration::from_secs(15);
 const MAX_REDIRECTS: usize = 5;
 const MAX_PAGE_BYTES: usize = 4_000_000;
 const MAX_ARCHIVED_BODY_BYTES: usize = 4 * 1024 * 1024;
@@ -304,11 +301,11 @@ fn sanitize_for_offline_crawl(html: &str) -> String {
     builder.clean(html).to_string()
 }
 
-/// Thin client for a self-hosted SearXNG instance configured with Bing only.
+/// Google-first client for a self-hosted SearXNG instance. It never contacts
+/// a search engine outside that controlled endpoint.
 pub struct SearxngSearchClient {
     http_client: reqwest::Client,
     search_endpoint: Url,
-    bing_rss_endpoint: Url,
 }
 
 impl SearxngSearchClient {
@@ -319,115 +316,211 @@ impl SearxngSearchClient {
                 message: format!("invalid SearXNG endpoint: {error}"),
             })?;
         Ok(Self {
-            http_client: http_client()?,
+            http_client: reqwest::Client::builder()
+                .timeout(SEARCH_REQUEST_TIMEOUT)
+                .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS))
+                .user_agent(concat!("traceable-search/", env!("CARGO_PKG_VERSION")))
+                .build()
+                .map_err(|error| ResearchError::Search {
+                    message: format!("SearXNG HTTP client setup failed: {error}"),
+                })?,
             search_endpoint,
-            bing_rss_endpoint: Url::parse("https://www.bing.com/search?format=rss").map_err(
-                |error| ResearchError::Search {
-                    message: format!("invalid Bing RSS fallback endpoint: {error}"),
-                },
-            )?,
         })
     }
 
-    pub async fn search_web(&self, query: &str) -> Result<Vec<SearchResult>> {
-        match self.search_with_delays(query, &SEARCH_RETRY_DELAYS).await {
-            Ok(results) => Ok(results),
-            Err(searxng_error) => self.search_bing_rss(query).await.map_err(|bing_error| {
-                ResearchError::Search {
-                    message: format!(
-                        "SearXNG returned no usable result ({searxng_error}); Bing RSS fallback failed ({bing_error})"
-                    ),
+    pub async fn search_web(&self, query: &str) -> WebSearchExecution {
+        if query.trim().is_empty() {
+            return WebSearchExecution {
+                attempts: Vec::new(),
+                completion: WebSearchCompletion::Failed {
+                    reason: WebSearchFailureReason::InvalidQuery,
+                },
+            };
+        }
+        let google = self
+            .search_searxng_engine(query, SearchEngine::Google)
+            .await;
+        let google_attempt = google.attempt;
+        match (google_attempt.outcome.clone(), google.results) {
+            (SearchEngineAttemptOutcome::Completed { .. }, Some(results)) => WebSearchExecution {
+                attempts: vec![google_attempt],
+                completion: WebSearchCompletion::Completed {
+                    selected_engine: SearchEngine::Google,
+                    results,
+                },
+            },
+            (SearchEngineAttemptOutcome::ContractRejected { .. }, _) => WebSearchExecution {
+                attempts: vec![google_attempt],
+                completion: WebSearchCompletion::Failed {
+                    reason: WebSearchFailureReason::PrimarySearchContractRejected,
+                },
+            },
+            _ => {
+                let bing = self.search_searxng_engine(query, SearchEngine::Bing).await;
+                let bing_attempt = bing.attempt;
+                let completion = match (bing_attempt.outcome.clone(), bing.results) {
+                    (SearchEngineAttemptOutcome::Completed { .. }, Some(results)) => {
+                        WebSearchCompletion::Completed {
+                            selected_engine: SearchEngine::Bing,
+                            results,
+                        }
+                    }
+                    _ => WebSearchCompletion::Failed {
+                        reason: WebSearchFailureReason::FallbackSearchFailed,
+                    },
+                };
+                WebSearchExecution {
+                    attempts: vec![google_attempt, bing_attempt],
+                    completion,
                 }
-            }),
+            }
         }
     }
 
-    async fn search_with_delays(
+    async fn search_searxng_engine(
         &self,
         query: &str,
-        retry_delays: &[Duration],
-    ) -> Result<Vec<SearchResult>> {
-        if query.trim().is_empty() {
-            return Err(ResearchError::Search {
-                message: "query is empty".into(),
-            });
-        }
+        engine: SearchEngine,
+    ) -> SearxngEngineSearch {
         let mut search_url = self.search_endpoint.clone();
         search_url.query_pairs_mut().extend_pairs([
             ("q", query),
             ("format", "json"),
             ("categories", "general"),
             ("language", query_language(query)),
+            ("engines", search_engine_name(engine)),
         ]);
-
-        for attempt in 0..=retry_delays.len() {
-            let response = self
-                .http_client
-                .get(search_url.clone())
-                .send()
-                .await
-                .map_err(|error| ResearchError::Search {
-                    message: error.to_string(),
-                })?;
-            let status = response.status();
-            let body = response
-                .bytes()
-                .await
-                .map_err(|error| ResearchError::Search {
-                    message: error.to_string(),
-                })?;
-            if status == reqwest::StatusCode::TOO_MANY_REQUESTS || body_reports_rate_limit(&body) {
-                if let Some(delay) = retry_delays.get(attempt) {
-                    tokio::time::sleep(*delay).await;
-                    continue;
-                }
-                return Err(ResearchError::Search {
-                    message: "SearXNG rate limit persisted after 4 retries".into(),
-                });
+        let response = match self.http_client.get(search_url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                return SearxngEngineSearch::unavailable(
+                    engine,
+                    if error.is_timeout() {
+                        SearchEngineUnavailability::RequestTimeout
+                    } else {
+                        SearchEngineUnavailability::TransportFailure
+                    },
+                    None,
+                );
             }
-            if !status.is_success() {
-                return Err(ResearchError::Search {
-                    message: format!("SearXNG returned HTTP {status}"),
-                });
-            }
-            return parse_searxng_results(query, &body);
-        }
-        unreachable!("search retry loop always returns")
-    }
-
-    async fn search_bing_rss(&self, query: &str) -> Result<Vec<SearchResult>> {
-        let mut url = self.bing_rss_endpoint.clone();
-        url.query_pairs_mut().append_pair("q", query);
-        let response =
-            self.http_client
-                .get(url)
-                .send()
-                .await
-                .map_err(|error| ResearchError::Search {
-                    message: error.to_string(),
-                })?;
+        };
         let status = response.status();
-        let body = response
-            .bytes()
-            .await
-            .map_err(|error| ResearchError::Search {
-                message: error.to_string(),
-            })?;
-        if !status.is_success() {
-            return Err(ResearchError::Search {
-                message: format!("Bing RSS returned HTTP {status}"),
-            });
+        let http_status = Some(status.as_u16());
+        if status == reqwest::StatusCode::REQUEST_TIMEOUT {
+            return SearxngEngineSearch::unavailable(
+                engine,
+                SearchEngineUnavailability::RequestTimeout,
+                http_status,
+            );
         }
-        parse_bing_rss_results(query, &body)
+        if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            return SearxngEngineSearch::unavailable(
+                engine,
+                SearchEngineUnavailability::RateLimited,
+                http_status,
+            );
+        }
+        if status.is_server_error() {
+            return SearxngEngineSearch::unavailable(
+                engine,
+                SearchEngineUnavailability::ServerError,
+                http_status,
+            );
+        }
+        if status != reqwest::StatusCode::OK {
+            return SearxngEngineSearch::contract_rejected(
+                engine,
+                SearchBoundaryContractFailure::UnexpectedHttpStatus,
+                http_status,
+            );
+        }
+        let body = match response.bytes().await {
+            Ok(body) => body,
+            Err(error) => {
+                return SearxngEngineSearch::unavailable(
+                    engine,
+                    if error.is_timeout() {
+                        SearchEngineUnavailability::RequestTimeout
+                    } else {
+                        SearchEngineUnavailability::TransportFailure
+                    },
+                    http_status,
+                );
+            }
+        };
+        match parse_searxng_engine_results(engine, query, &body) {
+            Ok(ParsedSearxngEngineResults::Completed(results)) => {
+                SearxngEngineSearch::completed(engine, results, http_status)
+            }
+            Ok(ParsedSearxngEngineResults::Unresponsive) => SearxngEngineSearch::unavailable(
+                engine,
+                SearchEngineUnavailability::EngineUnresponsive,
+                http_status,
+            ),
+            Err(reason) => SearxngEngineSearch::contract_rejected(engine, reason, http_status),
+        }
     }
 }
 
-fn body_reports_rate_limit(body: &[u8]) -> bool {
-    if body.len() > 1024 {
-        return false;
+struct SearxngEngineSearch {
+    attempt: SearchEngineAttempt,
+    results: Option<Vec<SearchResult>>,
+}
+
+impl SearxngEngineSearch {
+    fn completed(
+        engine: SearchEngine,
+        results: Vec<SearchResult>,
+        http_status: Option<u16>,
+    ) -> Self {
+        Self {
+            attempt: SearchEngineAttempt {
+                engine,
+                outcome: SearchEngineAttemptOutcome::Completed {
+                    valid_result_count: results.len() as u32,
+                },
+                http_status,
+            },
+            results: Some(results),
+        }
     }
-    let body = String::from_utf8_lossy(body).to_ascii_lowercase();
-    body.contains("ratelimit") || body.contains("rate limit") || body.contains("too many requests")
+
+    fn unavailable(
+        engine: SearchEngine,
+        reason: SearchEngineUnavailability,
+        http_status: Option<u16>,
+    ) -> Self {
+        Self {
+            attempt: SearchEngineAttempt {
+                engine,
+                outcome: SearchEngineAttemptOutcome::Unavailable { reason },
+                http_status,
+            },
+            results: None,
+        }
+    }
+
+    fn contract_rejected(
+        engine: SearchEngine,
+        reason: SearchBoundaryContractFailure,
+        http_status: Option<u16>,
+    ) -> Self {
+        Self {
+            attempt: SearchEngineAttempt {
+                engine,
+                outcome: SearchEngineAttemptOutcome::ContractRejected { reason },
+                http_status,
+            },
+            results: None,
+        }
+    }
+}
+
+const fn search_engine_name(engine: SearchEngine) -> &'static str {
+    match engine {
+        SearchEngine::Google => "google",
+        SearchEngine::Bing => "bing",
+    }
 }
 
 fn query_language(query: &str) -> &'static str {
@@ -443,8 +536,8 @@ fn query_language(query: &str) -> &'static str {
 
 #[derive(Deserialize)]
 struct SearxngEnvelope {
-    #[serde(default)]
     results: Vec<SearxngResult>,
+    unresponsive_engines: Vec<(String, String)>,
 }
 
 #[derive(Deserialize)]
@@ -453,13 +546,37 @@ struct SearxngResult {
     url: String,
     #[serde(default)]
     content: String,
+    #[serde(default)]
+    engine: Option<String>,
+    #[serde(default)]
+    engines: Option<Vec<String>>,
 }
 
-fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
+#[derive(Debug, PartialEq, Eq)]
+enum ParsedSearxngEngineResults {
+    Completed(Vec<SearchResult>),
+    Unresponsive,
+}
+
+fn parse_searxng_engine_results(
+    engine: SearchEngine,
+    query: &str,
+    body: &[u8],
+) -> std::result::Result<ParsedSearxngEngineResults, SearchBoundaryContractFailure> {
     let raw: SearxngEnvelope =
-        serde_json::from_slice(body).map_err(|error| ResearchError::Search {
-            message: format!("invalid SearXNG JSON: {error}"),
-        })?;
+        serde_json::from_slice(body).map_err(|_| SearchBoundaryContractFailure::InvalidResponse)?;
+    let expected_engine = search_engine_name(engine);
+    if raw
+        .results
+        .iter()
+        .any(|result| !searxng_result_proves_engine(result, expected_engine))
+        || raw
+            .unresponsive_engines
+            .iter()
+            .any(|(name, _)| name != expected_engine)
+    {
+        return Err(SearchBoundaryContractFailure::EngineSelectionViolation);
+    }
     let results: Vec<_> = raw
         .results
         .into_iter()
@@ -469,67 +586,44 @@ fn parse_searxng_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> 
         .take(10)
         .enumerate()
         .map(|(index, item)| {
-            SearchResult::new(query, item.title, item.content, item.url, index as u32 + 1)
-        })
-        .collect();
-    if results.is_empty() {
-        Err(ResearchError::Search {
-            message: "SearXNG/Bing returned no valid result".into(),
-        })
-    } else {
-        Ok(results)
-    }
-}
-
-#[derive(Deserialize)]
-struct BingRssEnvelope {
-    channel: BingRssChannel,
-}
-
-#[derive(Deserialize)]
-struct BingRssChannel {
-    #[serde(default)]
-    item: Vec<BingRssItem>,
-}
-
-#[derive(Deserialize)]
-struct BingRssItem {
-    title: String,
-    link: String,
-    #[serde(default)]
-    description: String,
-}
-
-fn parse_bing_rss_results(query: &str, body: &[u8]) -> Result<Vec<SearchResult>> {
-    let raw: BingRssEnvelope =
-        deserialize_xml(Cursor::new(body)).map_err(|error| ResearchError::Search {
-            message: format!("invalid Bing RSS XML: {error}"),
-        })?;
-    let results: Vec<_> = raw
-        .channel
-        .item
-        .into_iter()
-        .filter(|item| {
-            Url::parse(&item.link).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
-        })
-        .take(10)
-        .enumerate()
-        .map(|(index, item)| {
             SearchResult::new(
+                engine,
                 query,
                 item.title,
-                item.description,
-                item.link,
+                item.content,
+                item.url,
                 index as u32 + 1,
             )
         })
         .collect();
-    if results.is_empty() {
-        return Err(ResearchError::Search {
-            message: "Bing RSS returned no valid result".into(),
-        });
+    if !results.is_empty() {
+        return Ok(ParsedSearxngEngineResults::Completed(results));
     }
-    Ok(results)
+    if raw
+        .unresponsive_engines
+        .iter()
+        .any(|(name, _)| name == expected_engine)
+    {
+        Ok(ParsedSearxngEngineResults::Unresponsive)
+    } else {
+        Ok(ParsedSearxngEngineResults::Completed(Vec::new()))
+    }
+}
+
+fn searxng_result_proves_engine(result: &SearxngResult, expected_engine: &str) -> bool {
+    let direct_engine_is_valid = result
+        .engine
+        .as_deref()
+        .is_some_and(|engine| engine == expected_engine);
+    let merged_engines_are_valid = result.engines.as_ref().is_some_and(|engines| {
+        !engines.is_empty() && engines.iter().all(|engine| engine == expected_engine)
+    });
+    match (&result.engine, &result.engines) {
+        (Some(_), Some(_)) => direct_engine_is_valid && merged_engines_are_valid,
+        (Some(_), None) => direct_engine_is_valid,
+        (None, Some(_)) => merged_engines_are_valid,
+        (None, None) => false,
+    }
 }
 
 /// Thin client for the crawl4ai `/crawl` API. The service endpoint may be on a
@@ -828,79 +922,417 @@ struct ChatResponseMessage {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::{
-        Arc,
-        atomic::{AtomicUsize, Ordering},
+    use std::{
+        collections::VecDeque,
+        sync::{Arc, Mutex},
     };
 
-    use axum::{Router, extract::State, http::StatusCode, response::IntoResponse, routing::get};
+    use axum::{
+        Router,
+        extract::{OriginalUri, State},
+        http::StatusCode,
+        response::IntoResponse,
+        routing::get,
+    };
 
     use super::*;
 
-    async fn retrying_search(State(attempts): State<Arc<AtomicUsize>>) -> impl IntoResponse {
-        if attempts.fetch_add(1, Ordering::SeqCst) == 0 {
-            (StatusCode::OK, "ratelimit")
-        } else {
-            (
-                StatusCode::OK,
-                r#"{"results":[{"title":"Rust","url":"https://example.com/","content":"language"}]}"#,
-            )
-        }
+    #[derive(Clone)]
+    struct SearchFixtureState {
+        requests: Arc<Mutex<Vec<String>>>,
+        responses: Arc<Mutex<VecDeque<(StatusCode, String)>>>,
     }
 
-    async fn rate_limited_search(State(attempts): State<Arc<AtomicUsize>>) -> impl IntoResponse {
-        attempts.fetch_add(1, Ordering::SeqCst);
-        (StatusCode::TOO_MANY_REQUESTS, "too many requests")
+    async fn scripted_search(
+        State(state): State<SearchFixtureState>,
+        OriginalUri(uri): OriginalUri,
+    ) -> impl IntoResponse {
+        state
+            .requests
+            .lock()
+            .unwrap()
+            .push(uri.query().unwrap_or_default().to_owned());
+        state.responses.lock().unwrap().pop_front().unwrap()
     }
 
     async fn search_fixture(
-        handler: axum::routing::MethodRouter<Arc<AtomicUsize>>,
+        responses: Vec<(StatusCode, &str)>,
     ) -> (
         SearxngSearchClient,
-        Arc<AtomicUsize>,
+        Arc<Mutex<Vec<String>>>,
         tokio::task::JoinHandle<()>,
     ) {
-        let attempts = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let state = SearchFixtureState {
+            requests: requests.clone(),
+            responses: Arc::new(Mutex::new(
+                responses
+                    .into_iter()
+                    .map(|(status, body)| (status, body.to_owned()))
+                    .collect(),
+            )),
+        };
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let base_url = format!("http://{}/", listener.local_addr().unwrap());
         let app = Router::new()
-            .route("/search", handler)
-            .with_state(attempts.clone());
+            .route("/search", get(scripted_search))
+            .with_state(state);
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         (
             SearxngSearchClient::new(&base_url).unwrap(),
-            attempts,
+            requests,
             server,
         )
     }
 
     #[tokio::test]
-    async fn search_retries_rate_limit_body_then_succeeds() {
-        let (client, attempts, server) = search_fixture(get(retrying_search)).await;
+    async fn google_success_uses_one_explicit_single_engine_request() {
+        let (client, requests, server) = search_fixture(vec![(
+            StatusCode::OK,
+            r#"{"results":[{"title":"Rust","url":"https://example.com/","content":"language","engine":"google","engines":["google"]}],"unresponsive_engines":[]}"#,
+        )])
+        .await;
 
-        let results = client
-            .search_with_delays("rust", &[Duration::ZERO; 4])
-            .await
-            .unwrap();
-
+        let execution = client.search_web("rust").await;
         server.abort();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Rust");
-        assert_eq!(attempts.load(Ordering::SeqCst), 2);
+        assert_eq!(
+            execution.attempts,
+            [crate::SearchEngineAttempt {
+                engine: crate::SearchEngine::Google,
+                outcome: crate::SearchEngineAttemptOutcome::Completed {
+                    valid_result_count: 1,
+                },
+                http_status: Some(200),
+            }]
+        );
+        let crate::WebSearchCompletion::Completed {
+            selected_engine,
+            results,
+        } = execution.completion
+        else {
+            panic!("Google success did not complete the search");
+        };
+        assert_eq!(selected_engine, crate::SearchEngine::Google);
+        assert_eq!(results[0].search_engine, crate::SearchEngine::Google);
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let pairs = url::form_urlencoded::parse(requests[0].as_bytes()).collect::<Vec<_>>();
+        assert_eq!(
+            pairs
+                .iter()
+                .filter(|(name, _)| name == "engines")
+                .map(|(_, value)| value.as_ref())
+                .collect::<Vec<_>>(),
+            ["google"]
+        );
     }
 
     #[tokio::test]
-    async fn search_stops_after_four_rate_limit_retries() {
-        let (client, attempts, server) = search_fixture(get(rate_limited_search)).await;
+    async fn google_unavailable_falls_back_to_one_explicit_bing_request() {
+        let (client, requests, server) = search_fixture(vec![
+            (
+                StatusCode::OK,
+                r#"{"results":[],"unresponsive_engines":[["google","upstream timeout"]]}"#,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"results":[{"title":"Rust","url":"https://example.com/bing","content":"language","engine":"bing","engines":["bing"]}],"unresponsive_engines":[]}"#,
+            ),
+        ])
+        .await;
 
-        let error = client
-            .search_with_delays("rust", &[Duration::ZERO; 4])
-            .await
-            .unwrap_err();
+        let execution = client.search_web("rust").await;
 
         server.abort();
-        assert!(error.to_string().contains("persisted after 4 retries"));
-        assert_eq!(attempts.load(Ordering::SeqCst), 5);
+        assert_eq!(execution.attempts.len(), 2);
+        assert_eq!(execution.attempts[0].engine, SearchEngine::Google);
+        assert_eq!(
+            execution.attempts[0].outcome,
+            SearchEngineAttemptOutcome::Unavailable {
+                reason: SearchEngineUnavailability::EngineUnresponsive,
+            }
+        );
+        assert_eq!(execution.attempts[1].engine, SearchEngine::Bing);
+        let WebSearchCompletion::Completed {
+            selected_engine,
+            results,
+        } = execution.completion
+        else {
+            panic!("Bing fallback did not complete the search");
+        };
+        assert_eq!(selected_engine, SearchEngine::Bing);
+        assert_eq!(results[0].search_engine, SearchEngine::Bing);
+        let requested_engines = requests
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|query| {
+                url::form_urlencoded::parse(query.as_bytes())
+                    .find_map(|(name, value)| (name == "engines").then(|| value.into_owned()))
+                    .unwrap()
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(requested_engines, ["google", "bing"]);
+    }
+
+    #[tokio::test]
+    async fn google_proven_empty_is_completed_without_bing() {
+        let (client, requests, server) = search_fixture(vec![(
+            StatusCode::OK,
+            r#"{"results":[],"unresponsive_engines":[]}"#,
+        )])
+        .await;
+
+        let execution = client.search_web("rare exact query").await;
+
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert_eq!(
+            execution.attempts[0].outcome,
+            SearchEngineAttemptOutcome::Completed {
+                valid_result_count: 0,
+            }
+        );
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Completed {
+                selected_engine: SearchEngine::Google,
+                ref results,
+            } if results.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn google_invalid_urls_are_a_completed_empty_result_without_bing() {
+        let (client, requests, server) = search_fixture(vec![(
+            StatusCode::OK,
+            r#"{"results":[{"title":"FTP","url":"ftp://example.com/file","engine":"google","engines":["google"]}],"unresponsive_engines":[]}"#,
+        )])
+        .await;
+
+        let execution = client.search_web("rare query").await;
+
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Completed {
+                selected_engine: SearchEngine::Google,
+                ref results,
+            } if results.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn google_valid_results_win_over_same_engine_unresponsive_metadata() {
+        let (client, requests, server) = search_fixture(vec![(
+            StatusCode::OK,
+            r#"{"results":[{"title":"Result","url":"https://example.com/result","engine":"google","engines":["google"]}],"unresponsive_engines":[["google","late response"]]}"#,
+        )])
+        .await;
+
+        let execution = client.search_web("query").await;
+
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Completed {
+                selected_engine: SearchEngine::Google,
+                ref results,
+            } if results.len() == 1
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_http_statuses_fallback_to_a_successful_empty_bing_result() {
+        for (status, expected_reason) in [
+            (
+                StatusCode::REQUEST_TIMEOUT,
+                SearchEngineUnavailability::RequestTimeout,
+            ),
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                SearchEngineUnavailability::RateLimited,
+            ),
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                SearchEngineUnavailability::ServerError,
+            ),
+        ] {
+            let (client, requests, server) = search_fixture(vec![
+                (status, "unavailable"),
+                (
+                    StatusCode::OK,
+                    r#"{"results":[],"unresponsive_engines":[]}"#,
+                ),
+            ])
+            .await;
+
+            let execution = client.search_web("query").await;
+
+            server.abort();
+            assert_eq!(requests.lock().unwrap().len(), 2);
+            assert_eq!(
+                execution.attempts[0].outcome,
+                SearchEngineAttemptOutcome::Unavailable {
+                    reason: expected_reason,
+                }
+            );
+            assert!(matches!(
+                execution.completion,
+                WebSearchCompletion::Completed {
+                    selected_engine: SearchEngine::Bing,
+                    ref results,
+                } if results.is_empty()
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn client_errors_and_invalid_payloads_reject_without_bing() {
+        for (status, body, expected_reason) in [
+            (
+                StatusCode::BAD_REQUEST,
+                "bad request",
+                SearchBoundaryContractFailure::UnexpectedHttpStatus,
+            ),
+            (
+                StatusCode::UNAUTHORIZED,
+                "unauthorized",
+                SearchBoundaryContractFailure::UnexpectedHttpStatus,
+            ),
+            (
+                StatusCode::NOT_FOUND,
+                "not found",
+                SearchBoundaryContractFailure::UnexpectedHttpStatus,
+            ),
+            (
+                StatusCode::OK,
+                "not json",
+                SearchBoundaryContractFailure::InvalidResponse,
+            ),
+            (
+                StatusCode::OK,
+                r#"{"results":[{"title":"Wrong","url":"https://example.com/","engine":"bing","engines":["bing"]}],"unresponsive_engines":[]}"#,
+                SearchBoundaryContractFailure::EngineSelectionViolation,
+            ),
+        ] {
+            let (client, requests, server) = search_fixture(vec![(status, body)]).await;
+
+            let execution = client.search_web("query").await;
+
+            server.abort();
+            assert_eq!(requests.lock().unwrap().len(), 1);
+            assert_eq!(
+                execution.attempts[0].outcome,
+                SearchEngineAttemptOutcome::ContractRejected {
+                    reason: expected_reason,
+                }
+            );
+            assert!(matches!(
+                execution.completion,
+                WebSearchCompletion::Failed {
+                    reason: WebSearchFailureReason::PrimarySearchContractRejected,
+                }
+            ));
+        }
+    }
+
+    #[tokio::test]
+    async fn transport_failure_attempts_google_then_bing_and_fails() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base_url = format!("http://{}/", listener.local_addr().unwrap());
+        drop(listener);
+        let client = SearxngSearchClient::new(&base_url).unwrap();
+
+        let execution = client.search_web("query").await;
+
+        assert_eq!(execution.attempts.len(), 2);
+        assert!(execution.attempts.iter().all(|attempt| matches!(
+            attempt.outcome,
+            SearchEngineAttemptOutcome::Unavailable {
+                reason: SearchEngineUnavailability::TransportFailure,
+            }
+        )));
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::FallbackSearchFailed,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn google_contract_rejection_does_not_hide_behind_bing() {
+        let (client, requests, server) =
+            search_fixture(vec![(StatusCode::FORBIDDEN, "forbidden")]).await;
+
+        let execution = client.search_web("rust").await;
+
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 1);
+        assert!(matches!(
+            execution.attempts[0].outcome,
+            SearchEngineAttemptOutcome::ContractRejected {
+                reason: SearchBoundaryContractFailure::UnexpectedHttpStatus,
+            }
+        ));
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::PrimarySearchContractRejected,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn google_rate_limit_falls_back_and_bing_failure_is_terminal() {
+        let (client, requests, server) = search_fixture(vec![
+            (StatusCode::TOO_MANY_REQUESTS, "rate limited"),
+            (StatusCode::SERVICE_UNAVAILABLE, "unavailable"),
+        ])
+        .await;
+
+        let execution = client.search_web("rust").await;
+
+        server.abort();
+        assert_eq!(requests.lock().unwrap().len(), 2);
+        assert!(matches!(
+            execution.attempts[0].outcome,
+            SearchEngineAttemptOutcome::Unavailable {
+                reason: SearchEngineUnavailability::RateLimited,
+            }
+        ));
+        assert!(matches!(
+            execution.attempts[1].outcome,
+            SearchEngineAttemptOutcome::Unavailable {
+                reason: SearchEngineUnavailability::ServerError,
+            }
+        ));
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::FallbackSearchFailed,
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn empty_query_never_reaches_searxng() {
+        let (client, requests, server) = search_fixture(Vec::new()).await;
+
+        let execution = client.search_web("   ").await;
+
+        server.abort();
+        assert!(requests.lock().unwrap().is_empty());
+        assert!(execution.attempts.is_empty());
+        assert!(matches!(
+            execution.completion,
+            WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::InvalidQuery,
+            }
+        ));
     }
 
     #[tokio::test]
@@ -986,8 +1418,12 @@ mod tests {
 
     #[test]
     fn searxng_contract_maps_and_filters_results() {
-        let json = br#"{"results":[{"title":"Skip","url":"ftp://example.com/x"},{"title":"Alpha","url":"https://example.com/a","content":"One"},{"title":"Beta","url":"http://example.com/b"}]}"#;
-        let results = parse_searxng_results("query", json).unwrap();
+        let json = br#"{"results":[{"title":"Skip","url":"ftp://example.com/x","engine":"google","engines":["google"]},{"title":"Alpha","url":"https://example.com/a","content":"One","engine":"google","engines":["google"]},{"title":"Beta","url":"http://example.com/b","engine":"google","engines":["google"]}],"unresponsive_engines":[]}"#;
+        let ParsedSearxngEngineResults::Completed(results) =
+            parse_searxng_engine_results(SearchEngine::Google, "query", json).unwrap()
+        else {
+            panic!("valid Google results were marked unresponsive");
+        };
         assert_eq!(results.len(), 2);
         assert_eq!(results[0].rank, 1);
         assert_eq!(results[1].rank, 2);
@@ -1000,19 +1436,63 @@ mod tests {
     }
 
     #[test]
-    fn searxng_rejects_bad_json_and_empty_results() {
-        assert!(parse_searxng_results("query", b"not json").is_err());
-        assert!(parse_searxng_results("query", br#"{"results":[]}"#).is_err());
+    fn searxng_contract_keeps_at_most_ten_results_with_contiguous_ranks() {
+        let results = (0..12)
+            .map(|index| {
+                serde_json::json!({
+                    "title": format!("Result {index}"),
+                    "url": format!("https://example.com/{index}"),
+                    "engine": "google",
+                    "engines": ["google"],
+                })
+            })
+            .collect::<Vec<_>>();
+        let body = serde_json::to_vec(&serde_json::json!({
+            "results": results,
+            "unresponsive_engines": [],
+        }))
+        .unwrap();
+
+        let ParsedSearxngEngineResults::Completed(results) =
+            parse_searxng_engine_results(SearchEngine::Google, "query", &body).unwrap()
+        else {
+            panic!("valid Google results were marked unresponsive");
+        };
+
+        assert_eq!(results.len(), 10);
+        assert_eq!(
+            results.iter().map(|result| result.rank).collect::<Vec<_>>(),
+            (1..=10).collect::<Vec<_>>()
+        );
     }
 
     #[test]
-    fn bing_rss_fallback_maps_valid_items_and_rejects_empty_feeds() {
-        let feed = br#"<?xml version="1.0"?><rss><channel><item><title>Rust</title><link>https://www.rust-lang.org/</link><description>Language</description></item><item><title>Invalid</title><link>javascript:alert(1)</link></item></channel></rss>"#;
-        let results = parse_bing_rss_results("rust", feed).unwrap();
-        assert_eq!(results.len(), 1);
-        assert_eq!(results[0].title, "Rust");
-        assert_eq!(results[0].rank, 1);
-        assert!(parse_bing_rss_results("rust", b"<rss><channel/></rss>").is_err());
+    fn searxng_contract_accepts_proven_empty_and_rejects_unproven_payloads() {
+        assert_eq!(
+            parse_searxng_engine_results(
+                SearchEngine::Google,
+                "query",
+                br#"{"results":[],"unresponsive_engines":[]}"#,
+            )
+            .map(|parsed| matches!(parsed, ParsedSearxngEngineResults::Completed(results) if results.is_empty())),
+            Ok(true)
+        );
+        assert_eq!(
+            parse_searxng_engine_results(SearchEngine::Google, "query", b"not json"),
+            Err(SearchBoundaryContractFailure::InvalidResponse)
+        );
+        assert_eq!(
+            parse_searxng_engine_results(SearchEngine::Google, "query", br#"{"results":[]}"#,),
+            Err(SearchBoundaryContractFailure::InvalidResponse)
+        );
+        assert_eq!(
+            parse_searxng_engine_results(
+                SearchEngine::Google,
+                "query",
+                br#"{"results":[{"title":"Hidden","url":"ftp://example.com/x","engine":"bing","engines":["bing"]}],"unresponsive_engines":[]}"#,
+            ),
+            Err(SearchBoundaryContractFailure::EngineSelectionViolation)
+        );
     }
 
     #[test]

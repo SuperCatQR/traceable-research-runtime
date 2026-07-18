@@ -46,4 +46,4 @@ Clarification schema v5 不兼容旧 v2/v3/v4 `ask | complete` / 专用问题事
 - 研究正在执行时如何处理用户的新消息（排队、取消重启或创建新 Turn）需要单独定义生命周期；
   当前同一 Conversation 仍只允许一个未完成 Turn。
 - Google 优先、Bing 回退的搜索策略另见
-  [搜索待办](../../todo/2026-07-16-google-first-searxng-search-fallback.md)。
+  [搜索计划](../plans/2026-07-16-google-first-searxng-search-fallback.md)。

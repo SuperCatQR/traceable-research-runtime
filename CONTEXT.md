@@ -34,10 +34,18 @@ _Avoid_: Page, document, crawl result
 A verifiable statement in the final answer linked to one or more Web Snapshots.
 _Avoid_: Fact, citation
 
+**Search Engine Attempt**:
+One explicit request to a single SearXNG engine for one query, with a typed completed, unavailable, or contract-rejected outcome. Google is always attempted first; Bing is attempted only after a Google unavailable outcome.
+_Avoid_: Search retry, provider call
+
+**Exploration Stop Reason**:
+The single persisted reason a Research Run stops generating new search rounds: planned rounds completed, input budget reached, snapshot limit reached, or no new URLs found.
+_Avoid_: Search error, completion status
+
 ## Trace Disclosure
 
 **Research Trace**:
-An append-only audit record of how one Research Turn was understood, prepared, researched, and completed or failed.
+An append-only v7 audit record of how one Research Turn was understood, prepared, researched, and completed or failed. Every research event has a stable sequence and occurrence time.
 _Avoid_: Debug log, chain-of-thought
 
 **Research Overview**:

@@ -4,7 +4,7 @@ use serde_json::{Value, json};
 
 use crate::{
     CompletedTurnContext, Crawl4AiSnapshotClient, FrozenResearchBrief, OpenAiCompatibleModelClient,
-    Result, SearchResult, SearxngSearchClient, Snapshot, SnapshotNavigationExcerpt,
+    Result, SearxngSearchClient, Snapshot, SnapshotNavigationExcerpt, WebSearchExecution,
     research_run::ResearchExecutionBackend,
 };
 
@@ -78,7 +78,7 @@ impl ResearchExecutionBackend for LiveResearchBackend {
         .await
     }
 
-    async fn search_web(&mut self, query: &str) -> Result<Vec<SearchResult>> {
+    async fn search_web(&mut self, query: &str) -> WebSearchExecution {
         self.web_search_client.search_web(query).await
     }
 

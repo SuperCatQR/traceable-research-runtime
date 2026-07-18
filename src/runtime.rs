@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     env, fs,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
@@ -14,12 +14,12 @@ use crate::{
     CLARIFICATION_PROMPT, ClarificationError, ClarificationEvent, ClarificationEventKind,
     ClarificationEventLog, ClarificationLocks, ClarificationModelParseOutcome, ClarificationState,
     ClarificationStatus, Crawl4AiSnapshotClient, FrozenResearchBrief, LiveResearchBackend,
-    ModelKnowledgeDraft, OpenAiCompatibleModelClient, ReplayedRunHeader, ResearchAnswerComparison,
+    ModelKnowledgeDraft, OpenAiCompatibleModelClient, ResearchAnswerComparison,
     ResearchAnswerStyle, ResearchClaimOrigin, ResearchError, RunHeader, SearxngSearchClient,
     SnapshotReader, SnapshotRef, SnapshotWriter, TracePolicy, TraceWriter,
     clarification_cancelled_event, clarification_user_message_event,
     events_from_clarification_model_output, parse_clarification_model_attempt,
-    replay_clarification, replay_run_header,
+    replay_clarification, replay_trace,
     research_run::{EvidenceSource, ResearchRunExecutor, ResearchRunOutput},
     research_run_prepared_event_with_answer_style, validate_trace_policy,
 };
@@ -729,22 +729,13 @@ impl TraceableResearchRuntime {
             Err(ResearchError::Trace(error))
                 if error.kind() == std::io::ErrorKind::AlreadyExists =>
             {
-                match replay_run_header(self.research_trace_path(&header.run_id))? {
-                    ReplayedRunHeader::V6(existing) if existing.as_ref() == &header => {}
-                    ReplayedRunHeader::Legacy { .. } => {
-                        return Err(ResearchError::Trace(std::io::Error::new(
-                            std::io::ErrorKind::InvalidData,
-                            "legacy trace is replayable but cannot resume as a session run",
-                        ))
-                        .into());
-                    }
-                    _ => {
-                        return Err(ResearchError::Trace(std::io::Error::new(
-                            std::io::ErrorKind::AlreadyExists,
-                            "existing trace header does not match frozen intake",
-                        ))
-                        .into());
-                    }
+                let replayed = replay_trace(self.research_trace_path(&header.run_id))?;
+                if replayed.header != header {
+                    return Err(ResearchError::Trace(std::io::Error::new(
+                        std::io::ErrorKind::AlreadyExists,
+                        "existing trace header does not match frozen intake",
+                    ))
+                    .into());
                 }
             }
             Err(error) => return Err(error.into()),
@@ -856,53 +847,17 @@ impl TraceableResearchRuntime {
         if !path.exists() {
             return Ok(TerminalRecovery::None);
         }
-        match replay_run_header(&path).map_err(research_setup_error)? {
-            ReplayedRunHeader::V6(existing) if existing.as_ref() == header => {}
-            _ => {
-                return Err(research_setup_error(
-                    "existing trace header does not match frozen run",
-                ));
-            }
+        let replayed = replay_trace(&path).map_err(research_setup_error)?;
+        if &replayed.header != header {
+            return Err(research_setup_error(
+                "existing trace header does not match frozen run",
+            ));
         }
-        let contents = fs::read_to_string(&path).map_err(research_setup_error)?;
-        if !contents.ends_with('\n') {
-            return Err(research_setup_error("truncated terminal trace"));
-        }
-        let events = contents
-            .lines()
-            .skip(1)
-            .map(serde_json::from_str::<crate::TraceEvent>)
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(research_setup_error)?;
-        let mut completed_round = 0;
-        for event in &events {
-            match event {
-                crate::TraceEvent::RoundCompleted { round, .. } => {
-                    if *round != completed_round + 1 || *round > header.policy.rounds {
-                        return Err(research_setup_error(
-                            "invalid terminal trace round sequence",
-                        ));
-                    }
-                    completed_round = *round;
-                }
-                crate::TraceEvent::RunHeader { .. } => {
-                    return Err(research_setup_error(
-                        "duplicate run header in terminal trace",
-                    ));
-                }
-                crate::TraceEvent::RunFailed { .. } => {}
-                _ => {}
-            }
-        }
-        let answer_count = events
-            .iter()
-            .filter(|event| matches!(event, crate::TraceEvent::ComposedResearchAnswer { .. }))
-            .count();
         if let Some(crate::TraceEvent::RunFailed {
             error_class,
             stage,
             message,
-        }) = events.last()
+        }) = replayed.events.last().map(|envelope| &envelope.event)
         {
             return Ok(TerminalRecovery::Failed(ResearchError::PersistedFailure {
                 error_class: *error_class,
@@ -910,44 +865,40 @@ impl TraceableResearchRuntime {
                 message: message.clone(),
             }));
         }
-        if answer_count == 0 {
+        if replayed.run_replay.completed_round == 0 {
+            if replayed.is_terminal() {
+                return Err(research_setup_error(
+                    "terminal trace has no completed exploration round",
+                ));
+            }
             return Ok(TerminalRecovery::None);
-        }
-        if answer_count != 1 {
-            return Err(research_setup_error(
-                "terminal trace must contain exactly one answer",
-            ));
-        }
-        if completed_round == 0 {
-            return Err(research_setup_error(
-                "terminal trace has no completed exploration round",
-            ));
         }
         let Some(crate::TraceEvent::ComposedResearchAnswer {
             answer,
             claims,
             comparison,
-        }) = events.last()
+        }) = replayed.events.last().map(|envelope| &envelope.event)
         else {
             return Ok(TerminalRecovery::None);
         };
+        if replayed.run_replay.exploration_stop_reason.is_none() {
+            return Err(research_setup_error(
+                "terminal trace has no exploration stop reason",
+            ));
+        }
         let answer = crate::ComposedResearchAnswer {
             answer: answer.clone(),
             claims: claims.clone(),
             comparison: comparison.clone(),
         };
-        let knowledge_draft = events
+        let knowledge_draft = replayed
+            .events
             .iter()
-            .find_map(|event| match event {
+            .find_map(|envelope| match &envelope.event {
                 crate::TraceEvent::KnowledgeDraft { draft } => Some(draft.clone()),
                 _ => None,
             })
-            .unwrap_or_else(|| ModelKnowledgeDraft {
-                answer: "Legacy run: no independent model knowledge draft was recorded.".into(),
-                claims: Vec::new(),
-                uncertainty: "This pre-v4 run contains only Web-grounded output.".into(),
-                basis_summary: "Legacy trace contains no model knowledge basis summary.".into(),
-            });
+            .ok_or_else(|| research_setup_error("terminal trace has no model knowledge draft"))?;
         let reader = SnapshotReader::open(
             self.infrastructure
                 .research_data_dir
@@ -1056,6 +1007,30 @@ pub struct EvidenceSourceResponse {
     pub title: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChatResearchAnswerResponse {
+    pub answer: String,
+    pub sources: Vec<EvidenceSourceResponse>,
+}
+
+#[must_use]
+pub fn project_chat_research_answer(
+    complete_answer: &ResearchAnswerResponse,
+) -> ChatResearchAnswerResponse {
+    let mut seen_sources = HashSet::new();
+    let sources = complete_answer
+        .claims
+        .iter()
+        .flat_map(|claim| claim.sources.iter())
+        .filter(|source| seen_sources.insert((source.url.clone(), source.title.clone())))
+        .cloned()
+        .collect();
+    ChatResearchAnswerResponse {
+        answer: complete_answer.answer.clone(),
+        sources,
+    }
+}
+
 fn build_research_answer_response(
     result: ResearchRunOutput,
 ) -> Result<ResearchAnswerResponse, ResearchError> {
@@ -1111,7 +1086,7 @@ fn build_research_answer_response(
 
 #[cfg(test)]
 mod tests {
-    use std::{fs, io::Write, time::SystemTime};
+    use std::{fs, time::SystemTime};
 
     use super::*;
     use crate::{
@@ -1479,11 +1454,9 @@ mod tests {
             policy: first.policy.clone(),
             answer_style: first.answer_style,
         };
-        assert!(matches!(
-            replay_run_header(runtime.research_trace_path(&first.run_id)).unwrap(),
-            ReplayedRunHeader::V6(replayed)
-                if replayed.run_id == first.run_id && replayed.brief == first.brief
-        ));
+        let replayed = replay_trace(runtime.research_trace_path(&first.run_id)).unwrap();
+        assert_eq!(replayed.header.run_id, first.run_id);
+        assert_eq!(replayed.header.brief, first.brief);
         assert!(matches!(
             runtime.recover_completed_research(&header).unwrap(),
             TerminalRecovery::None
@@ -1527,11 +1500,9 @@ mod tests {
 
         assert_eq!(repaired.run_id, "run-before-crash");
         assert_eq!(repaired.policy, test_policy());
-        assert!(matches!(
-            replay_run_header(runtime.research_trace_path(&repaired.run_id)).unwrap(),
-            ReplayedRunHeader::V6(header)
-                if header.run_id == repaired.run_id && header.brief == repaired.brief
-        ));
+        let replayed = replay_trace(runtime.research_trace_path(&repaired.run_id)).unwrap();
+        assert_eq!(replayed.header.run_id, repaired.run_id);
+        assert_eq!(replayed.header.brief, repaired.brief);
         fs::remove_dir_all(&runtime.infrastructure.research_data_dir).unwrap();
     }
 
@@ -1599,20 +1570,28 @@ mod tests {
             .prepare_research_run(clarification_id, test_policy())
             .await
             .unwrap();
-        let mut trace = fs::OpenOptions::new()
-            .append(true)
-            .open(runtime.research_trace_path(&prepared.run_id))
-            .unwrap();
-        serde_json::to_writer(
-            &mut trace,
-            &crate::TraceEvent::RunFailed {
+        let header = RunHeader {
+            run_id: prepared.run_id.clone(),
+            clarification_id: prepared.brief.clarification_id().into(),
+            session_id: prepared.session_id.clone(),
+            turn: prepared.turn,
+            brief: prepared.brief.clone(),
+            started_at: *prepared.brief.frozen_at(),
+            policy: prepared.policy.clone(),
+            answer_style: prepared.answer_style,
+        };
+        let (mut trace, _) = TraceWriter::resume(
+            runtime.infrastructure.research_data_dir.join("traces"),
+            &header,
+        )
+        .unwrap();
+        trace
+            .append(&crate::TraceEvent::RunFailed {
                 error_class: crate::ErrorClass::External,
                 stage: crate::ResearchStage::Planning,
                 message: "persisted failure".into(),
-            },
-        )
-        .unwrap();
-        trace.write_all(b"\n").unwrap();
+            })
+            .unwrap();
         drop(trace);
 
         let error = runtime
@@ -1864,49 +1843,56 @@ mod tests {
     }
 
     #[test]
-    fn build_research_answer_response_hides_snapshot_refs() {
+    fn chat_research_answer_contains_only_answer_and_necessary_sources() {
         let reference = SnapshotRef::from_id("abc123");
-        let value = serde_json::to_value(
-            build_research_answer_response(ResearchRunOutput {
-                answer: ComposedResearchAnswer {
-                    answer: "Grounded".into(),
-                    claims: vec![
-                        ComposedResearchClaim {
-                            text: "Model view".into(),
-                            origin: ResearchClaimOrigin::ModelKnowledge,
-                            snapshot_refs: Vec::new(),
-                            rationale: "Fixture retains this model knowledge view.".into(),
-                        },
-                        ComposedResearchClaim {
-                            text: "Fact".into(),
-                            origin: ResearchClaimOrigin::WebEvidence,
-                            snapshot_refs: vec![reference.clone()],
-                            rationale: "Fixture source supports this factual claim.".into(),
-                        },
-                    ],
-                    comparison: ResearchAnswerComparison {
-                        agreements: Vec::new(),
-                        differences: Vec::new(),
-                        synthesis_rationale: "fixture".into(),
+        let complete_answer = build_research_answer_response(ResearchRunOutput {
+            answer: ComposedResearchAnswer {
+                answer: "Grounded".into(),
+                claims: vec![
+                    ComposedResearchClaim {
+                        text: "Model view".into(),
+                        origin: ResearchClaimOrigin::ModelKnowledge,
+                        snapshot_refs: Vec::new(),
+                        rationale: "Fixture retains this model knowledge view.".into(),
                     },
+                    ComposedResearchClaim {
+                        text: "Fact".into(),
+                        origin: ResearchClaimOrigin::WebEvidence,
+                        snapshot_refs: vec![reference.clone()],
+                        rationale: "Fixture source supports this factual claim.".into(),
+                    },
+                ],
+                comparison: ResearchAnswerComparison {
+                    agreements: Vec::new(),
+                    differences: Vec::new(),
+                    synthesis_rationale: "fixture".into(),
                 },
-                knowledge_draft: ModelKnowledgeDraft {
-                    answer: "Model view".into(),
-                    claims: vec!["Model view".into()],
-                    uncertainty: "Fixture uncertainty".into(),
-                    basis_summary: "Fixture model knowledge basis.".into(),
-                },
-                answer_style: ResearchAnswerStyle::WebFirst,
-                sources: vec![EvidenceSource {
-                    snapshot_ref: reference,
-                    url: "https://example.com/final".into(),
-                    title: "Example".into(),
-                }],
-            })
-            .unwrap(),
-        )
+            },
+            knowledge_draft: ModelKnowledgeDraft {
+                answer: "Model view".into(),
+                claims: vec!["Model view".into()],
+                uncertainty: "Fixture uncertainty".into(),
+                basis_summary: "Fixture model knowledge basis.".into(),
+            },
+            answer_style: ResearchAnswerStyle::WebFirst,
+            sources: vec![EvidenceSource {
+                snapshot_ref: reference,
+                url: "https://example.com/final".into(),
+                title: "Example".into(),
+            }],
+        })
         .unwrap();
-        assert_eq!(value["claims"][1]["sources"][0]["title"], "Example");
-        assert!(!value.to_string().contains("snapshot_ref"));
+        let value = serde_json::to_value(project_chat_research_answer(&complete_answer)).unwrap();
+
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "answer": "Grounded",
+                "sources": [{
+                    "url": "https://example.com/final",
+                    "title": "Example"
+                }]
+            })
+        );
     }
 }

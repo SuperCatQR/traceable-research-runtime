@@ -1,6 +1,6 @@
 # 三级 Trace 展示计划
 
-> Historical implementation plan. The remaining Trace v7 work is tracked in `../../plans/2026-07-16-trace-boundary-hardening-plan.md`.
+> Historical implementation plan. The completed Trace v7 follow-up is archived in `2026-07-16-trace-boundary-hardening-plan.md`.
 
 - 状态：已实施
 - 日期：2026-07-16

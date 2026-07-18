@@ -46,21 +46,25 @@ pub use live_research_backend::{
 };
 pub use research_domain::{
     BriefValidationError, ComposedResearchAnswer, ComposedResearchClaim, CrawlBodyKind, CrawlMeta,
-    FrozenResearchBrief, MAX_DECISION_RATIONALE_CHARS, MIN_DECISION_RATIONALE_CHARS,
-    ModelKnowledgeDraft, RESEARCH_BRIEF_SCHEMA_VERSION, RationaleAuditStatus,
-    ResearchAnswerComparison, ResearchAnswerStyle, ResearchBrief, ResearchClaimOrigin,
-    ResearchScope, SearchQuery, SearchResult, Snapshot, SnapshotNavigationExcerpt, SnapshotRef,
-    content_hash, search_result_id, snapshot_id, snapshot_ref, validate_decision_rationale,
+    ExplorationStopReason, FrozenResearchBrief, MAX_DECISION_RATIONALE_CHARS,
+    MIN_DECISION_RATIONALE_CHARS, ModelKnowledgeDraft, RESEARCH_BRIEF_SCHEMA_VERSION,
+    RationaleAuditStatus, ResearchAnswerComparison, ResearchAnswerStyle, ResearchBrief,
+    ResearchClaimOrigin, ResearchScope, SearchBoundaryContractFailure, SearchEngine,
+    SearchEngineAttempt, SearchEngineAttemptOutcome, SearchEngineUnavailability, SearchQuery,
+    SearchResult, Snapshot, SnapshotNavigationExcerpt, SnapshotRef, WebSearchCompletion,
+    WebSearchExecution, WebSearchFailureReason, content_hash, search_result_id, snapshot_id,
+    snapshot_ref, validate_decision_rationale,
 };
 pub use research_error::{ErrorClass, ResearchError, ResearchStage, Result};
 pub use research_trace::{
-    ReplayedRunHeader, RunHeader, RunReplay, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent,
-    TracePolicy, TraceWriter, replay_run_header, validate_trace_event_for_schema,
+    ReplayedTrace, RunHeader, RunReplay, SourceSelection, TRACE_SCHEMA_VERSION, TraceEvent,
+    TraceEventEnvelope, TracePolicy, TraceWriter, replay_trace, validate_trace_event_for_schema,
     validate_trace_policy,
 };
 pub use runtime::{
-    EvidenceSourceResponse, ModelAccessConfig, PreparedResearchRun, ResearchAnswerResponse,
-    ResearchClaimResponse, ResearchInfrastructureConfig, ResearchPreparationError,
-    ResearchRuntimeError, TraceableResearchRuntime,
+    ChatResearchAnswerResponse, EvidenceSourceResponse, ModelAccessConfig, PreparedResearchRun,
+    ResearchAnswerResponse, ResearchClaimResponse, ResearchInfrastructureConfig,
+    ResearchPreparationError, ResearchRuntimeError, TraceableResearchRuntime,
+    project_chat_research_answer,
 };
 pub use snapshot_store::{SnapshotReader, SnapshotWriter};

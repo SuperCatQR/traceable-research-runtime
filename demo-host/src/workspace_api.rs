@@ -14,14 +14,16 @@ use axum_extra::extract::{
     CookieJar,
     cookie::{Cookie, SameSite},
 };
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use time::Duration as CookieDuration;
 use traceable_search::{
-    ClarificationEvent, ClarificationEventKind, ClarificationState, ClarificationStatus,
-    DialogueMessage, ModelAccessConfig, OpenAiCompatibleModelClient, RationaleAuditStatus,
-    ResearchAnswerResponse, ResearchAnswerStyle, TraceEvent, TracePolicy, replay_run_header,
-    validate_public_web_url, validate_trace_event_for_schema,
+    ChatResearchAnswerResponse, ClarificationEvent, ClarificationEventKind, ClarificationState,
+    ClarificationStatus, DialogueMessage, ExplorationStopReason, ModelAccessConfig,
+    OpenAiCompatibleModelClient, RationaleAuditStatus, ResearchAnswerResponse, ResearchAnswerStyle,
+    SearchBoundaryContractFailure, SearchEngine, SearchEngineAttemptOutcome,
+    SearchEngineUnavailability, TraceEvent, TraceEventEnvelope, TracePolicy,
+    project_chat_research_answer, replay_trace, validate_public_web_url,
 };
 use url::Url;
 use uuid::Uuid;
@@ -210,14 +212,9 @@ struct TurnDialogueResponse {
 struct ResearchTurnResponse {
     turn_id: String,
     turn_number: i64,
-    run_id: Option<String>,
     user_question: String,
     status: &'static str,
-    answer_style: ResearchAnswerStyle,
-    model_profile_id: String,
-    model_api_base_url: String,
-    model_id: String,
-    answer: Option<ResearchAnswerResponse>,
+    answer: Option<ChatResearchAnswerResponse>,
     dialogue: Option<TurnDialogueResponse>,
     created_at: i64,
     updated_at: i64,
@@ -280,6 +277,8 @@ struct TraceAuditPageResponse {
 
 #[derive(Debug, Clone, Serialize)]
 struct TraceAuditEntryResponse {
+    sequence: Option<u64>,
+    occurred_at: Option<DateTime<Utc>>,
     stage: &'static str,
     label: &'static str,
     detail: String,
@@ -290,7 +289,7 @@ struct LoadedTurnTrace {
     turn: ResearchTurnRecord,
     clarification: ClarificationState,
     clarification_events: Vec<ClarificationEvent>,
-    research_events: Vec<TraceEvent>,
+    research_events: Vec<TraceEventEnvelope>,
     research_rationale_audit_status: Option<RationaleAuditStatus>,
 }
 
@@ -1238,20 +1237,19 @@ async fn load_owned_turn_trace(
             .clarification_trace_path(&turn.clarification_id),
     )?;
     let (research_events, research_rationale_audit_status) = if let Some(run_id) = &turn.run_id {
-        let header = replay_run_header(state.research_runtime.research_trace_path(run_id))
+        let replayed = replay_trace(state.research_runtime.research_trace_path(run_id))
             .map_err(|error| PublicHttpError::internal_failure(error.to_string()))?;
-        let rationale_audit_status = header.rationale_audit_status();
-        let research_events =
-            read_jsonl_events::<TraceEvent>(state.research_runtime.research_trace_path(run_id))?;
-        let schema_version = match &header {
-            traceable_search::ReplayedRunHeader::Legacy { schema_version, .. } => *schema_version,
-            traceable_search::ReplayedRunHeader::V6(_) => traceable_search::TRACE_SCHEMA_VERSION,
-        };
-        for event in &research_events {
-            validate_trace_event_for_schema(schema_version, event)
-                .map_err(|error| PublicHttpError::internal_failure(error.to_string()))?;
+        if replayed.header.run_id != *run_id
+            || replayed.header.clarification_id != turn.clarification_id
+        {
+            return Err(PublicHttpError::internal_failure(
+                "research trace header does not match the owned turn",
+            ));
         }
-        (research_events, Some(rationale_audit_status))
+        (
+            replayed.events,
+            Some(RationaleAuditStatus::RequiredAndValidated),
+        )
     } else {
         (Vec::new(), None)
     };
@@ -1301,8 +1299,8 @@ fn project_trace_summary(trace: &LoadedTurnTrace) -> ResearchTraceSummaryRespons
             message: concise_trace_text(message, 320),
         })
     });
-    for event in &trace.research_events {
-        match event {
+    for envelope in &trace.research_events {
+        match &envelope.event {
             TraceEvent::SearchQuery { round, query, gap } => {
                 let entry = rounds.entry(*round).or_insert_with(|| TraceRoundResponse {
                     round: *round,
@@ -1357,7 +1355,7 @@ fn project_trace_summary(trace: &LoadedTurnTrace) -> ResearchTraceSummaryRespons
     let selected_sources = trace
         .research_events
         .iter()
-        .filter_map(|event| match event {
+        .filter_map(|envelope| match &envelope.event {
             TraceEvent::SnapshotSelection { selected } => Some(selected.as_slice()),
             _ => None,
         })
@@ -1435,9 +1433,10 @@ fn project_audit_entries(trace: &LoadedTurnTrace) -> Vec<TraceAuditEntryResponse
             }
         }
     }
-    for event in &trace.research_events {
-        match event {
-            TraceEvent::RunHeader { run_id, .. } => entries.push(audit_entry(
+    for envelope in &trace.research_events {
+        match &envelope.event {
+            TraceEvent::RunHeader { run_id, .. } => entries.push(research_audit_entry(
+                envelope,
                 "setup",
                 "研究运行",
                 &format!("运行标识：{run_id}"),
@@ -1449,7 +1448,8 @@ fn project_audit_entries(trace: &LoadedTurnTrace) -> Vec<TraceAuditEntryResponse
                 output_chars,
                 error_class,
                 ..
-            } => entries.push(audit_entry(
+            } => entries.push(research_audit_entry(
+                envelope,
                 "planning",
                 "模型调用",
                 &format!(
@@ -1462,45 +1462,100 @@ fn project_audit_entries(trace: &LoadedTurnTrace) -> Vec<TraceAuditEntryResponse
                 ),
                 None,
             )),
-            TraceEvent::KnowledgeDraft { draft } => entries.push(audit_entry(
+            TraceEvent::KnowledgeDraft { draft } => entries.push(research_audit_entry(
+                envelope,
                 "planning",
                 "模型知识草稿依据",
                 &draft.uncertainty,
                 Some(&draft.basis_summary),
             )),
-            TraceEvent::SearchQuery { round, query, gap } => entries.push(audit_entry(
+            TraceEvent::SearchQuery { round, query, gap } => entries.push(research_audit_entry(
+                envelope,
                 "planning",
                 "检索计划",
                 &format!("第 {round} 轮：{query}"),
                 Some(gap),
             )),
+            TraceEvent::SearchAttemptCompleted {
+                round,
+                engine,
+                outcome,
+                http_status,
+                ..
+            } => entries.push(research_audit_entry(
+                envelope,
+                "search",
+                "搜索引擎尝试",
+                &search_attempt_audit_detail(*round, *engine, outcome, *http_status),
+                None,
+            )),
+            TraceEvent::SearchFallbackActivated {
+                round,
+                from_engine,
+                to_engine,
+                reason,
+                ..
+            } => entries.push(research_audit_entry(
+                envelope,
+                "search",
+                "启用搜索回退",
+                &format!(
+                    "第 {round} 轮；{} 不可用，切换到 {}；{}",
+                    search_engine_label(*from_engine),
+                    search_engine_label(*to_engine),
+                    search_unavailability_text(*reason)
+                ),
+                None,
+            )),
             TraceEvent::SearchResult {
-                title, url, rank, ..
-            } => entries.push(audit_entry(
+                search_engine,
+                title,
+                url,
+                rank,
+                ..
+            } => entries.push(research_audit_entry(
+                envelope,
                 "search",
                 "搜索结果",
-                &format!("排名 {rank}：{title}（{url}）"),
+                &format!(
+                    "{} 排名 {rank}：{title}（{url}）",
+                    search_engine_label(*search_engine)
+                ),
                 None,
             )),
             TraceEvent::Archive {
                 final_url,
                 char_len,
                 ..
-            } => entries.push(audit_entry(
+            } => entries.push(research_audit_entry(
+                envelope,
                 "archive",
                 "网页已归档",
                 &format!("{final_url}；正文 {char_len} 字符"),
                 None,
             )),
             TraceEvent::ArchiveSkip { reason, .. } => {
-                entries.push(audit_entry("archive", "网页未归档", reason, None));
+                entries.push(research_audit_entry(
+                    envelope,
+                    "archive",
+                    "网页未归档",
+                    reason,
+                    None,
+                ));
             }
-            TraceEvent::SnapshotNavigationExcerpt { title, excerpt, .. } => entries.push(
-                audit_entry("archive", "来源摘要", &format!("{title}：{excerpt}"), None),
-            ),
+            TraceEvent::SnapshotNavigationExcerpt { title, excerpt, .. } => {
+                entries.push(research_audit_entry(
+                    envelope,
+                    "archive",
+                    "来源摘要",
+                    &format!("{title}：{excerpt}"),
+                    None,
+                ))
+            }
             TraceEvent::SnapshotSelection { selected } => {
                 for selection in selected {
-                    entries.push(audit_entry(
+                    entries.push(research_audit_entry(
+                        envelope,
                         "selection",
                         "选取来源",
                         &selection.snapshot_ref.to_string(),
@@ -1513,7 +1568,8 @@ fn project_audit_entries(trace: &LoadedTurnTrace) -> Vec<TraceAuditEntryResponse
                 origin,
                 rationale,
                 ..
-            } => entries.push(audit_entry(
+            } => entries.push(research_audit_entry(
+                envelope,
                 "synthesis",
                 match origin {
                     traceable_search::ResearchClaimOrigin::ModelKnowledge => "保留模型知识主张",
@@ -1522,19 +1578,37 @@ fn project_audit_entries(trace: &LoadedTurnTrace) -> Vec<TraceAuditEntryResponse
                 text,
                 Some(rationale),
             )),
-            TraceEvent::ComposedResearchAnswer { comparison, .. } => entries.push(audit_entry(
-                "synthesis",
-                "最终综合",
-                "模型知识与网页证据已完成对照。",
-                Some(&comparison.synthesis_rationale),
-            )),
-            TraceEvent::RoundCompleted { round, .. } => entries.push(audit_entry(
+            TraceEvent::ComposedResearchAnswer { comparison, .. } => {
+                entries.push(research_audit_entry(
+                    envelope,
+                    "synthesis",
+                    "最终综合",
+                    "模型知识与网页证据已完成对照。",
+                    Some(&comparison.synthesis_rationale),
+                ))
+            }
+            TraceEvent::RoundCompleted { round, .. } => entries.push(research_audit_entry(
+                envelope,
                 "planning",
                 "检索轮次完成",
                 &format!("第 {round} 轮已完成。"),
                 None,
             )),
-            TraceEvent::RunFailed { stage, message, .. } => entries.push(audit_entry(
+            TraceEvent::ExplorationStopped {
+                completed_round,
+                reason,
+            } => entries.push(research_audit_entry(
+                envelope,
+                "planning",
+                "探索停止",
+                &format!(
+                    "已完成 {completed_round} 轮；{}",
+                    exploration_stop_reason_text(*reason)
+                ),
+                None,
+            )),
+            TraceEvent::RunFailed { stage, message, .. } => entries.push(research_audit_entry(
+                envelope,
                 "failure",
                 "研究运行失败",
                 &format!("{stage:?}：{message}"),
@@ -1552,10 +1626,90 @@ fn audit_entry(
     rationale: Option<&str>,
 ) -> TraceAuditEntryResponse {
     TraceAuditEntryResponse {
+        sequence: None,
+        occurred_at: None,
         stage,
         label,
         detail: concise_trace_text(detail, 600),
         rationale: rationale.map(|value| concise_trace_text(value, 480)),
+    }
+}
+
+fn research_audit_entry(
+    envelope: &TraceEventEnvelope,
+    stage: &'static str,
+    label: &'static str,
+    detail: &str,
+    rationale: Option<&str>,
+) -> TraceAuditEntryResponse {
+    let mut entry = audit_entry(stage, label, detail, rationale);
+    entry.sequence = Some(envelope.sequence);
+    entry.occurred_at = Some(envelope.occurred_at);
+    entry
+}
+
+const fn search_engine_label(engine: SearchEngine) -> &'static str {
+    match engine {
+        SearchEngine::Google => "Google",
+        SearchEngine::Bing => "Bing",
+    }
+}
+
+fn search_attempt_outcome_text(outcome: &SearchEngineAttemptOutcome) -> String {
+    match outcome {
+        SearchEngineAttemptOutcome::Completed { valid_result_count } => {
+            format!("完成，{valid_result_count} 条有效结果")
+        }
+        SearchEngineAttemptOutcome::Unavailable { reason } => {
+            format!("不可用，{}", search_unavailability_text(*reason))
+        }
+        SearchEngineAttemptOutcome::ContractRejected { reason } => {
+            format!("响应被拒绝，{}", search_contract_failure_text(*reason))
+        }
+    }
+}
+
+fn search_attempt_audit_detail(
+    round: u32,
+    engine: SearchEngine,
+    outcome: &SearchEngineAttemptOutcome,
+    http_status: Option<u16>,
+) -> String {
+    format!(
+        "第 {round} 轮；{}；{}{}",
+        search_engine_label(engine),
+        search_attempt_outcome_text(outcome),
+        http_status
+            .map(|status| format!("；HTTP {status}"))
+            .unwrap_or_default()
+    )
+}
+
+const fn search_unavailability_text(reason: SearchEngineUnavailability) -> &'static str {
+    match reason {
+        SearchEngineUnavailability::TransportFailure => "网络传输失败",
+        SearchEngineUnavailability::RequestTimeout => "请求超时",
+        SearchEngineUnavailability::RateLimited => "请求受到限流",
+        SearchEngineUnavailability::ServerError => "搜索服务端错误",
+        SearchEngineUnavailability::EngineUnresponsive => "引擎未响应",
+    }
+}
+
+const fn search_contract_failure_text(reason: SearchBoundaryContractFailure) -> &'static str {
+    match reason {
+        SearchBoundaryContractFailure::EmptyQuery => "查询为空",
+        SearchBoundaryContractFailure::UnexpectedHttpStatus => "HTTP 状态不符合契约",
+        SearchBoundaryContractFailure::InvalidResponse => "响应结构不符合契约",
+        SearchBoundaryContractFailure::EngineSelectionViolation => "返回结果来自错误引擎",
+    }
+}
+
+const fn exploration_stop_reason_text(reason: ExplorationStopReason) -> &'static str {
+    match reason {
+        ExplorationStopReason::CompletedRounds => "已完成计划轮次",
+        ExplorationStopReason::InputBudget => "已达到输入预算",
+        ExplorationStopReason::SnapshotLimit => "已达到快照上限",
+        ExplorationStopReason::NoNewUrls => "没有发现新的 URL",
     }
 }
 
@@ -1782,25 +1936,21 @@ fn project_research_turn(
     turn: ResearchTurnRecord,
     clarification: Option<ClarificationState>,
 ) -> Result<ResearchTurnResponse, PublicHttpError> {
-    let answer = turn
+    let complete_answer = turn
         .answer_json
         .as_deref()
         .map(serde_json::from_str::<ResearchAnswerResponse>)
         .transpose()
         .map_err(PublicHttpError::internal_failure)?;
+    let answer = complete_answer.as_ref().map(project_chat_research_answer);
     let dialogue = clarification
         .map(|clarification| project_dialogue(clarification, turn.status))
         .transpose()?;
     Ok(ResearchTurnResponse {
         turn_id: turn.turn_id,
         turn_number: turn.turn_number,
-        run_id: turn.run_id,
         user_question: turn.user_question,
         status: turn.status.as_str(),
-        answer_style: turn.answer_style,
-        model_profile_id: turn.model_profile_id,
-        model_api_base_url: turn.model_api_base_url,
-        model_id: turn.model_id,
         answer,
         dialogue,
         created_at: turn.created_at,
@@ -1961,6 +2111,72 @@ mod tests {
     use super::*;
 
     #[test]
+    fn trace_summary_projection_has_no_search_engine_or_fallback_fields() {
+        let value = serde_json::to_value(ResearchTraceSummaryResponse {
+            run_id: Some("run-1".into()),
+            clarification_rationale_audit_status: RationaleAuditStatus::RequiredAndValidated,
+            research_rationale_audit_status: Some(RationaleAuditStatus::RequiredAndValidated),
+            understanding: None,
+            rounds: Vec::new(),
+            archived_source_count: 0,
+            skipped_source_count: 0,
+            selected_sources: Vec::new(),
+            synthesis_rationale: None,
+            failure: None,
+        })
+        .unwrap();
+        let serialized = serde_json::to_string(&value).unwrap();
+
+        assert!(!serialized.contains("engine"));
+        assert!(!serialized.contains("attempt"));
+        assert!(!serialized.contains("fallback"));
+    }
+
+    #[test]
+    fn trace_audit_entry_exposes_v7_order_time_and_search_outcome() {
+        let occurred_at = Utc::now();
+        let envelope = TraceEventEnvelope {
+            sequence: 7,
+            occurred_at,
+            event: TraceEvent::SearchAttemptCompleted {
+                round: 2,
+                query: "primary source".into(),
+                engine: SearchEngine::Google,
+                outcome: SearchEngineAttemptOutcome::Unavailable {
+                    reason: SearchEngineUnavailability::RateLimited,
+                },
+                http_status: Some(429),
+            },
+        };
+        let detail = search_attempt_audit_detail(
+            2,
+            SearchEngine::Google,
+            &SearchEngineAttemptOutcome::Unavailable {
+                reason: SearchEngineUnavailability::RateLimited,
+            },
+            Some(429),
+        );
+        let value = serde_json::to_value(research_audit_entry(
+            &envelope,
+            "search",
+            "搜索引擎尝试",
+            &detail,
+            None,
+        ))
+        .unwrap();
+
+        assert_eq!(value["sequence"], 7);
+        assert_eq!(
+            value["occurred_at"],
+            serde_json::to_value(occurred_at).unwrap()
+        );
+        assert_eq!(
+            value["detail"],
+            "第 2 轮；Google；不可用，请求受到限流；HTTP 429"
+        );
+    }
+
+    #[test]
     fn email_and_password_validation_are_bounded() {
         assert_eq!(
             normalize_email(" User@Example.COM ").unwrap(),
@@ -1994,6 +2210,82 @@ mod tests {
         assert!(!json.contains("ciphertext"));
         assert!(!json.contains("nonce"));
         assert!(!json.contains("\"api_key\":"));
+    }
+
+    #[test]
+    fn chat_turn_projection_exposes_only_l1_fields() {
+        let complete_answer = serde_json::json!({
+            "answer_style": "web_first",
+            "answer": "Grounded answer",
+            "knowledge_draft": {
+                "answer": "draft",
+                "claims": ["draft claim"],
+                "uncertainty": "uncertain",
+                "basis_summary": "review-safe basis"
+            },
+            "comparison": {
+                "agreements": [],
+                "differences": [],
+                "synthesis_rationale": "review-safe synthesis"
+            },
+            "claims": [{
+                "text": "Grounded claim",
+                "origin": "web_evidence",
+                "rationale": "review-safe claim rationale",
+                "sources": [{"url": "https://example.com/", "title": "Example"}]
+            }]
+        });
+        let response = project_research_turn(
+            ResearchTurnRecord {
+                turn_id: "t".repeat(32),
+                conversation_id: "c".repeat(32),
+                turn_number: 1,
+                clarification_id: "i".repeat(32),
+                run_id: Some("r".repeat(32)),
+                user_question: "question".into(),
+                status: ResearchTurnStatus::Completed,
+                answer_style: ResearchAnswerStyle::WebFirst,
+                model_profile_id: "p".repeat(32),
+                model_profile_revision: 1,
+                model_api_base_url: "https://model.example/v1/".into(),
+                model_id: "secret-model-id".into(),
+                answer_json: Some(complete_answer.to_string()),
+                created_at: 1,
+                updated_at: 2,
+                completed_at: Some(2),
+            },
+            None,
+        )
+        .unwrap();
+        let value = serde_json::to_value(response).unwrap();
+        let keys = value
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            keys,
+            [
+                "answer",
+                "completed_at",
+                "created_at",
+                "dialogue",
+                "status",
+                "turn_id",
+                "turn_number",
+                "updated_at",
+                "user_question",
+            ]
+        );
+        assert_eq!(
+            value["answer"],
+            serde_json::json!({
+                "answer": "Grounded answer",
+                "sources": [{"url": "https://example.com/", "title": "Example"}]
+            })
+        );
     }
 
     #[test]

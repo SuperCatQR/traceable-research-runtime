@@ -6,11 +6,12 @@ use serde::Deserialize;
 use url::Url;
 
 use crate::{
-    CompletedTurnContext, ComposedResearchAnswer, ComposedResearchClaim, FrozenResearchBrief,
-    ModelKnowledgeDraft, ResearchAnswerComparison, ResearchAnswerStyle, ResearchClaimOrigin,
-    ResearchError, ResearchStage, Result, RunReplay, SearchQuery, SearchResult, Snapshot,
+    CompletedTurnContext, ComposedResearchAnswer, ComposedResearchClaim, ExplorationStopReason,
+    FrozenResearchBrief, ModelKnowledgeDraft, ResearchAnswerComparison, ResearchAnswerStyle,
+    ResearchClaimOrigin, ResearchError, ResearchStage, Result, RunReplay, SearchQuery, Snapshot,
     SnapshotNavigationExcerpt, SnapshotReader, SnapshotRef, SnapshotWriter, SourceSelection,
-    TraceEvent, TracePolicy, TraceWriter, validate_decision_rationale,
+    TraceEvent, TracePolicy, TraceWriter, WebSearchCompletion, WebSearchExecution,
+    WebSearchFailureReason, validate_decision_rationale,
 };
 
 pub const MIN_EXPLORE_ROUNDS: u32 = 3;
@@ -22,20 +23,12 @@ pub const MAX_SNAPSHOTS: usize = 300;
 pub const MAX_READ_SNAPSHOTS: usize = 100;
 const MAX_QUERY_CHARS: usize = 200;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ResearchRunStopReason {
-    CompletedRounds,
-    InputBudget,
-    SnapshotLimit,
-    NoNewUrls,
-}
-
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct ResearchRunProgress {
     pub round: u32,
     pub estimated_input_tokens: usize,
     pub archived_snapshots: usize,
-    pub stop_reason: Option<ResearchRunStopReason>,
+    pub stop_reason: Option<ExplorationStopReason>,
 }
 
 /// Test seam for the three external effects. Implementations remain sequential.
@@ -54,7 +47,7 @@ pub trait ResearchExecutionBackend {
         previous_queries: &[String],
     ) -> impl Future<Output = Result<String>>;
 
-    fn search_web(&mut self, query: &str) -> impl Future<Output = Result<Vec<SearchResult>>>;
+    fn search_web(&mut self, query: &str) -> impl Future<Output = WebSearchExecution>;
 
     fn capture_web_snapshot(&mut self, url: &str) -> impl Future<Output = Result<Snapshot>>;
 
@@ -170,7 +163,7 @@ impl<B: ResearchExecutionBackend, W: Write> ResearchRunExecutor<B, W> {
                 round: replay.completed_round,
                 estimated_input_tokens: estimate_snapshot_input_tokens(&captured_snapshots),
                 archived_snapshots: captured_snapshots.len(),
-                stop_reason: None,
+                stop_reason: replay.exploration_stop_reason,
             },
             captured_snapshots,
             previous_queries: replay.previous_queries,
@@ -241,18 +234,21 @@ impl<B: ResearchExecutionBackend, W: Write> ResearchRunExecutor<B, W> {
     }
 
     pub async fn execute_exploration(&mut self) -> Result<&ResearchRunProgress> {
+        if self.progress.stop_reason.is_some() {
+            return Ok(&self.progress);
+        }
         for round in self.progress.round + 1..=self.policy.rounds {
-            self.progress.round = round;
             self.progress.estimated_input_tokens =
                 estimate_snapshot_input_tokens(&self.captured_snapshots);
             if self.progress.estimated_input_tokens >= self.policy.input_budget as usize {
-                self.progress.stop_reason = Some(ResearchRunStopReason::InputBudget);
+                self.progress.stop_reason = Some(ExplorationStopReason::InputBudget);
                 break;
             }
             if self.captured_snapshots.len() >= self.policy.max_snapshots as usize {
-                self.progress.stop_reason = Some(ResearchRunStopReason::SnapshotLimit);
+                self.progress.stop_reason = Some(ExplorationStopReason::SnapshotLimit);
                 break;
             }
+            self.progress.round = round;
 
             let input_snapshot_refs = self
                 .captured_snapshots
@@ -292,16 +288,73 @@ impl<B: ResearchExecutionBackend, W: Write> ResearchRunExecutor<B, W> {
             let mut new_results = Vec::new();
             let mut round_urls = HashSet::new();
             for query in queries {
-                let results = self
-                    .execution_backend
-                    .search_web(&query.query)
-                    .await
-                    .map_err(|error| error.at(ResearchStage::Search))?;
+                let execution = self.execution_backend.search_web(&query.query).await;
+                for (index, attempt) in execution.attempts.iter().enumerate() {
+                    self.trace_writer
+                        .append(&TraceEvent::SearchAttemptCompleted {
+                            round,
+                            query: query.query.clone(),
+                            engine: attempt.engine,
+                            outcome: attempt.outcome.clone(),
+                            http_status: attempt.http_status,
+                        })
+                        .map_err(|error| error.at(ResearchStage::Trace))?;
+                    if index == 0 && execution.attempts.len() == 2 {
+                        let Some(next_attempt) = execution.attempts.get(1) else {
+                            unreachable!("two-attempt execution has a second attempt")
+                        };
+                        let crate::SearchEngineAttemptOutcome::Unavailable { reason } =
+                            attempt.outcome
+                        else {
+                            return Err(ResearchError::Search {
+                                message: "search fallback followed a non-unavailable attempt"
+                                    .into(),
+                            }
+                            .at(ResearchStage::Search));
+                        };
+                        if attempt.engine != crate::SearchEngine::Google
+                            || next_attempt.engine != crate::SearchEngine::Bing
+                        {
+                            return Err(ResearchError::Search {
+                                message: "search fallback engine order is invalid".into(),
+                            }
+                            .at(ResearchStage::Search));
+                        }
+                        self.trace_writer
+                            .append(&TraceEvent::SearchFallbackActivated {
+                                round,
+                                query: query.query.clone(),
+                                from_engine: attempt.engine,
+                                to_engine: next_attempt.engine,
+                                reason,
+                            })
+                            .map_err(|error| error.at(ResearchStage::Trace))?;
+                    }
+                }
+                let (selected_engine, results) = match execution.completion {
+                    WebSearchCompletion::Completed {
+                        selected_engine,
+                        results,
+                    } => (selected_engine, results),
+                    WebSearchCompletion::Failed { reason } => {
+                        return Err(ResearchError::Search {
+                            message: web_search_failure_message(reason),
+                        }
+                        .at(ResearchStage::Search));
+                    }
+                };
                 for result in results {
+                    if result.search_engine != selected_engine {
+                        return Err(ResearchError::Search {
+                            message: "search result engine differs from completed engine".into(),
+                        }
+                        .at(ResearchStage::Search));
+                    }
                     self.trace_writer
                         .append(&TraceEvent::SearchResult {
                             round,
                             query: query.query.clone(),
+                            search_engine: result.search_engine,
                             search_result_id: result.search_result_id.clone(),
                             title: result.title.clone(),
                             url: result.url.clone(),
@@ -328,11 +381,11 @@ impl<B: ResearchExecutionBackend, W: Write> ResearchRunExecutor<B, W> {
             }
 
             if new_results.is_empty() {
-                self.progress.stop_reason = Some(ResearchRunStopReason::NoNewUrls);
+                self.progress.stop_reason = Some(ExplorationStopReason::NoNewUrls);
             }
             for result in new_results {
                 if self.captured_snapshots.len() >= self.policy.max_snapshots as usize {
-                    self.progress.stop_reason = Some(ResearchRunStopReason::SnapshotLimit);
+                    self.progress.stop_reason = Some(ExplorationStopReason::SnapshotLimit);
                     break;
                 }
                 match self
@@ -397,9 +450,16 @@ impl<B: ResearchExecutionBackend, W: Write> ResearchRunExecutor<B, W> {
                 break;
             }
         }
-        self.progress
+        let stop_reason = *self
+            .progress
             .stop_reason
-            .get_or_insert(ResearchRunStopReason::CompletedRounds);
+            .get_or_insert(ExplorationStopReason::CompletedRounds);
+        self.trace_writer
+            .append(&TraceEvent::ExplorationStopped {
+                completed_round: self.progress.round,
+                reason: stop_reason,
+            })
+            .map_err(|error| error.at(ResearchStage::Trace))?;
         Ok(&self.progress)
     }
 
@@ -820,6 +880,19 @@ fn normalize_url_for_deduplication(raw: &str) -> Result<String> {
     Ok(url.to_string())
 }
 
+fn web_search_failure_message(reason: WebSearchFailureReason) -> String {
+    match reason {
+        WebSearchFailureReason::InvalidQuery => "web search rejected an empty query",
+        WebSearchFailureReason::PrimarySearchContractRejected => {
+            "SearXNG rejected the primary search contract"
+        }
+        WebSearchFailureReason::FallbackSearchFailed => {
+            "SearXNG could not complete the primary or fallback search"
+        }
+    }
+    .into()
+}
+
 fn estimate_snapshot_input_tokens(snapshots: &[Snapshot]) -> usize {
     snapshots
         .iter()
@@ -852,8 +925,8 @@ mod tests {
 
     use super::*;
     use crate::{
-        CrawlMeta, ErrorClass, RunHeader, TRACE_SCHEMA_VERSION, TracePolicy,
-        research_trace::LegacyRunHeader,
+        CrawlMeta, ErrorClass, RunHeader, SearchResult, TRACE_SCHEMA_VERSION, TraceEventEnvelope,
+        TracePolicy,
     };
 
     #[derive(Default)]
@@ -864,6 +937,7 @@ mod tests {
         selected_ref: Option<SnapshotRef>,
         synthesize_calls: u32,
         plan_error: bool,
+        search_execution: Option<WebSearchExecution>,
         duplicate_urls: bool,
         crawl_failures_remaining: u32,
         converged_final_url: bool,
@@ -908,32 +982,49 @@ mod tests {
             })
         }
 
-        fn search_web(&mut self, query: &str) -> impl Future<Output = Result<Vec<SearchResult>>> {
+        fn search_web(&mut self, query: &str) -> impl Future<Output = WebSearchExecution> {
             self.search_calls += 1;
-            std::future::ready(Ok(vec![
-                SearchResult::new(
-                    query,
-                    query.into(),
-                    "first".into(),
-                    if self.duplicate_urls {
-                        "https://example.com/duplicate#first".into()
-                    } else {
-                        format!("https://example.com/{query}#first")
+            if let Some(execution) = &self.search_execution {
+                return std::future::ready(execution.clone());
+            }
+            std::future::ready(WebSearchExecution {
+                attempts: vec![crate::SearchEngineAttempt {
+                    engine: crate::SearchEngine::Google,
+                    outcome: crate::SearchEngineAttemptOutcome::Completed {
+                        valid_result_count: 2,
                     },
-                    1,
-                ),
-                SearchResult::new(
-                    query,
-                    query.into(),
-                    "duplicate".into(),
-                    if self.duplicate_urls {
-                        "https://example.com/duplicate#duplicate".into()
-                    } else {
-                        format!("https://example.com/{query}#duplicate")
-                    },
-                    2,
-                ),
-            ]))
+                    http_status: Some(200),
+                }],
+                completion: WebSearchCompletion::Completed {
+                    selected_engine: crate::SearchEngine::Google,
+                    results: vec![
+                        SearchResult::new(
+                            crate::SearchEngine::Google,
+                            query,
+                            query.into(),
+                            "first".into(),
+                            if self.duplicate_urls {
+                                "https://example.com/duplicate#first".into()
+                            } else {
+                                format!("https://example.com/{query}#first")
+                            },
+                            1,
+                        ),
+                        SearchResult::new(
+                            crate::SearchEngine::Google,
+                            query,
+                            query.into(),
+                            "duplicate".into(),
+                            if self.duplicate_urls {
+                                "https://example.com/duplicate#duplicate".into()
+                            } else {
+                                format!("https://example.com/{query}#duplicate")
+                            },
+                            2,
+                        ),
+                    ],
+                },
+            })
         }
 
         fn capture_web_snapshot(&mut self, url: &str) -> impl Future<Output = Result<Snapshot>> {
@@ -1115,6 +1206,21 @@ mod tests {
         research_run_with_rounds(db, DEFAULT_EXPLORE_ROUNDS)
     }
 
+    fn exploration_stop_events(trace: &[u8]) -> Vec<(u32, ExplorationStopReason)> {
+        std::str::from_utf8(trace)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<TraceEventEnvelope>(line).unwrap())
+            .filter_map(|envelope| match envelope.event {
+                TraceEvent::ExplorationStopped {
+                    completed_round,
+                    reason,
+                } => Some((completed_round, reason)),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[tokio::test]
     async fn resume_restores_committed_state_and_starts_at_the_next_round() {
         let db = TempDb::new("resume");
@@ -1129,6 +1235,7 @@ mod tests {
                 .map(|snapshot| snapshot.snapshot_ref.clone())
                 .collect(),
             model_knowledge_draft: None,
+            exploration_stop_reason: None,
         };
         let restored_count = replay.archived_snapshot_refs.len();
         drop(original);
@@ -1238,19 +1345,24 @@ mod tests {
     #[tokio::test]
     async fn run_preserves_original_and_trace_failures() {
         let db = TempDb::new("run-trace-failure");
-        let trace = TraceWriter::new_legacy(
+        let brief = frozen_brief();
+        let trace = TraceWriter::new(
             FailAfterHeader {
                 header_written: false,
             },
-            LegacyRunHeader {
+            RunHeader {
                 run_id: "trace-failure".into(),
-                question: "question".into(),
+                clarification_id: brief.clarification_id().into(),
+                session_id: None,
+                turn: None,
+                brief,
                 started_at: Utc::now(),
                 policy: TracePolicy {
                     rounds: DEFAULT_EXPLORE_ROUNDS,
                     input_budget: MAX_STRONG_INPUT_TOKENS as u32,
                     max_snapshots: MAX_SNAPSHOTS as u32,
                 },
+                answer_style: ResearchAnswerStyle::WebFirst,
             },
         )
         .unwrap();
@@ -1294,7 +1406,7 @@ mod tests {
         assert_eq!(progress.round, DEFAULT_EXPLORE_ROUNDS);
         assert_eq!(
             progress.stop_reason,
-            Some(ResearchRunStopReason::CompletedRounds)
+            Some(ExplorationStopReason::CompletedRounds)
         );
         assert_eq!(
             research_run.execution_backend.plan_calls,
@@ -1318,6 +1430,218 @@ mod tests {
             .unwrap();
         assert_eq!(result["round"], 1);
         assert_eq!(result["query"], "q1-0");
+        let stopped = exploration_stop_events(trace.as_bytes());
+        assert_eq!(
+            stopped,
+            [(
+                DEFAULT_EXPLORE_ROUNDS,
+                ExplorationStopReason::CompletedRounds
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn exploration_traces_google_fallback_before_bing_results() {
+        let db = TempDb::new("search-fallback-trace");
+        let mut research_run = research_run(&db);
+        research_run.execution_backend.search_execution = Some(WebSearchExecution {
+            attempts: vec![
+                crate::SearchEngineAttempt {
+                    engine: crate::SearchEngine::Google,
+                    outcome: crate::SearchEngineAttemptOutcome::Unavailable {
+                        reason: crate::SearchEngineUnavailability::EngineUnresponsive,
+                    },
+                    http_status: Some(200),
+                },
+                crate::SearchEngineAttempt {
+                    engine: crate::SearchEngine::Bing,
+                    outcome: crate::SearchEngineAttemptOutcome::Completed {
+                        valid_result_count: 1,
+                    },
+                    http_status: Some(200),
+                },
+            ],
+            completion: WebSearchCompletion::Completed {
+                selected_engine: crate::SearchEngine::Bing,
+                results: vec![SearchResult::new(
+                    crate::SearchEngine::Bing,
+                    "q1-0",
+                    "Bing result".into(),
+                    "snippet".into(),
+                    "https://example.com/bing-result".into(),
+                    1,
+                )],
+            },
+        });
+
+        research_run.execute_exploration().await.unwrap();
+
+        let trace = String::from_utf8(research_run.trace_writer.into_inner()).unwrap();
+        let flow = trace
+            .lines()
+            .map(|line| serde_json::from_str::<TraceEventEnvelope>(line).unwrap())
+            .filter_map(|envelope| match envelope.event {
+                TraceEvent::SearchAttemptCompleted { query, engine, .. } if query == "q1-0" => {
+                    Some(match engine {
+                        crate::SearchEngine::Google => "google_attempt",
+                        crate::SearchEngine::Bing => "bing_attempt",
+                    })
+                }
+                TraceEvent::SearchFallbackActivated { query, .. } if query == "q1-0" => {
+                    Some("fallback")
+                }
+                TraceEvent::SearchResult {
+                    query,
+                    search_engine: crate::SearchEngine::Bing,
+                    ..
+                } if query == "q1-0" => Some("bing_result"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flow,
+            ["google_attempt", "fallback", "bing_attempt", "bing_result"]
+        );
+    }
+
+    #[tokio::test]
+    async fn contract_rejected_search_fails_without_a_fallback_event() {
+        let db = TempDb::new("search-contract-rejected");
+        let mut research_run = research_run(&db);
+        research_run.execution_backend.search_execution = Some(WebSearchExecution {
+            attempts: vec![crate::SearchEngineAttempt {
+                engine: crate::SearchEngine::Google,
+                outcome: crate::SearchEngineAttemptOutcome::ContractRejected {
+                    reason: crate::SearchBoundaryContractFailure::InvalidResponse,
+                },
+                http_status: Some(200),
+            }],
+            completion: WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::PrimarySearchContractRejected,
+            },
+        });
+
+        let error = research_run.execute(&db.0).await.unwrap_err();
+
+        assert_eq!(error.stage(), Some(ResearchStage::Search));
+        let envelopes = String::from_utf8(research_run.trace_writer.into_inner())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<TraceEventEnvelope>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(envelopes.iter().any(|envelope| matches!(
+            envelope.event,
+            TraceEvent::SearchAttemptCompleted {
+                outcome: crate::SearchEngineAttemptOutcome::ContractRejected { .. },
+                ..
+            }
+        )));
+        assert!(
+            !envelopes.iter().any(|envelope| matches!(
+                envelope.event,
+                TraceEvent::SearchFallbackActivated { .. }
+            ))
+        );
+        assert!(matches!(
+            envelopes.last().map(|envelope| &envelope.event),
+            Some(TraceEvent::RunFailed {
+                stage: ResearchStage::Search,
+                ..
+            })
+        ));
+    }
+
+    #[tokio::test]
+    async fn unavailable_google_and_bing_attempts_precede_search_failure() {
+        let db = TempDb::new("search-dual-unavailable");
+        let mut research_run = research_run(&db);
+        research_run.execution_backend.search_execution = Some(WebSearchExecution {
+            attempts: vec![
+                crate::SearchEngineAttempt {
+                    engine: crate::SearchEngine::Google,
+                    outcome: crate::SearchEngineAttemptOutcome::Unavailable {
+                        reason: crate::SearchEngineUnavailability::RequestTimeout,
+                    },
+                    http_status: Some(408),
+                },
+                crate::SearchEngineAttempt {
+                    engine: crate::SearchEngine::Bing,
+                    outcome: crate::SearchEngineAttemptOutcome::Unavailable {
+                        reason: crate::SearchEngineUnavailability::ServerError,
+                    },
+                    http_status: Some(503),
+                },
+            ],
+            completion: WebSearchCompletion::Failed {
+                reason: WebSearchFailureReason::FallbackSearchFailed,
+            },
+        });
+
+        let error = research_run.execute(&db.0).await.unwrap_err();
+
+        assert_eq!(error.stage(), Some(ResearchStage::Search));
+        let flow = String::from_utf8(research_run.trace_writer.into_inner())
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<TraceEventEnvelope>(line).unwrap())
+            .filter_map(|envelope| match envelope.event {
+                TraceEvent::SearchAttemptCompleted {
+                    engine: crate::SearchEngine::Google,
+                    ..
+                } => Some("google_attempt"),
+                TraceEvent::SearchFallbackActivated { .. } => Some("fallback"),
+                TraceEvent::SearchAttemptCompleted {
+                    engine: crate::SearchEngine::Bing,
+                    ..
+                } => Some("bing_attempt"),
+                TraceEvent::RunFailed {
+                    stage: ResearchStage::Search,
+                    ..
+                } => Some("search_failure"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            flow,
+            [
+                "google_attempt",
+                "fallback",
+                "bing_attempt",
+                "search_failure"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn completed_empty_searches_finish_the_round_before_no_new_urls_stop() {
+        let db = TempDb::new("search-empty-round");
+        let mut research_run = research_run(&db);
+        research_run.execution_backend.search_execution = Some(WebSearchExecution {
+            attempts: vec![crate::SearchEngineAttempt {
+                engine: crate::SearchEngine::Google,
+                outcome: crate::SearchEngineAttemptOutcome::Completed {
+                    valid_result_count: 0,
+                },
+                http_status: Some(200),
+            }],
+            completion: WebSearchCompletion::Completed {
+                selected_engine: crate::SearchEngine::Google,
+                results: Vec::new(),
+            },
+        });
+
+        let progress = research_run.execute_exploration().await.unwrap().clone();
+
+        assert_eq!(
+            research_run.execution_backend.search_calls,
+            QUERIES_PER_ROUND as u32
+        );
+        assert_eq!(progress.round, 1);
+        assert_eq!(progress.stop_reason, Some(ExplorationStopReason::NoNewUrls));
+        assert_eq!(
+            exploration_stop_events(&research_run.trace_writer.into_inner()),
+            [(1, ExplorationStopReason::NoNewUrls)]
+        );
     }
 
     #[test]
@@ -1337,7 +1661,7 @@ mod tests {
         let progress = research_run.execute_exploration().await.unwrap().clone();
 
         assert_eq!(progress.round, 2);
-        assert_eq!(progress.stop_reason, Some(ResearchRunStopReason::NoNewUrls));
+        assert_eq!(progress.stop_reason, Some(ExplorationStopReason::NoNewUrls));
         assert_eq!(research_run.execution_backend.plan_calls, 2);
         assert_eq!(
             research_run.execution_backend.search_calls,
@@ -1345,6 +1669,10 @@ mod tests {
         );
         assert_eq!(research_run.execution_backend.crawl_calls, 1);
         assert_eq!(research_run.captured_snapshots.len(), 1);
+        assert_eq!(
+            exploration_stop_events(&research_run.trace_writer.into_inner()),
+            [(2, ExplorationStopReason::NoNewUrls)]
+        );
     }
 
     #[tokio::test]
@@ -1357,7 +1685,7 @@ mod tests {
         let progress = research_run.execute_exploration().await.unwrap().clone();
 
         assert_eq!(progress.round, 3);
-        assert_eq!(progress.stop_reason, Some(ResearchRunStopReason::NoNewUrls));
+        assert_eq!(progress.stop_reason, Some(ExplorationStopReason::NoNewUrls));
         assert_eq!(research_run.execution_backend.crawl_calls, 2);
         assert_eq!(research_run.captured_snapshots.len(), 1);
     }
@@ -1391,9 +1719,13 @@ mod tests {
 
         assert_eq!(
             progress.stop_reason,
-            Some(ResearchRunStopReason::InputBudget)
+            Some(ExplorationStopReason::InputBudget)
         );
         assert_eq!(research_run.execution_backend.plan_calls, 0);
+        assert_eq!(
+            exploration_stop_events(&research_run.trace_writer.into_inner()),
+            [(0, ExplorationStopReason::InputBudget)]
+        );
     }
 
     #[tokio::test]
@@ -1416,11 +1748,15 @@ mod tests {
 
         assert_eq!(
             progress.stop_reason,
-            Some(ResearchRunStopReason::SnapshotLimit)
+            Some(ExplorationStopReason::SnapshotLimit)
         );
         assert_eq!(research_run.execution_backend.plan_calls, 0);
         assert_eq!(research_run.execution_backend.search_calls, 0);
         assert_eq!(research_run.execution_backend.crawl_calls, 0);
+        assert_eq!(
+            exploration_stop_events(&research_run.trace_writer.into_inner()),
+            [(0, ExplorationStopReason::SnapshotLimit)]
+        );
     }
 
     #[tokio::test]
@@ -1548,8 +1884,8 @@ mod tests {
         match events.first() {
             Some(TraceEvent::RunHeader {
                 schema_version,
-                clarification_id: Some(clarification_id),
-                brief: Some(header_brief),
+                clarification_id,
+                brief: header_brief,
                 ..
             }) => {
                 assert_eq!(*schema_version, TRACE_SCHEMA_VERSION);

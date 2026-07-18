@@ -29,5 +29,5 @@ and can be cached aggressively without serving stale code.
 
 - The layout fixture measures a 2048 by 1029 viewport with an 80-paragraph answer and requires the
   composer to remain fully visible while the transcript has a scroll range.
-- `scripts/verify-demo-workspace.mjs` asserts the cache policy on both `/` and its referenced hashed
-  asset through the real Demo Host.
+- The integration verification used when accepting this decision asserted the cache policy on both
+  `/` and its referenced hashed asset through the real Demo Host.

@@ -1,75 +1,166 @@
-# Research
+# Traceable Markdown Document Research Runtime
 
-面向专业领域的低成本、可溯源、可审计对话式知识系统。
+面向标准化 Markdown 文档语料的可恢复、可溯源、可审计研究 Runtime。
 
-当前处于架构验证阶段。暂定设计见：
+本仓库已实现 Rust 2024 library crate：`TraceableMarkdownResearchRuntime` 作为调用方唯一 Interface，内部包含 SQLite 持久化、不可变 Markdown Corpus Snapshot、问题确认状态机、固定研究执行引擎、完整 Trace 回放、来源完整性校验，以及 Fixture / OpenAI-compatible 两种模型 Adapter。
 
-- [架构设计（暂定）](docs/architecture.md)
-- [验证版设计（PoC）](docs/validation-poc.md)
+- [Traceable Markdown Document Research Runtime 架构设计](docs/curated-document-research-architecture.md)
+- [领域语言](CONTEXT.md)
+- [后端优先开发与交付计划](docs/dev/backend-first-implementation-plan.md)
+- [前端 Demo 产品、交互与未来接口草稿](docs/dev/frontend-demo-product-draft.md)
 
-## 当前原则
+仓库目录保留历史名称 `traceable-research-runtime-database-search`；这里的“database search”不表示 SQL、全文数据库查询或通用数据库搜索。项目只处理符合标准的 Markdown 文档集合。
 
-- 所有专业问题进入同一受控研究流程，不作简单/复杂二级分流。
-- 提供两版架构，共享同一核心与 Source 契约，只有原文来源不同：
-  - 架构 A（结构化索引数据库）：强模型逐层选择索引节点，读取版本化文档单元。
-  - 架构 B（Web Search）：强模型生成搜索词、选择结果网页，读取网页快照。
-- MVP 先落架构 B（Web Search），工作量最小；架构 A 作为完整规格，按同一契约增补。
-- 检索结果只作导航；原文须锁定版本或存档快照、记录哈希与来源地址，形成稳定 `source_ref` 后方可引用。
-- 模型只生成结构化候选；程序掌握状态、校验与控制流。
-- 廉价模型类似受控 subagent，但任务、原文范围、工具和输出均由 Runtime 固定，不具自治权。
-- 以有界数据协议和无状态调用消解上下文问题，不设专门管理层。
-- Runtime 内的薄 Source Module 以 `list_candidates / open / read` 契约封装两版实现；新增来源满足该契约即可插拔。
-- 采用克制的微服务：API、薄 Research Runtime、独立 Model API Gateway（可直接部署 New API）；Source 首期同进程实现。
-- 按变化与故障边界拆分；不预设专用知识库、KG、常驻多 Agent 或“每个名词一个服务”。
+## 后端实现
 
-## 阶段一验证结果
+公开 Interface 覆盖以下完整生命周期：
 
-阶段一在 `poc/run.py` 实现单进程受控研究环路（强模型生成查询、选候选、写带引用答案；廉价模型在快照内提逐字证据），四道校验全部由程序执行：候选 ID 属本次运行、内容哈希匹配、引文逐字命中快照、Claim 必须指向已验证证据。
+1. 发布并锁定一个版本化 Markdown Corpus Snapshot。
+2. 创建 Document Research Conversation 与 Request。
+3. 执行 Research Question Clarification，必要时接受补充消息或重试。
+4. 冻结 Brief、Snapshot、模型引用、执行 limits 与回答方式。
+5. 执行或恢复固定研究流程，返回公开答案与执行概览。
+6. 按请求投影公开答案、执行概览和分页 Detailed Audit。
+7. 在任一非终态取消请求；可重试传输故障保留恢复 checkpoint。
 
-### 测试方法
+SQLite 使用 WAL、`synchronous=FULL`、append-only event trigger 和 command ledger。所有阻塞存储工作在 Tokio blocking pool 中执行，外部模型调用期间不持有数据库事务。调用方只持有 `ResearchPrincipal`、命令输入、结果与投影类型；原始事件、SQLite、Corpus reader、Integrity Validator 和 Execution Engine 保持内部 Locality。
 
-以下为结果表的必要背景，说明数据是在什么条件下、用什么口径测出来的。
+### 本地运行
 
-**受控环路**：每题固定跑一趟 `生成查询 → 选候选 → 存档快照 → 逐字取证 → 形成 Claim → 带引用答案`。模型只产出结构化候选（搜索词、候选选择、Claim），系统状态与控制流由 `run.py` 掌握；模型不能决定跳过校验或引用未存档的内容。
+需要 Rust `1.96`（仓库已提供 `rust-toolchain.toml`）：
 
-**双模型分工**：强模型担任「研究者」角色，负责生成搜索词、从有界结果列表里选网页、最终写带引用的答案；廉价模型担任「取证」角色，只在已存档的快照正文内摘取逐字引文，任务、原文范围、工具和输出格式均由 Runtime 固定。本轮强模型跑四种配置对比，廉价取证角色固定用 `deepseek-v4-flash` 非思考，不参与变量。
+```powershell
+cargo run --example fixture_research
+```
 
-**候选检索与存档**：搜索候选经 DuckDuckGo（`ddgs`）返回，仅作导航，不作证据。选中的网页由存档后端抓取、渲染、抽取正文，落盘为带 `content_hash` 的快照，形成稳定 `source_ref` 后方可被引用。存档后端为部署在内网的 crawl4ai 服务（服务器端抓取 + JS 渲染 + 正文抽取），作为唯一后端；遇反爬、登录墙或动态渲染失败的资源直接判为空答，不硬爬。
+该示例使用完全离线的模型 Fixture，通过公开 Runtime Interface 发布语料、创建请求、确认问题、prepare、execute，并输出带逐字引用的公开答案。它不访问公网；完整代码见 [`examples/fixture_research.rs`](examples/fixture_research.rs)。
 
-**四道程序校验**（对所有配置一致生效，模型无法绕过）：
-1. 候选 ID 属本次运行 —— open 只接受本会话产生的候选，拒绝集合外 ID；
-2. 内容哈希匹配 —— 读取的正文必须与存档时的 `content_hash` 一致；
-3. 引文逐字命中 —— 廉价模型摘出的每条引文必须在快照正文中逐字连续出现；
-4. Claim 指向已验证证据 —— 答案里每个 Claim 必须挂到一条通过前三关的 Evidence。
+### Live Model Adapter
 
-**金标集**：`poc/eval/gold.jsonl` 共 12 题、8 领域（法律 ×3、税务、交通 ×2、消费、婚姻家庭、劳动、医疗 ×2、金融），全部贴近日常且有权威可溯源出处。每题预置「必答点」用于算命中率。
+`OpenAiCompatibleMarkdownResearchModelGateway` 接受 endpoint、API key、强/廉价模型名、单次超时、最大尝试次数和 prompt schema version。仅 timeout、连接错误、HTTP 429/5xx 会按配置重试；非法 JSON、封闭 schema、候选归属和引用完整性错误不会伪装成瞬时故障。API key 在 `Debug` 与错误中始终脱敏。
 
-**配置矩阵**：在 DeepSeek 官方 API 上对强模型角色跑四配置（`deepseek-v4-flash` / `deepseek-v4-pro` × 思考 / 非思考，思考模式经 `extra_body.thinking` 切换）。
+```rust
+use std::{sync::Arc, time::Duration};
+use traceable_markdown_research_runtime::{
+    OpenAiCompatibleMarkdownResearchModelGateway,
+    OpenAiCompatibleMarkdownResearchModelGatewayConfig,
+    TraceableMarkdownResearchRuntime,
+};
 
-**指标定义**：下表结果每格里 `X% (a/b)` 的 `a` 是分子、`b` 是分母。
+let gateway = OpenAiCompatibleMarkdownResearchModelGateway::new(
+    OpenAiCompatibleMarkdownResearchModelGatewayConfig {
+        endpoint: "https://model.example/v1/".to_owned(),
+        api_key: std::env::var("MODEL_API_KEY").unwrap(),
+        strong_model: "strong-model".to_owned(),
+        cheap_model: "extraction-model".to_owned(),
+        request_timeout: Duration::from_secs(60),
+        max_attempts: 3,
+        prompt_schema_version: 1,
+    },
+)?;
+let runtime = TraceableMarkdownResearchRuntime::open("runtime.sqlite", Arc::new(gateway))?;
+# Ok::<(), traceable_markdown_research_runtime::RuntimeError>(())
+```
 
-- **来源覆盖率** = 成功作答的题数 / 总题数。"成功作答"指该题至少存档到一篇权威原文、取到逐字证据并产出带引用的答案；反之若候选全被反爬/登录墙挡下（`open` 失败）或无逐字命中证据，程序会拒答，计为未覆盖。分母恒为 12（金标题数），故 `11/12` 表示 12 题中 11 题成功作答。这条衡量的是"能不能答"，主要卡在公网召回边界。
-- **引用忠实度** = 逐字命中快照的被引证据数 / 被引用的证据总数。廉价模型摘出的每条引文都要在存档快照正文里逐字连续出现（`quote in text`）才算数。100% 表示答案引用的每一条证据都真实存在于原文、无一句杜撰或改写。这条衡量的是"引用真不真"。
-- **Trace 完整率** = 能完整回链到已验证证据的 Claim 数 / 答案里的 Claim 总数。答案中每个事实句都必须挂到一条通过全部校验的 Evidence 上。100% 表示答案里没有任何一句"悬空断言"。这条衡量的是"每句话有没有出处"。
-- **必答点命中率** = 命中的必答点数 / 必答点总数。每题预置若干「必答点」（回答该题必须覆盖的关键事实），跨全部题目累加。分母 17 是 12 道题的必答点合计，故 `10/17` 表示 17 个必答点中答对了 10 个。这条衡量的是"答得全不全"。
-- **强模型/题** —— 每题平均调用强模型的次数（生成搜索词、选候选、写答案三处）。
-- **s/题** —— 每题端到端平均耗时（秒），含检索、存档快照与所有模型调用。
+### 质量门禁
 
-前两项（覆盖率、必答点命中率）反映"能答对多少"，受公网召回和模型能力影响；后两项（忠实度、Trace 完整率）反映"答出来的部分可不可信"，由程序校验保证，与模型强弱无关。
+```powershell
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-targets --all-features
+cargo test --doc
+```
 
-### 结果
+测试默认完全离线，覆盖 migration、幂等命令、文件数据库重启恢复、跨主体拒绝、并发双 execute、cancel/execute 竞态、模型故障恢复、Trace/Snapshot/hash/offset/citation 篡改、Live Adapter 超时/5xx/响应大小/密钥隔离、封闭模型 schema、审计页大小和完整固定流程。当前 Gate B 共 76 项测试。
 
-| 配置 | 来源覆盖率 | 引用忠实度 | Trace 完整率 | 必答点命中率 | 强模型/题 | s/题 |
-| --- | --- | --- | --- | --- | --- | --- |
-| flash 非思考 | 92% (11/12) | 100% | 100% | 59% (10/17) | 2.8 | 18.0 |
-| flash 思考 | 92% (11/12) | 100% | 100% | 59% (10/17) | 2.9 | 34.3 |
-| pro 非思考 | 67% (8/12) | 100% | 100% | 59% (10/17) | 2.5 | 14.1 |
-| pro 思考 | 100% (12/12) | 100% | 100% | 82% (14/17) | 2.9 | 41.9 |
+## 前端 Demo
 
-- 引用忠实度与 Trace 完整率在四配置下恒为 100%，与模型强弱、是否思考无关。这正是受控流的价值：正确性由程序校验保证，不依赖模型自觉。答出题目里的 Claim 100% 指向已验证证据，无一例外。
-- 题量扩到 12 题多领域后，3 题时的结论被推翻：`pro 思考` 反而最强（覆盖 100%、必答点命中 82%），但也最慢（41.9s/题）。思考预算在多领域难题上换来了召回与必答点命中，代价是 2–3 倍耗时。
-- `pro 非思考` 最快（14.1s/题）但召回最弱（67%），在难题上更容易搜不到或存档不了权威原文而空答。flash 两档居中，速度与覆盖折中。
-- 覆盖率与必答点的差距主要来自公网召回边界（能否搜到并存档权威原文），各配置空答的题目不尽相同，含 web 检索的随机性；这非架构缺陷，也是架构 A（结构化索引库）的价值信号。事实准确率与向量 RAG 对照仍待补。
-- 选型取决于场景：要覆盖和准确选 `pro 思考`，要低延迟低成本选 `flash 非思考`。
+[`frontend/`](frontend/) 提供“迹研”本地交互 Demo，覆盖首次使用、正常研究和失败恢复三种可切换场景。界面展示问题确认、锁定 Snapshot、阶段与真实计数、两种回答方式、逐段来源、逐字引用、Coverage Gap、执行概览和分页审计。
 
-复现：`python poc/run.py --bench`（默认跑 `poc/eval/gold.jsonl` 全部四配置并打印对比表）。
+Demo 仅导入本地 typed fixtures；代码中没有 `fetch`、XHR、WebSocket、SSE、API path 或 mock server，不需要启动 Rust Runtime。
+
+```powershell
+cd frontend
+npm install
+npm run dev
+```
+
+默认地址为 `http://127.0.0.1:5173/`。前端质量命令：
+
+```powershell
+npm test
+npm run build
+```
+
+## 核心流程
+
+```text
+Document Research Conversation
+→ Document Research Request
+→ Research Question Clarification
+→ Frozen Document Research Brief
+→ Prepared Markdown Research Execution
+→ Model-Knowledge-Only Answer
+→ 范围发现与向下探索
+→ Verbatim Source Evidence
+→ Evidence-Linked Research Claim
+→ Evidence-Linked Research Claims Answer
+→ Source-Attributed Answer Composition
+```
+
+范围发现负责判断问题可能涉及哪些导航方向，向下探索负责在已选方向内找到足够具体的 Markdown 正文。两者构成固定且互相反馈的状态机，不扩展为通用工作流引擎。
+
+模型固定分为两档：
+
+- **强模型**：负责问题确认、全部研究路径、Evidence-Linked Research Claim、Evidence-Linked Research Claims Answer 和最终答案合成。
+- **廉价模型**：只在已授权 Markdown Source Segment 内逐字提取 Verbatim Source Evidence。
+
+`MarkdownResearchExecutionEngine` 隐藏分支任务、候选归属、读取预算、正文授权、逐字取证、研究结论、答案合成和恢复复杂度；调用方只通过 `TraceableMarkdownResearchRuntime` 命令 Interface 使用系统。
+
+## Markdown 真源
+
+每篇 Markdown Source Document 只要求三个自然语言分辨率：
+
+```text
+markdown_source_document_title        文档标题
+markdown_source_document_abstract     文档内容的短描述
+canonical_markdown_document_body      canonical Markdown 正文
+```
+
+导航如何生成和维护不属于本项目。`TraceableMarkdownResearchRuntime` 负责接收、校验和存储导航，并与 Markdown Source Document Version 共同发布为不可变 `MarkdownCorpusSnapshot`。Markdown Corpus Navigation Node、摘要、模型知识、Evidence-Linked Research Claim 和历史答案都不是事实真源。
+
+## 回答合成方式
+
+同一次 Markdown Research Execution 共享一批 Verbatim Source Evidence 和 Evidence-Linked Research Claim，可以请求一种或同时请求两种 Answer Composition Style：
+
+- `model_knowledge_led`：Evidence-Linked Research Claim : 模型知识 = 2 : 8；以 Model-Knowledge-Only Answer 为基础，由 Evidence-Linked Research Claim 修正和补充。
+- `evidence_linked_research_claim_led`：Evidence-Linked Research Claim : 模型知识 = 8 : 2；以 Evidence-Linked Research Claims Answer 为基础，再加入模型知识补充。
+
+两类输入冲突时始终以 Evidence-Linked Research Claim 为准。最终答案的每个 Source-Attributed Answer Segment 必须声明以下来源类型之一：
+
+- `evidence_linked_research_claims`
+- `model_knowledge_only`
+- `evidence_linked_research_claims_and_model_knowledge`
+
+包含模型知识的回答段明确标记为“模型补充，未由当前 Markdown 文档验证”。
+
+## 保证范围
+
+程序保证：
+
+- 候选和正文读取属于当前 Markdown Research Execution 与锁定 Markdown Corpus Snapshot；
+- Verbatim Source Evidence 引文逐字存在于对应 Canonical Markdown Document Body；
+- Verbatim Source Evidence、Evidence-Linked Research Claim、Source-Attributed Answer Segment 和 Public Source Citation 的引用关系完整；
+- Markdown Research Execution Trace 完整回放后才用于恢复和审计投影。
+
+程序不保证 Verbatim Source Evidence 在语义上支持 Evidence-Linked Research Claim，也不保证模型答案正确。Evidence-Linked Research Claim 只属于产生它的单次 Markdown Research Execution，不得自动成为后续研究的事实来源。
+
+## 当前范围
+
+- 不接入 Markdown 以外的文档来源。
+- 不负责生成或治理导航。
+- 不实现可自定义研究阶段的工作流平台。
+- 当前交付是进程内 Rust library，不提供 HTTP/REST/GraphQL/MCP、CLI、独立 Runtime 进程或部署脚本。
+- 不承诺多进程 active-active 执行；同一 Runtime 实例会按 execution ID 串行化模型工作流，多个进程或独立 Runtime 实例仍可能重复外部模型调用，但 SQLite command/checkpoint 和终态提交保持幂等且唯一。
+- 不证明模型的语义判断或最终结论正确，只证明可观察的来源、引用、授权、状态和恢复契约。
+- Web Search 姊妹项目位于 `C:\WorkSpace\project\traceable-research-runtime-web-search`；本项目参考其生命周期、执行引擎、完整执行记录回放和答案来源标识，不复用 Web 搜索、网页抓取或来源读取 Interface。

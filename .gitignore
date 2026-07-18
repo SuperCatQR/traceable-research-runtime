@@ -11,3 +11,15 @@ poc/bench_out.txt
 poc/bench_err.txt
 __pycache__/
 *.pyc
+
+# Rust build and local runtime data
+/target/
+/data/
+
+# Local frontend demo dependencies and build output
+/frontend/node_modules/
+/frontend/dist/
+/frontend/coverage/
+
+# Local agent skills used during development, not runtime deliverables
+/skills/

@@ -232,6 +232,7 @@ pub struct ReplayedTrace {
 
 #[derive(Default)]
 struct ReplayedSearchFlow {
+    brave_outcome: Option<SearchEngineAttemptOutcome>,
     google_outcome: Option<SearchEngineAttemptOutcome>,
     fallback_reason: Option<SearchEngineUnavailability>,
     bing_outcome: Option<SearchEngineAttemptOutcome>,
@@ -505,6 +506,14 @@ pub fn replay_trace(path: impl AsRef<Path>) -> Result<ReplayedTrace> {
                     .get_mut(&(*round, query.clone()))
                     .ok_or_else(|| invalid_trace("search attempt has no matching query"))?;
                 match engine {
+                    SearchEngine::Brave
+                        if flow.brave_outcome.is_none()
+                            && flow.google_outcome.is_none()
+                            && flow.fallback_reason.is_none()
+                            && flow.bing_outcome.is_none() =>
+                    {
+                        flow.brave_outcome = Some(outcome.clone());
+                    }
                     SearchEngine::Google
                         if flow.google_outcome.is_none()
                             && flow.fallback_reason.is_none()
@@ -563,6 +572,11 @@ pub fn replay_trace(path: impl AsRef<Path>) -> Result<ReplayedTrace> {
                     .get_mut(&(*round, query.clone()))
                     .ok_or_else(|| invalid_trace("search result has no matching query"))?;
                 let selected_outcome = match search_engine {
+                    SearchEngine::Brave
+                        if flow.google_outcome.is_none() && flow.fallback_reason.is_none() =>
+                    {
+                        flow.brave_outcome.as_ref()
+                    }
                     SearchEngine::Google if flow.fallback_reason.is_none() => {
                         flow.google_outcome.as_ref()
                     }
@@ -691,8 +705,9 @@ fn validate_completed_round_search_flows(
             continue;
         }
         let selected_outcome = flow
-            .bing_outcome
+            .brave_outcome
             .as_ref()
+            .or(flow.bing_outcome.as_ref())
             .or(flow.google_outcome.as_ref())
             .ok_or_else(|| invalid_trace("completed round contains an unattempted query"))?;
         let SearchEngineAttemptOutcome::Completed { valid_result_count } = selected_outcome else {

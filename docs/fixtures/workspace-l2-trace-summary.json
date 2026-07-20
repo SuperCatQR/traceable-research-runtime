@@ -1,0 +1,25 @@
+{
+  "model_id": "example-model",
+  "understanding": {
+    "message": "I understand the release comparison request.",
+    "rationale": "The requested release and comparison target are explicit."
+  },
+  "rounds": [
+    {
+      "round": 1,
+      "directions": ["official release notes"],
+      "search_result_count": 3
+    }
+  ],
+  "archived_source_count": 2,
+  "skipped_source_count": 1,
+  "selected_sources": [
+    {
+      "title": "Release notes",
+      "url": "https://example.com/release",
+      "rationale": "Primary source for the release."
+    }
+  ],
+  "synthesis_rationale": "The answer prioritizes the primary release notes.",
+  "failure": null
+}

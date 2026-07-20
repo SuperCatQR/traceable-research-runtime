@@ -1,6 +1,7 @@
 ---
-status: accepted
+status: superseded
 date: 2026-07-17
+superseded-by: 0010-embed-snapshot-extraction-and-keep-search-at-a-seam
 ---
 
 # Route Google-first Bing fallback through SearXNG

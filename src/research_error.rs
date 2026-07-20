@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 /// Runtime attribution for a failure (§8.1).
 ///
-/// `External` = an outside dependency or the model misbehaved (crawl4ai
+/// `External` = an outside dependency or the model misbehaved (public Web
 /// reporting empty "success", Bing ranking drift, strong returning bad JSON).
 /// `Internal` = one of our own invariants broke (e.g. a stored snapshot no
 /// longer hashes to its recorded `content_hash`).
@@ -42,12 +42,12 @@ pub enum ResearchStage {
 /// validation (§6) or failure mode (§8.1), and `error_class` pins its attribution.
 #[derive(Debug, thiserror::Error)]
 pub enum ResearchError {
-    /// SearXNG/Bing search failed: HTTP, JSON parse, or an empty result
+    /// Search provider failed: HTTP, JSON parse, or an empty result
     /// set for the query.
     #[error("search failed: {message}")]
     Search { message: String },
 
-    /// crawl4ai could not produce a valid snapshot for `url` — the fetch
+    /// Public-page capture could not produce a valid snapshot for `url` — the fetch
     /// failed, or `success=true` but the body was empty / below the minimum
     /// length (§6 validation 3; §5 "success=true 不等于正文正确").
     #[error("fetch failed for {url}: {reason}")]

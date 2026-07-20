@@ -6,10 +6,11 @@ edition = "2024"
 [dependencies]
 # async runtime
 tokio = { version = "1.52.3", features = ["fs", "macros", "rt-multi-thread", "time", "net"] }
-# HTTP client: crawl4ai + strong model (P3); native-tls = SChannel on Windows, no extra C toolchain
+# HTTP client: Brave Search, public pages, and strong model; native-tls = SChannel on Windows
 reqwest = { version = "0.13.4", default-features = false, features = ["json", "native-tls"] }
-# strip active/subresource HTML before offline Crawl4AI conversion
+# strip active/subresource HTML, then convert the safe structure in process
 ammonia = "4.1.3"
+htmd = "0.5.4"
 # (de)serialization: domain types (P1), audit JSONL (P2), model I/O (P4)
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.150"

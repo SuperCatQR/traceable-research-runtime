@@ -34,8 +34,8 @@ _Avoid_: Page, document, crawl result
 A verifiable statement in the final answer linked to one or more Web Snapshots.
 _Avoid_: Fact, citation
 
-**Search Engine Attempt**:
-One explicit request to a single SearXNG engine for one query, with a typed completed, unavailable, or contract-rejected outcome. Google is always attempted first; Bing is attempted only after a Google unavailable outcome.
+**Search Provider Attempt**:
+One explicit request to the configured Brave Search API for one query, with a typed completed, unavailable, or contract-rejected outcome. Legacy Google/Bing attempts remain readable only for v7 Trace replay compatibility.
 _Avoid_: Search retry, provider call
 
 **Exploration Stop Reason**:

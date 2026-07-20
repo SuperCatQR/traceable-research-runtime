@@ -90,6 +90,10 @@ pub enum ClarificationEventKind {
         original_question: String,
         revision: u32,
         created_at: DateTime<Utc>,
+        /// Optional durable evidence tying this event to a workspace write.
+        /// It is additive so schema-v5 logs without the field remain readable.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         session_id: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +105,9 @@ pub enum ClarificationEventKind {
         revision: u32,
         message: String,
         received_at: DateTime<Utc>,
+        /// Optional durable evidence for an idempotent dialogue write.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        operation_id: Option<String>,
     },
     /// The brief remains model-owned. `assistant_message` is the only part of
     /// this decision that the normal chat surface presents directly.
@@ -183,6 +190,10 @@ pub struct ClarificationState {
     pub dialogue: Vec<DialogueMessage>,
     pub failure: Option<String>,
     pub preparation: Option<ResearchPreparation>,
+    #[serde(skip)]
+    current_operation_id: Option<String>,
+    #[serde(skip)]
+    recent_operation_ids: Vec<String>,
 }
 
 impl ClarificationState {
@@ -196,6 +207,19 @@ impl ClarificationState {
     #[must_use]
     pub const fn rationale_audit_status(&self) -> RationaleAuditStatus {
         RationaleAuditStatus::RequiredAndValidated
+    }
+
+    /// Returns true when this replayed intake already contains evidence for
+    /// the supplied workspace operation.  Evidence survives model events so a
+    /// retry can distinguish "message append happened, model call pending"
+    /// from "message was never appended".
+    #[must_use]
+    pub fn has_operation_id(&self, operation_id: &str) -> bool {
+        self.current_operation_id.as_deref() == Some(operation_id)
+            || self
+                .recent_operation_ids
+                .iter()
+                .any(|candidate| candidate == operation_id)
     }
 }
 
@@ -262,6 +286,7 @@ pub fn reduce_clarification_event(
                 clarification_id,
                 original_question,
                 revision,
+                operation_id,
                 session_id,
                 turn,
                 conversation_history,
@@ -288,24 +313,29 @@ pub fn reduce_clarification_event(
                     "conversation history requires a conversation turn".into(),
                 ));
             }
-            Ok(ClarificationState {
-                clarification_id: clarification_id.clone(),
-                event_schema_version: event.schema_version,
-                original_question: original_question.trim().to_owned(),
-                session_id: session_id.clone(),
-                turn: *turn,
-                conversation_history: conversation_history.clone(),
-                revision: 0,
-                status: ClarificationStatus::ModelEvaluationPending,
-                brief_draft: None,
-                content_hash: None,
-                dialogue: vec![DialogueMessage {
-                    role: DialogueRole::User,
-                    text: original_question.trim().to_owned(),
-                }],
-                failure: None,
-                preparation: None,
-            })
+            record_operation_id(
+                ClarificationState {
+                    clarification_id: clarification_id.clone(),
+                    event_schema_version: event.schema_version,
+                    original_question: original_question.trim().to_owned(),
+                    session_id: session_id.clone(),
+                    turn: *turn,
+                    conversation_history: conversation_history.clone(),
+                    revision: 0,
+                    status: ClarificationStatus::ModelEvaluationPending,
+                    brief_draft: None,
+                    content_hash: None,
+                    dialogue: vec![DialogueMessage {
+                        role: DialogueRole::User,
+                        text: original_question.trim().to_owned(),
+                    }],
+                    failure: None,
+                    preparation: None,
+                    current_operation_id: None,
+                    recent_operation_ids: Vec::new(),
+                },
+                operation_id.as_deref(),
+            )
         }
         (None, _) => Err(ClarificationError::InvalidEvent(
             "intake_started must be the first event".into(),
@@ -329,7 +359,10 @@ fn reduce_existing(
     }
     match event {
         ClarificationEventKind::UserMessageReceived {
-            revision, message, ..
+            revision,
+            message,
+            operation_id,
+            ..
         } => {
             if !matches!(
                 clarification.status,
@@ -346,7 +379,7 @@ fn reduce_existing(
             });
             next.status = ClarificationStatus::ModelEvaluationPending;
             next.failure = None;
-            Ok(next)
+            record_operation_id(next, operation_id.as_deref())
         }
         ClarificationEventKind::ModelUnderstanding {
             revision,
@@ -592,6 +625,22 @@ pub fn clarification_user_message_event(
     message: &str,
     now: DateTime<Utc>,
 ) -> ClarificationResult<ClarificationEvent> {
+    clarification_user_message_event_with_operation(
+        clarification,
+        requested_revision,
+        message,
+        None,
+        now,
+    )
+}
+
+pub fn clarification_user_message_event_with_operation(
+    clarification: &ClarificationState,
+    requested_revision: u32,
+    message: &str,
+    operation_id: Option<&str>,
+    now: DateTime<Utc>,
+) -> ClarificationResult<ClarificationEvent> {
     if !matches!(
         clarification.status,
         ClarificationStatus::AwaitingUserMessage | ClarificationStatus::ModelRequestFailed
@@ -606,6 +655,7 @@ pub fn clarification_user_message_event(
             revision: requested_revision,
             message: message.trim().to_owned(),
             received_at: now,
+            operation_id: operation_id.map(str::to_owned),
         },
     ))
 }
@@ -884,6 +934,33 @@ fn require_revision(clarification: &ClarificationState, revision: u32) -> Clarif
     }
 }
 
+fn record_operation_id(
+    mut clarification: ClarificationState,
+    operation_id: Option<&str>,
+) -> ClarificationResult<ClarificationState> {
+    let Some(operation_id) = operation_id else {
+        return Ok(clarification);
+    };
+    validate_file_id(operation_id, true)?;
+    if clarification.current_operation_id.as_deref() != Some(operation_id) {
+        if !clarification
+            .recent_operation_ids
+            .iter()
+            .any(|candidate| candidate == operation_id)
+        {
+            clarification
+                .recent_operation_ids
+                .push(operation_id.to_owned());
+            if clarification.recent_operation_ids.len() > 8 {
+                let excess = clarification.recent_operation_ids.len() - 8;
+                clarification.recent_operation_ids.drain(..excess);
+            }
+        }
+        clarification.current_operation_id = Some(operation_id.to_owned());
+    }
+    Ok(clarification)
+}
+
 fn require_content_hash_value(
     clarification: &ClarificationState,
     requested_content_hash: &str,
@@ -963,9 +1040,74 @@ impl ClarificationEventLog {
         Ok(log)
     }
 
+    /// Create or reopen a clarification for a reserved operation.  The
+    /// operation metadata is optional wire evidence; semantic seed fields
+    /// remain the identity check so old schema-v5 files can be resumed.
+    pub fn create_idempotent(
+        intake_dir: impl AsRef<Path>,
+        started: ClarificationEvent,
+    ) -> ClarificationResult<Self> {
+        let expected = reduce_clarification_event(None, &started)?;
+        let intake_dir = intake_dir.as_ref();
+        fs::create_dir_all(intake_dir)?;
+        let path = intake_path(intake_dir, &expected.clarification_id)?;
+        match OpenOptions::new().write(true).create_new(true).open(&path) {
+            Ok(file) => {
+                let mut log = Self {
+                    writer: BufWriter::new(file),
+                    clarification: expected,
+                };
+                log.write_event(&started)?;
+                Ok(log)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match Self::open(intake_dir, &expected.clarification_id) {
+                    Ok(log) => {
+                        let first = read_first_event(&path)?;
+                        if clarification_seeds_match(&first, &started) {
+                            Ok(log)
+                        } else {
+                            Err(ClarificationError::InvalidEvent(
+                                "existing clarification does not match operation seed".into(),
+                            ))
+                        }
+                    }
+                    Err(ClarificationError::EmptyLog) => {
+                        // A process can die after create_new but before the
+                        // first complete record.  The reserved clarification
+                        // ID makes replacing this empty/torn seed safe.
+                        let file = OpenOptions::new().write(true).truncate(true).open(&path)?;
+                        let mut log = Self {
+                            writer: BufWriter::new(file),
+                            clarification: expected,
+                        };
+                        log.write_event(&started)?;
+                        Ok(log)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn open(intake_dir: impl AsRef<Path>, clarification_id: &str) -> ClarificationResult<Self> {
         let path = intake_path(intake_dir.as_ref(), clarification_id)?;
-        let clarification = replay_path(&path)?;
+        let (clarification, valid_bytes, truncated) = replay_path_details(&path)?;
+        let Some(clarification) = clarification else {
+            // Empty files and first-line torn writes are recoverable seeds.
+            // Keep the file in place for create_idempotent to rewrite.
+            if truncated || valid_bytes == 0 {
+                OpenOptions::new().write(true).open(&path)?.set_len(0)?;
+            }
+            return Err(ClarificationError::EmptyLog);
+        };
+        if truncated {
+            OpenOptions::new()
+                .write(true)
+                .open(&path)?
+                .set_len(valid_bytes)?;
+        }
         let file = OpenOptions::new().append(true).open(path)?;
         Ok(Self {
             writer: BufWriter::new(file),
@@ -997,15 +1139,27 @@ pub fn replay_clarification(
     intake_dir: impl AsRef<Path>,
     clarification_id: &str,
 ) -> ClarificationResult<ClarificationState> {
-    replay_path(&intake_path(intake_dir.as_ref(), clarification_id)?)
+    let path = intake_path(intake_dir.as_ref(), clarification_id)?;
+    let (state, valid_bytes, truncated) = replay_path_details(&path)?;
+    if truncated {
+        OpenOptions::new()
+            .write(true)
+            .open(&path)?
+            .set_len(valid_bytes)?;
+    }
+    state.ok_or(ClarificationError::EmptyLog)
 }
 
-fn replay_path(path: &Path) -> ClarificationResult<ClarificationState> {
+fn replay_path_details(
+    path: &Path,
+) -> ClarificationResult<(Option<ClarificationState>, u64, bool)> {
     let file = File::open(path)?;
     let mut reader = BufReader::new(file);
     let mut current = None;
     let mut line = String::new();
     let mut line_number = 0;
+    let mut valid_bytes = 0_u64;
+    let mut truncated = false;
     loop {
         line.clear();
         let bytes = reader.read_line(&mut line)?;
@@ -1014,7 +1168,8 @@ fn replay_path(path: &Path) -> ClarificationResult<ClarificationState> {
         }
         line_number += 1;
         if !line.ends_with('\n') {
-            return Err(ClarificationError::TruncatedLine { line: line_number });
+            truncated = true;
+            break;
         }
         let event: ClarificationEvent =
             serde_json::from_str(&line).map_err(|source| ClarificationError::InvalidJsonLine {
@@ -1022,8 +1177,63 @@ fn replay_path(path: &Path) -> ClarificationResult<ClarificationState> {
                 source,
             })?;
         current = Some(reduce_clarification_event(current.as_ref(), &event)?);
+        valid_bytes += bytes as u64;
     }
-    current.ok_or(ClarificationError::EmptyLog)
+    Ok((current, valid_bytes, truncated))
+}
+
+fn read_first_event(path: &Path) -> ClarificationResult<ClarificationEvent> {
+    let file = File::open(path)?;
+    let mut reader = BufReader::new(file);
+    let mut line = String::new();
+    let bytes = reader.read_line(&mut line)?;
+    if bytes == 0 || !line.ends_with('\n') {
+        return Err(ClarificationError::EmptyLog);
+    }
+    serde_json::from_str(&line)
+        .map_err(|source| ClarificationError::InvalidJsonLine { line: 1, source })
+}
+
+fn clarification_seeds_match(existing: &ClarificationEvent, expected: &ClarificationEvent) -> bool {
+    match (&existing.kind, &expected.kind) {
+        (
+            ClarificationEventKind::ClarificationStarted {
+                clarification_id: existing_id,
+                original_question: existing_question,
+                revision: existing_revision,
+                created_at: existing_created_at,
+                operation_id: existing_operation,
+                session_id: existing_session,
+                turn: existing_turn,
+                conversation_history: existing_history,
+                ..
+            },
+            ClarificationEventKind::ClarificationStarted {
+                clarification_id: expected_id,
+                original_question: expected_question,
+                revision: expected_revision,
+                created_at: expected_created_at,
+                operation_id: expected_operation,
+                session_id: expected_session,
+                turn: expected_turn,
+                conversation_history: expected_history,
+                ..
+            },
+        ) => {
+            existing.schema_version == expected.schema_version
+                && existing_id == expected_id
+                && existing_question == expected_question
+                && existing_revision == expected_revision
+                && existing_created_at == expected_created_at
+                && (existing_operation.is_none()
+                    || expected_operation.is_none()
+                    || existing_operation == expected_operation)
+                && existing_session == expected_session
+                && existing_turn == expected_turn
+                && existing_history == expected_history
+        }
+        _ => false,
+    }
 }
 
 fn intake_path(intake_dir: &Path, clarification_id: &str) -> ClarificationResult<PathBuf> {
@@ -1074,6 +1284,7 @@ mod tests {
             original_question: QUESTION.into(),
             revision: 0,
             created_at: now(),
+            operation_id: None,
             session_id: None,
             turn: None,
             conversation_history: Vec::new(),
@@ -1344,6 +1555,84 @@ mod tests {
         let replayed = replay_clarification(&dir, "dialogue-log").unwrap();
         assert_eq!(replayed.dialogue.len(), 3);
         assert_eq!(replayed.dialogue[2].text, "重点比较兼容性");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn idempotent_seed_repairs_empty_and_torn_files_without_duplicate_start() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("traceable-dialogue-replay-{unique}"));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("dialogue-replay.jsonl");
+        File::create(&path).unwrap();
+        let seed = started("dialogue-replay");
+        let log = ClarificationEventLog::create_idempotent(&dir, seed.clone()).unwrap();
+        assert_eq!(log.clarification().clarification_id, "dialogue-replay");
+        let valid_len = fs::metadata(&path).unwrap().len();
+        drop(log);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"schema_version\":5")
+            .unwrap();
+        let reopened = ClarificationEventLog::create_idempotent(&dir, seed).unwrap();
+        assert_eq!(reopened.clarification().clarification_id, "dialogue-replay");
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+        drop(reopened);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn operation_evidence_survives_model_events_and_replay() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!("traceable-dialogue-operation-{unique}"));
+        let mut log = ClarificationEventLog::create_idempotent(
+            &dir,
+            ClarificationEvent::new(ClarificationEventKind::ClarificationStarted {
+                clarification_id: "dialogue-operation".into(),
+                original_question: QUESTION.into(),
+                revision: 0,
+                created_at: now(),
+                operation_id: Some("operation-start".into()),
+                session_id: None,
+                turn: None,
+                conversation_history: Vec::new(),
+            }),
+        )
+        .unwrap();
+        for event in events_from_clarification_model_output(
+            log.clarification(),
+            model_output(ClarificationDecision::ContinueDialogue, "Please add scope."),
+            now(),
+        )
+        .unwrap()
+        {
+            log.append(&event).unwrap();
+        }
+        let waiting = log.clarification().clone();
+        log.append(
+            &clarification_user_message_event_with_operation(
+                &waiting,
+                waiting.revision,
+                "Compatibility",
+                Some("operation-message"),
+                now(),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        assert!(log.clarification().has_operation_id("operation-start"));
+        assert!(log.clarification().has_operation_id("operation-message"));
+        drop(log);
+        let replayed = replay_clarification(&dir, "dialogue-operation").unwrap();
+        assert!(replayed.has_operation_id("operation-message"));
         let _ = fs::remove_dir_all(dir);
     }
 }

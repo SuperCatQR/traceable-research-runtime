@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, HashSet},
-    env, fs,
+    env,
     path::PathBuf,
     sync::atomic::{AtomicU64, Ordering},
 };
@@ -11,15 +11,15 @@ use url::Url;
 
 use crate::clarification::{research_preparation_failed_event, research_run_failed_event};
 use crate::{
-    CLARIFICATION_PROMPT, ClarificationError, ClarificationEvent, ClarificationEventKind,
-    ClarificationEventLog, ClarificationLocks, ClarificationModelParseOutcome, ClarificationState,
-    ClarificationStatus, Crawl4AiSnapshotClient, FrozenResearchBrief, LiveResearchBackend,
-    ModelKnowledgeDraft, OpenAiCompatibleModelClient, ResearchAnswerComparison,
-    ResearchAnswerStyle, ResearchClaimOrigin, ResearchError, RunHeader, SearxngSearchClient,
-    SnapshotReader, SnapshotRef, SnapshotWriter, TracePolicy, TraceWriter,
-    clarification_cancelled_event, clarification_user_message_event,
-    events_from_clarification_model_output, parse_clarification_model_attempt,
-    replay_clarification, replay_trace,
+    BraveSearchClient, CLARIFICATION_PROMPT, ClarificationError, ClarificationEvent,
+    ClarificationEventKind, ClarificationEventLog, ClarificationLocks,
+    ClarificationModelParseOutcome, ClarificationState, ClarificationStatus,
+    EmbeddedSnapshotClient, FrozenResearchBrief, LiveResearchBackend, ModelKnowledgeDraft,
+    OpenAiCompatibleModelClient, ResearchAnswerComparison, ResearchAnswerStyle,
+    ResearchClaimOrigin, ResearchError, RunHeader, SnapshotReader, SnapshotRef, SnapshotWriter,
+    TracePolicy, TraceWriter, clarification_cancelled_event,
+    clarification_user_message_event_with_operation, events_from_clarification_model_output,
+    parse_clarification_model_attempt, replay_clarification, replay_trace,
     research_run::{EvidenceSource, ResearchRunExecutor, ResearchRunOutput},
     research_run_prepared_event_with_answer_style, validate_trace_policy,
 };
@@ -28,18 +28,14 @@ static RUN_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
 pub struct ResearchInfrastructureConfig {
-    searxng_base_url: String,
-    crawl4ai_base_url: String,
-    crawl4ai_api_token: String,
+    brave_search_api_key: String,
     pub research_data_dir: PathBuf,
 }
 
 impl ResearchInfrastructureConfig {
     pub fn from_env() -> anyhow::Result<Self> {
         Ok(Self {
-            searxng_base_url: required_env("SEARCH_BASE_URL")?,
-            crawl4ai_base_url: required_env("CRAWL4AI_BASE_URL")?,
-            crawl4ai_api_token: env::var("CRAWL4AI_TOKEN").unwrap_or_default(),
+            brave_search_api_key: required_env("BRAVE_SEARCH_API_KEY")?,
             research_data_dir: env::var_os("TRACEABLE_SEARCH_DATA_DIR")
                 .map(PathBuf::from)
                 .unwrap_or_else(|| PathBuf::from("data")),
@@ -52,6 +48,7 @@ pub struct ModelAccessConfig {
     api_base_url: String,
     api_key: String,
     model_id: String,
+    require_public_endpoint: bool,
 }
 
 impl ModelAccessConfig {
@@ -59,6 +56,23 @@ impl ModelAccessConfig {
         api_base_url: impl Into<String>,
         api_key: impl Into<String>,
         model_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::with_endpoint_policy(api_base_url, api_key, model_id, false)
+    }
+
+    pub fn new_public(
+        api_base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model_id: impl Into<String>,
+    ) -> anyhow::Result<Self> {
+        Self::with_endpoint_policy(api_base_url, api_key, model_id, true)
+    }
+
+    fn with_endpoint_policy(
+        api_base_url: impl Into<String>,
+        api_key: impl Into<String>,
+        model_id: impl Into<String>,
+        require_public_endpoint: bool,
     ) -> anyhow::Result<Self> {
         let api_base_url = api_base_url.into().trim().to_owned();
         let model_id = model_id.into().trim().to_owned();
@@ -77,6 +91,7 @@ impl ModelAccessConfig {
             api_base_url,
             api_key: api_key.into(),
             model_id,
+            require_public_endpoint,
         })
     }
 
@@ -89,7 +104,15 @@ impl ModelAccessConfig {
     }
 
     fn create_client(&self) -> Result<OpenAiCompatibleModelClient, ResearchError> {
-        OpenAiCompatibleModelClient::new(&self.api_base_url, &self.api_key, &self.model_id)
+        if self.require_public_endpoint {
+            OpenAiCompatibleModelClient::new_public(
+                &self.api_base_url,
+                &self.api_key,
+                &self.model_id,
+            )
+        } else {
+            OpenAiCompatibleModelClient::new(&self.api_base_url, &self.api_key, &self.model_id)
+        }
     }
 }
 
@@ -207,13 +230,22 @@ impl TraceableResearchRuntime {
         &self,
     ) -> Result<crate::ResearchConversation, ResearchRuntimeError> {
         let session_id = format!("session-{}", self.generate_research_run_id());
-        let _guard = self.conversation_locks.lock(&session_id).await?;
+        self.create_conversation_idempotent(&session_id, Utc::now())
+            .await
+    }
+
+    pub async fn create_conversation_idempotent(
+        &self,
+        session_id: &str,
+        created_at: chrono::DateTime<Utc>,
+    ) -> Result<crate::ResearchConversation, ResearchRuntimeError> {
+        let _guard = self.conversation_locks.lock(session_id).await?;
         let event =
             crate::ConversationEvent::new(crate::ConversationEventKind::ConversationStarted {
-                session_id,
-                created_at: Utc::now(),
+                session_id: session_id.to_owned(),
+                created_at,
             });
-        let log = crate::ConversationEventLog::create(
+        let log = crate::ConversationEventLog::create_idempotent(
             self.infrastructure.research_data_dir.join("sessions"),
             event,
         )?;
@@ -248,46 +280,97 @@ impl TraceableResearchRuntime {
         question: &str,
         model_access: &ModelAccessConfig,
     ) -> Result<ClarificationState, ResearchRuntimeError> {
+        let clarification_id = self.generate_research_run_id();
+        let started_at = Utc::now();
+        self.start_research_turn_idempotent(
+            session_id,
+            &clarification_id,
+            &clarification_id,
+            question,
+            started_at,
+            model_access,
+        )
+        .await
+    }
+
+    pub async fn start_research_turn_idempotent(
+        &self,
+        session_id: &str,
+        clarification_id: &str,
+        operation_id: &str,
+        question: &str,
+        started_at: chrono::DateTime<Utc>,
+        model_access: &ModelAccessConfig,
+    ) -> Result<ClarificationState, ResearchRuntimeError> {
         let _conversation_guard = self.conversation_locks.lock(session_id).await?;
         let mut conversation_log = crate::ConversationEventLog::open(
             self.infrastructure.research_data_dir.join("sessions"),
             session_id,
         )?;
-        let clarification_id = self.generate_research_run_id();
-        let turn = conversation_log.conversation().next_turn_number();
+        let turn = conversation_log
+            .conversation()
+            .pending_turns
+            .iter()
+            .find(|pending| pending.clarification_id == clarification_id)
+            .map(|pending| pending.turn)
+            .or_else(|| {
+                conversation_log
+                    .conversation()
+                    .completed_turns
+                    .iter()
+                    .find(|completed| completed.clarification_id == clarification_id)
+                    .map(|completed| completed.turn)
+            })
+            .or_else(|| {
+                conversation_log
+                    .conversation()
+                    .cancelled_turns
+                    .iter()
+                    .find(|cancelled| cancelled.clarification_id == clarification_id)
+                    .map(|cancelled| cancelled.turn)
+            })
+            .or_else(|| {
+                conversation_log
+                    .conversation()
+                    .failed_turns
+                    .iter()
+                    .find(|failed| failed.clarification_id == clarification_id)
+                    .map(|failed| failed.turn)
+            })
+            .unwrap_or_else(|| conversation_log.conversation().next_turn_number());
         let conversation_history = conversation_log.conversation().completed_turn_history();
-        let started_at = Utc::now();
         let started = ClarificationEvent::new(ClarificationEventKind::ClarificationStarted {
-            clarification_id: clarification_id.clone(),
+            clarification_id: clarification_id.to_owned(),
             original_question: question.to_owned(),
             revision: 0,
             created_at: started_at,
+            operation_id: Some(operation_id.to_owned()),
             session_id: Some(session_id.to_owned()),
             turn: Some(turn),
             conversation_history,
         });
-        let _clarification_guard = self.clarification_locks.lock(&clarification_id).await?;
+        let _clarification_guard = self.clarification_locks.lock(clarification_id).await?;
         let clarification_logs_dir = self.infrastructure.research_data_dir.join("intake");
-        let mut log = ClarificationEventLog::create(&clarification_logs_dir, started)?;
-        if let Err(error) = conversation_log.append(&crate::ConversationEvent::new(
-            crate::ConversationEventKind::TurnStarted {
+        let mut log = ClarificationEventLog::create_idempotent(&clarification_logs_dir, started)?;
+        let turn_started =
+            crate::ConversationEvent::new(crate::ConversationEventKind::TurnStarted {
                 session_id: session_id.to_owned(),
                 turn,
-                clarification_id: clarification_id.clone(),
+                clarification_id: clarification_id.to_owned(),
                 user_question: question.to_owned(),
                 started_at,
-            },
-        )) {
-            let _ =
-                fs::remove_file(clarification_logs_dir.join(format!("{clarification_id}.jsonl")));
+            });
+        if let Err(error) = conversation_log.append(&turn_started) {
             return Err(error.into());
         }
-        if let Err(error) = self.advance_clarification(&mut log, model_access).await {
+        if log.clarification().status == ClarificationStatus::ModelEvaluationPending
+            && let Err(error) = self.advance_clarification(&mut log, model_access).await
+        {
             conversation_log.append(&crate::ConversationEvent::new(
                 crate::ConversationEventKind::TurnCancelled {
                     session_id: session_id.to_owned(),
                     turn,
-                    clarification_id,
+                    clarification_id: clarification_id.to_owned(),
                     cancelled_at: Utc::now(),
                 },
             ))?;
@@ -313,18 +396,47 @@ impl TraceableResearchRuntime {
         message: &str,
         model_access: &ModelAccessConfig,
     ) -> Result<ClarificationState, ResearchRuntimeError> {
+        let operation_id = self.generate_research_run_id();
+        self.submit_dialogue_message_idempotent(
+            clarification_id,
+            &operation_id,
+            revision,
+            message,
+            Utc::now(),
+            model_access,
+        )
+        .await
+    }
+
+    pub async fn submit_dialogue_message_idempotent(
+        &self,
+        clarification_id: &str,
+        operation_id: &str,
+        revision: u32,
+        message: &str,
+        received_at: chrono::DateTime<Utc>,
+        model_access: &ModelAccessConfig,
+    ) -> Result<ClarificationState, ResearchRuntimeError> {
         let _guard = self.clarification_locks.lock(clarification_id).await?;
         let mut log = ClarificationEventLog::open(
             self.infrastructure.research_data_dir.join("intake"),
             clarification_id,
         )?;
-        log.append(&clarification_user_message_event(
-            log.clarification(),
-            revision,
-            message,
-            Utc::now(),
-        )?)?;
-        self.advance_clarification(&mut log, model_access).await?;
+        let already_applied = log.clarification().has_operation_id(operation_id);
+        if !already_applied {
+            log.append(&clarification_user_message_event_with_operation(
+                log.clarification(),
+                revision,
+                message,
+                Some(operation_id),
+                received_at,
+            )?)?;
+        }
+        if !already_applied
+            || log.clarification().status == ClarificationStatus::ModelEvaluationPending
+        {
+            self.advance_clarification(&mut log, model_access).await?;
+        }
         Ok(log.clarification().clone())
     }
 
@@ -794,13 +906,9 @@ impl TraceableResearchRuntime {
             .research_data_dir
             .join("snapshots.sqlite");
         let backend = LiveResearchBackend::new(
-            SearxngSearchClient::new(&self.infrastructure.searxng_base_url)
+            BraveSearchClient::new(&self.infrastructure.brave_search_api_key)
                 .map_err(research_setup_error)?,
-            Crawl4AiSnapshotClient::new(
-                &self.infrastructure.crawl4ai_base_url,
-                self.infrastructure.crawl4ai_api_token.clone(),
-            )
-            .map_err(research_setup_error)?,
+            EmbeddedSnapshotClient::new(),
             model_access.create_client().map_err(research_setup_error)?,
         );
         let snapshots = SnapshotWriter::open(&store_path).map_err(research_setup_error)?;
@@ -1102,9 +1210,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         TraceableResearchRuntime::new(ResearchInfrastructureConfig {
-            searxng_base_url: "http://127.0.0.1:1".into(),
-            crawl4ai_base_url: "http://127.0.0.1:1".into(),
-            crawl4ai_api_token: String::new(),
+            brave_search_api_key: "test-key".into(),
             research_data_dir: std::env::temp_dir().join(format!(
                 "traceable-search-app-{name}-{}-{unique}",
                 std::process::id()
@@ -1125,6 +1231,7 @@ mod tests {
             original_question: "Original question, byte for byte?".into(),
             revision: 0,
             created_at: Utc::now(),
+            operation_id: None,
             session_id: None,
             turn: None,
             conversation_history: Vec::new(),
@@ -1188,6 +1295,7 @@ mod tests {
             original_question: "question".into(),
             revision: 0,
             created_at: started_at,
+            operation_id: None,
             session_id: Some(conversation.session_id.clone()),
             turn: Some(1),
             conversation_history: Vec::new(),
@@ -1534,6 +1642,7 @@ mod tests {
             original_question: "Original question, byte for byte?".into(),
             revision: 0,
             created_at: started_at,
+            operation_id: None,
             session_id: Some(conversation.session_id.clone()),
             turn: Some(1),
             conversation_history: Vec::new(),
@@ -1623,9 +1732,7 @@ mod tests {
             .unwrap()
             .as_nanos();
         let runtime = TraceableResearchRuntime::new(ResearchInfrastructureConfig {
-            searxng_base_url: "http://127.0.0.1:1".into(),
-            crawl4ai_base_url: "http://127.0.0.1:1".into(),
-            crawl4ai_api_token: String::new(),
+            brave_search_api_key: "test-key".into(),
             research_data_dir: std::env::temp_dir().join(format!(
                 "traceable-search-app-session-setup-error-{}-{unique}",
                 std::process::id()
@@ -1635,6 +1742,7 @@ mod tests {
             api_base_url: "not a url".into(),
             api_key: String::new(),
             model_id: "test".into(),
+            require_public_endpoint: false,
         };
         let conversation = runtime.create_conversation().await.unwrap();
 
@@ -1839,6 +1947,121 @@ mod tests {
             .unwrap();
         assert_eq!(second.turn, Some(2));
         assert!(second.conversation_history.is_empty());
+        fs::remove_dir_all(&runtime.infrastructure.research_data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotent_start_replays_reserved_files_without_duplicate_events() {
+        let runtime = test_runtime("idempotent-start");
+        let conversation = runtime.create_conversation().await.unwrap();
+        let started_at = Utc::now();
+        let first = runtime
+            .start_research_turn_idempotent(
+                &conversation.session_id,
+                "clarification-idempotent-start",
+                "operation-idempotent-start",
+                "same question",
+                started_at,
+                &test_model_access(),
+            )
+            .await
+            .unwrap();
+        let second = runtime
+            .start_research_turn_idempotent(
+                &conversation.session_id,
+                "clarification-idempotent-start",
+                "operation-idempotent-start",
+                "same question",
+                started_at,
+                &test_model_access(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        let conversation_path = runtime
+            .infrastructure
+            .research_data_dir
+            .join("sessions")
+            .join(format!("{}.jsonl", conversation.session_id));
+        let conversation_text = fs::read_to_string(conversation_path).unwrap();
+        assert_eq!(conversation_text.matches("turn_started").count(), 1);
+        let clarification_path = runtime.clarification_trace_path(&first.clarification_id);
+        let clarification_text = fs::read_to_string(clarification_path).unwrap();
+        assert_eq!(clarification_text.matches("intake_started").count(), 1);
+        assert_eq!(clarification_text.matches("intake_failed").count(), 1);
+        assert!(second.has_operation_id("operation-idempotent-start"));
+        fs::remove_dir_all(&runtime.infrastructure.research_data_dir).unwrap();
+    }
+
+    #[tokio::test]
+    async fn idempotent_message_replay_uses_operation_evidence_after_model_failure() {
+        let runtime = test_runtime("idempotent-message");
+        let clarification_id = "clarification-idempotent-message";
+        let mut log = ClarificationEventLog::create(
+            runtime.infrastructure.research_data_dir.join("intake"),
+            ClarificationEvent::new(ClarificationEventKind::ClarificationStarted {
+                clarification_id: clarification_id.into(),
+                original_question: "question".into(),
+                revision: 0,
+                created_at: Utc::now(),
+                operation_id: None,
+                session_id: None,
+                turn: None,
+                conversation_history: Vec::new(),
+            }),
+        )
+        .unwrap();
+        for event in events_from_clarification_model_output(
+            log.clarification(),
+            ClarificationModelOutput {
+                decision: ClarificationDecision::ContinueDialogue,
+                rationale: "Need one more detail before research.".into(),
+                assistant_message: "Please add one detail.".into(),
+                brief_draft: crate::ResearchBrief {
+                    schema_version: crate::RESEARCH_BRIEF_SCHEMA_VERSION,
+                    original_question: "question".into(),
+                    research_question: "question".into(),
+                    desired_output: None,
+                    scope: crate::ResearchScope::default(),
+                    source_constraints: Vec::new(),
+                    accepted_assumptions: Vec::new(),
+                },
+            },
+            Utc::now(),
+        )
+        .unwrap()
+        {
+            log.append(&event).unwrap();
+        }
+        let received_at = Utc::now();
+        let first = runtime
+            .submit_dialogue_message_idempotent(
+                clarification_id,
+                "operation-idempotent-message",
+                1,
+                "extra detail",
+                received_at,
+                &test_model_access(),
+            )
+            .await
+            .unwrap();
+        let second = runtime
+            .submit_dialogue_message_idempotent(
+                clarification_id,
+                "operation-idempotent-message",
+                1,
+                "extra detail",
+                received_at,
+                &test_model_access(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(first, second);
+        assert_eq!(second.dialogue.len(), 3);
+        assert!(second.has_operation_id("operation-idempotent-message"));
+        let text = fs::read_to_string(runtime.clarification_trace_path(clarification_id)).unwrap();
+        assert_eq!(text.matches("user_message_received").count(), 1);
+        assert_eq!(text.matches("intake_failed").count(), 1);
         fs::remove_dir_all(&runtime.infrastructure.research_data_dir).unwrap();
     }
 

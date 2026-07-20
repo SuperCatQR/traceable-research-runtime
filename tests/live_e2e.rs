@@ -6,7 +6,7 @@ use traceable_search::{
 };
 
 #[tokio::test]
-#[ignore = "requires live SearXNG, crawl4ai, and model services"]
+#[ignore = "requires live Brave Search API, public Web access, and model services"]
 async fn live_research_pipeline() {
     let research_data_dir = PathBuf::from(
         std::env::var_os("TRACEABLE_SEARCH_DATA_DIR")

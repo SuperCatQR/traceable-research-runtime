@@ -377,7 +377,10 @@ pub struct SearchQuery {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchEngine {
+    Brave,
+    /// Legacy trace value retained so v7 records can still be replayed.
     Google,
+    /// Legacy trace value retained so v7 records can still be replayed.
     Bing,
 }
 
@@ -428,6 +431,8 @@ pub enum WebSearchFailureReason {
     InvalidQuery,
     PrimarySearchContractRejected,
     FallbackSearchFailed,
+    SearchProviderContractRejected,
+    SearchProviderUnavailable,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -457,7 +462,7 @@ pub struct WebSearchExecution {
     pub completion: WebSearchCompletion,
 }
 
-/// One SearXNG first-page hit (§3 web_search). `search_result_id` is derived from
+/// One provider first-page hit (§3 web_search). `search_result_id` is derived from
 /// the issuing query + URL, so archiving can be gated to this run (§6 v2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SearchResult {
@@ -491,7 +496,7 @@ impl SearchResult {
     }
 }
 
-/// Which crawl4ai markdown representation became the archived body.
+/// Legacy wire value describing which Markdown representation became the archived body.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CrawlBodyKind {
@@ -506,7 +511,7 @@ pub struct CrawlMeta {
     pub final_url: String,
     pub http_status: u16,
     pub fetched_at: DateTime<Utc>,
-    /// Page metadata returned by crawl4ai.
+    /// Extractor metadata. The field name remains part of the Snapshot compatibility contract.
     #[serde(default)]
     pub metadata: serde_json::Value,
     #[serde(default)]
@@ -520,7 +525,7 @@ pub struct CrawlMeta {
 }
 
 impl CrawlMeta {
-    /// Minimal provenance for non-crawl4ai fixtures and legacy callers.
+    /// Minimal provenance for fixtures and legacy callers.
     #[must_use]
     pub fn basic(final_url: String, http_status: u16, fetched_at: DateTime<Utc>) -> Self {
         Self {

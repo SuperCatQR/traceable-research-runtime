@@ -884,11 +884,15 @@ fn web_search_failure_message(reason: WebSearchFailureReason) -> String {
     match reason {
         WebSearchFailureReason::InvalidQuery => "web search rejected an empty query",
         WebSearchFailureReason::PrimarySearchContractRejected => {
-            "SearXNG rejected the primary search contract"
+            "the legacy primary search contract was rejected"
         }
         WebSearchFailureReason::FallbackSearchFailed => {
-            "SearXNG could not complete the primary or fallback search"
+            "the legacy primary or fallback search could not complete"
         }
+        WebSearchFailureReason::SearchProviderContractRejected => {
+            "the Brave Search API response did not satisfy the search contract"
+        }
+        WebSearchFailureReason::SearchProviderUnavailable => "the Brave Search API was unavailable",
     }
     .into()
 }
@@ -933,13 +937,13 @@ mod tests {
     struct FixtureBackend {
         plan_calls: u32,
         search_calls: u32,
-        crawl_calls: u32,
+        snapshot_capture_calls: u32,
         selected_ref: Option<SnapshotRef>,
         synthesize_calls: u32,
         plan_error: bool,
         search_execution: Option<WebSearchExecution>,
         duplicate_urls: bool,
-        crawl_failures_remaining: u32,
+        snapshot_capture_failures_remaining: u32,
         converged_final_url: bool,
         planned_briefs: Vec<FrozenResearchBrief>,
         planned_histories: Vec<Vec<CompletedTurnContext>>,
@@ -1028,9 +1032,9 @@ mod tests {
         }
 
         fn capture_web_snapshot(&mut self, url: &str) -> impl Future<Output = Result<Snapshot>> {
-            self.crawl_calls += 1;
-            let result = if self.crawl_failures_remaining > 0 {
-                self.crawl_failures_remaining -= 1;
+            self.snapshot_capture_calls += 1;
+            let result = if self.snapshot_capture_failures_remaining > 0 {
+                self.snapshot_capture_failures_remaining -= 1;
                 Err(ResearchError::Fetch {
                     url: url.into(),
                     reason: "fixture transient failure".into(),
@@ -1417,7 +1421,7 @@ mod tests {
             DEFAULT_EXPLORE_ROUNDS * QUERIES_PER_ROUND as u32
         );
         assert_eq!(
-            research_run.execution_backend.crawl_calls,
+            research_run.execution_backend.snapshot_capture_calls,
             DEFAULT_EXPLORE_ROUNDS * 3
         );
         assert_eq!(research_run.captured_snapshots.len(), 8);
@@ -1483,6 +1487,7 @@ mod tests {
             .filter_map(|envelope| match envelope.event {
                 TraceEvent::SearchAttemptCompleted { query, engine, .. } if query == "q1-0" => {
                     Some(match engine {
+                        crate::SearchEngine::Brave => "brave_attempt",
                         crate::SearchEngine::Google => "google_attempt",
                         crate::SearchEngine::Bing => "bing_attempt",
                     })
@@ -1667,7 +1672,7 @@ mod tests {
             research_run.execution_backend.search_calls,
             2 * QUERIES_PER_ROUND as u32
         );
-        assert_eq!(research_run.execution_backend.crawl_calls, 1);
+        assert_eq!(research_run.execution_backend.snapshot_capture_calls, 1);
         assert_eq!(research_run.captured_snapshots.len(), 1);
         assert_eq!(
             exploration_stop_events(&research_run.trace_writer.into_inner()),
@@ -1676,17 +1681,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn transient_crawl_failure_is_retried_in_a_later_round() {
+    async fn transient_snapshot_capture_failure_is_retried_in_a_later_round() {
         let db = TempDb::new("crawl-retry");
         let mut research_run = research_run(&db);
         research_run.execution_backend.duplicate_urls = true;
-        research_run.execution_backend.crawl_failures_remaining = 1;
+        research_run
+            .execution_backend
+            .snapshot_capture_failures_remaining = 1;
 
         let progress = research_run.execute_exploration().await.unwrap().clone();
 
         assert_eq!(progress.round, 3);
         assert_eq!(progress.stop_reason, Some(ExplorationStopReason::NoNewUrls));
-        assert_eq!(research_run.execution_backend.crawl_calls, 2);
+        assert_eq!(research_run.execution_backend.snapshot_capture_calls, 2);
         assert_eq!(research_run.captured_snapshots.len(), 1);
     }
 
@@ -1752,7 +1759,7 @@ mod tests {
         );
         assert_eq!(research_run.execution_backend.plan_calls, 0);
         assert_eq!(research_run.execution_backend.search_calls, 0);
-        assert_eq!(research_run.execution_backend.crawl_calls, 0);
+        assert_eq!(research_run.execution_backend.snapshot_capture_calls, 0);
         assert_eq!(
             exploration_stop_events(&research_run.trace_writer.into_inner()),
             [(0, ExplorationStopReason::SnapshotLimit)]

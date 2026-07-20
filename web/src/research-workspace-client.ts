@@ -8,7 +8,6 @@ export type ResearchTurnStatus =
 
 export type DialogueStatus = "thinking" | "awaiting_message" | "research_started" | "failed" | "cancelled";
 export type ResearchAnswerStyle = "web_first" | "knowledge_first";
-export type RationaleAuditStatus = "legacy_unverified" | "required_and_validated";
 
 export interface UserAccount {
   user_id: string;
@@ -28,6 +27,10 @@ export interface ModelProfile {
   verified_at: number | null;
   created_at: number;
   updated_at: number;
+}
+
+export interface ArchivedModelProfile extends ModelProfile {
+  archived_at: number;
 }
 
 export interface EvidenceSource {
@@ -70,9 +73,7 @@ export interface TraceSourceSummary {
 }
 
 export interface ResearchTraceSummary {
-  run_id: string | null;
-  clarification_rationale_audit_status: RationaleAuditStatus;
-  research_rationale_audit_status: RationaleAuditStatus | null;
+  model_id: string;
   understanding: TraceUnderstanding | null;
   rounds: TraceRoundSummary[];
   archived_source_count: number;
@@ -92,7 +93,6 @@ export interface TraceAuditEntry {
 }
 
 export interface ResearchTraceAuditPage {
-  run_id: string | null;
   next_cursor: number | null;
   entries: TraceAuditEntry[];
 }
@@ -124,6 +124,11 @@ export interface ResearchConversationDetail extends ResearchConversationSummary 
   turns: ResearchTurn[];
 }
 
+export interface ArchivedResearchConversation extends ResearchConversationSummary {
+  archived_at: number;
+  model_profile_available: boolean;
+}
+
 export interface SaveModelProfileInput {
   display_name: string;
   api_base_url: string;
@@ -138,20 +143,42 @@ interface ApiErrorPayload {
   retryable?: boolean;
 }
 
+interface RequestOptions {
+  method?: string;
+  body?: unknown;
+  idempotencyKey?: string;
+  signal?: AbortSignal;
+}
+
+export function createIdempotencyKey(): string {
+  return globalThis.crypto.randomUUID();
+}
+
 export class ResearchWorkspaceRequestError extends Error {
+  readonly status: number;
+  readonly code: string;
+  readonly retryable: boolean;
+
   constructor(
     message: string,
-    readonly status: number,
-    readonly code: string,
-    readonly retryable: boolean,
+    status: number,
+    code: string,
+    retryable: boolean,
   ) {
     super(message);
     this.name = "ResearchWorkspaceRequestError";
+    this.status = status;
+    this.code = code;
+    this.retryable = retryable;
   }
 }
 
 export class ResearchWorkspaceClient {
-  constructor(private readonly apiBaseUrl = "") {}
+  private readonly apiBaseUrl: string;
+
+  constructor(apiBaseUrl = "") {
+    this.apiBaseUrl = apiBaseUrl;
+  }
 
   currentAccount(): Promise<UserAccount> {
     return this.requestJson("/api/auth/me");
@@ -179,8 +206,15 @@ export class ResearchWorkspaceClient {
     return this.requestJson("/api/model-profiles");
   }
 
-  createModelProfile(profile: SaveModelProfileInput): Promise<ModelProfile> {
-    return this.requestJson("/api/model-profiles", { method: "POST", body: profile });
+  createModelProfile(
+    profile: SaveModelProfileInput,
+    idempotencyKey = createIdempotencyKey(),
+  ): Promise<ModelProfile> {
+    return this.requestJson("/api/model-profiles", {
+      method: "POST",
+      body: profile,
+      idempotencyKey,
+    });
   }
 
   updateModelProfile(profileId: string, profile: SaveModelProfileInput): Promise<ModelProfile> {
@@ -211,14 +245,28 @@ export class ResearchWorkspaceClient {
     });
   }
 
+  listArchivedModelProfiles(): Promise<ArchivedModelProfile[]> {
+    return this.requestJson("/api/archives/model-profiles");
+  }
+
+  restoreModelProfile(profileId: string): Promise<ModelProfile> {
+    return this.requestJson(`/api/model-profiles/${encodeURIComponent(profileId)}/restore`, {
+      method: "POST",
+    });
+  }
+
   listResearchConversations(): Promise<ResearchConversationSummary[]> {
     return this.requestJson("/api/conversations");
   }
 
-  createResearchConversation(modelProfileId?: string): Promise<ResearchConversationDetail> {
+  createResearchConversation(
+    modelProfileId?: string,
+    idempotencyKey = createIdempotencyKey(),
+  ): Promise<ResearchConversationDetail> {
     return this.requestJson("/api/conversations", {
       method: "POST",
       body: { model_profile_id: modelProfileId },
+      idempotencyKey,
     });
   }
 
@@ -242,14 +290,29 @@ export class ResearchWorkspaceClient {
     });
   }
 
+  listArchivedResearchConversations(): Promise<ArchivedResearchConversation[]> {
+    return this.requestJson("/api/archives/conversations");
+  }
+
+  restoreResearchConversation(
+    conversationId: string,
+    modelProfileId?: string,
+  ): Promise<ResearchConversationSummary> {
+    return this.requestJson(`/api/conversations/${encodeURIComponent(conversationId)}/restore`, {
+      method: "POST",
+      body: { model_profile_id: modelProfileId },
+    });
+  }
+
   startResearchTurn(
     conversationId: string,
     question: string,
     answerStyle: ResearchAnswerStyle,
+    idempotencyKey = createIdempotencyKey(),
   ): Promise<ResearchTurn> {
     return this.requestJson(
       `/api/conversations/${encodeURIComponent(conversationId)}/turns`,
-      { method: "POST", body: { question, answer_style: answerStyle } },
+      { method: "POST", body: { question, answer_style: answerStyle }, idempotencyKey },
     );
   }
 
@@ -258,36 +321,44 @@ export class ResearchWorkspaceClient {
     turnId: string,
     revision: number,
     message: string,
+    idempotencyKey = createIdempotencyKey(),
   ): Promise<ResearchTurn> {
     return this.requestJson(
       `/api/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/messages`,
-      { method: "POST", body: { revision, message } },
+      { method: "POST", body: { revision, message }, idempotencyKey },
     );
   }
 
-  loadResearchTraceSummary(conversationId: string, turnId: string): Promise<ResearchTraceSummary> {
+  loadResearchTraceSummary(
+    conversationId: string,
+    turnId: string,
+    signal?: AbortSignal,
+  ): Promise<ResearchTraceSummary> {
     return this.requestJson(
       `/api/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/trace/summary`,
+      { signal },
     );
   }
 
   loadResearchTraceAudit(
     conversationId: string,
     turnId: string,
-    options: { stage?: string; cursor?: number } = {},
+    options: { stage?: string; cursor?: number; limit?: number; signal?: AbortSignal } = {},
   ): Promise<ResearchTraceAuditPage> {
     const query = new URLSearchParams();
     if (options.stage) query.set("stage", options.stage);
     if (options.cursor !== undefined) query.set("cursor", String(options.cursor));
+    if (options.limit !== undefined) query.set("limit", String(options.limit));
     const suffix = query.size ? `?${query.toString()}` : "";
     return this.requestJson(
       `/api/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/trace/audit${suffix}`,
+      { signal: options.signal },
     );
   }
 
   private async requestJson<T>(
     requestPath: string,
-    options: { method?: string; body?: unknown } = {},
+    options: RequestOptions = {},
   ): Promise<T> {
     const response = await this.send(requestPath, options);
     return response.json() as Promise<T>;
@@ -295,21 +366,36 @@ export class ResearchWorkspaceClient {
 
   private async requestWithoutResponse(
     requestPath: string,
-    options: { method?: string; body?: unknown } = {},
+    options: RequestOptions = {},
   ): Promise<void> {
     await this.send(requestPath, options);
   }
 
   private async send(
     requestPath: string,
-    options: { method?: string; body?: unknown },
+    options: RequestOptions,
   ): Promise<Response> {
-    const response = await fetch(`${this.apiBaseUrl}${requestPath}`, {
-      method: options.method ?? "GET",
-      credentials: "same-origin",
-      headers: options.body === undefined ? undefined : { "Content-Type": "application/json" },
-      body: options.body === undefined ? undefined : JSON.stringify(options.body),
-    });
+    const headers = new Headers();
+    if (options.body !== undefined) headers.set("Content-Type", "application/json");
+    if (options.idempotencyKey) headers.set("Idempotency-Key", options.idempotencyKey);
+    let response: Response;
+    try {
+      response = await fetch(`${this.apiBaseUrl}${requestPath}`, {
+        method: options.method ?? "GET",
+        credentials: "same-origin",
+        headers,
+        body: options.body === undefined ? undefined : JSON.stringify(options.body),
+        signal: options.signal,
+      });
+    } catch (error) {
+      if (options.signal?.aborted) throw error;
+      throw new ResearchWorkspaceRequestError(
+        "网络不可用，请检查连接后重试",
+        0,
+        "network_unavailable",
+        true,
+      );
+    }
     if (response.ok) return response;
 
     const fallbackMessage = `请求失败（HTTP ${response.status}）`;
@@ -324,6 +410,6 @@ export class ResearchWorkspaceClient {
 }
 
 const configuredApiBaseUrl =
-  (import.meta.env.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
+  (import.meta.env?.VITE_API_BASE_URL as string | undefined)?.replace(/\/$/, "") ?? "";
 
 export const researchWorkspaceClient = new ResearchWorkspaceClient(configuredApiBaseUrl);

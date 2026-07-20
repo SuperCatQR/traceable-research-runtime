@@ -1,0 +1,19 @@
+{
+  "turn_id": "11111111111111111111111111111111",
+  "turn_number": 1,
+  "user_question": "What changed in the latest release?",
+  "status": "completed",
+  "answer": {
+    "answer": "The release changed the documented behavior.",
+    "sources": [
+      {
+        "url": "https://example.com/release",
+        "title": "Release notes"
+      }
+    ]
+  },
+  "dialogue": null,
+  "created_at": 1784476800,
+  "updated_at": 1784476860,
+  "completed_at": 1784476860
+}

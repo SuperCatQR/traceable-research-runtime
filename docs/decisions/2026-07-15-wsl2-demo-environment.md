@@ -1,7 +1,7 @@
 # WSL2 完整 Demo 环境
 
 日期：2026-07-15
-状态：已实施；2026-07-16 更新为模型主导自然对话与三级 Trace 工作区
+状态：已实施；2026-07-20 更新为 Brave Search API 与进程内 Snapshot 提取
 
 ## 原因
 
@@ -10,7 +10,7 @@
 ## 现状
 
 - WSL2：Ubuntu 24.04，Podman 可用。
-- 已有 SearXNG 与 crawl4ai 容器/镜像，可复用。
+- Brave Search API 作为外部搜索依赖；正文抓取与 Markdown 提取已内收至 Rust 进程。
 - WSL 内 DNS 返回真实公网 IP，可满足 Rust SSRF guard；Windows 侧曾出现 `198.18.0.0/15` 合成地址。
 - 上游模型由用户保存的 OpenAI-compatible Model Profile 提供；本机不部署大型模型。`.env`
   只为本地宿主和兼容性构造提供基础变量，不把用户 Profile 密钥带入浏览器。
@@ -39,14 +39,14 @@ Windows browser -> http://127.0.0.1:8080
                       +-- demo-host (Axum + authenticated static workspace)
                             |-- SQLite catalogue (accounts, login sessions, profiles, conversations)
                             |-- traceable-search library (JSONL trace and snapshots)
-                            |-- SearXNG :8888
-                            |-- crawl4ai :11235
+                            |-- Brave Search API (HTTPS)
+                            |-- embedded Snapshot extraction
                             `-- user-selected OpenAI-compatible model endpoint
 ```
 
 ## 验收
 
-- WSL2 中 SearXNG、crawl4ai 与 demo-host 持续运行。
+- WSL2 中 demo-host 通过服务端 API key 访问 Brave Search API。
 - `GET /api/health` 返回 `ok`。
 - 浏览器可注册账户、保存加密模型配置、新建并恢复多个研究对话。
 - 重新启动 demo-host 后，登录 Cookie、对话列表、已完成答案和待继续的自然对话仍可恢复。

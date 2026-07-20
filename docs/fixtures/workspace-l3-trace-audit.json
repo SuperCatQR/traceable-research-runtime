@@ -1,0 +1,13 @@
+{
+  "next_cursor": null,
+  "entries": [
+    {
+      "sequence": 7,
+      "occurred_at": "2026-07-19T12:01:00Z",
+      "stage": "search",
+      "label": "Search result",
+      "detail": "Google rank 1: Release notes (https://example.com/release)",
+      "rationale": null
+    }
+  ]
+}

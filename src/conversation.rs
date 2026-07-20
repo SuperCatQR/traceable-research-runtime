@@ -433,6 +433,59 @@ impl ConversationEventLog {
         Ok(log)
     }
 
+    /// Create a conversation with a caller-reserved identifier, or reopen the
+    /// exact same conversation after a process exit.  The event log is the
+    /// source of truth; an existing file is accepted only when its semantic
+    /// session identity matches the requested seed.
+    pub fn create_idempotent(
+        sessions_dir: impl AsRef<Path>,
+        started: ConversationEvent,
+    ) -> ConversationResult<Self> {
+        let expected = reduce_conversation_event(None, &started)?;
+        let sessions_dir = sessions_dir.as_ref();
+        create_private_dir(sessions_dir)?;
+        let path = session_path(sessions_dir, &expected.session_id)?;
+        match create_private_file(&path) {
+            Ok(file) => {
+                let mut log = Self {
+                    writer: BufWriter::new(file),
+                    conversation: expected,
+                };
+                log.write_event(&started)?;
+                Ok(log)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+                match Self::open(sessions_dir, &expected.session_id) {
+                    Ok(log) => {
+                        if log.conversation.session_id == expected.session_id
+                            && log.conversation.created_at == expected.created_at
+                        {
+                            Ok(log)
+                        } else {
+                            Err(ConversationError::InvalidEvent(
+                                "existing conversation does not match operation seed".into(),
+                            ))
+                        }
+                    }
+                    Err(ConversationError::EmptyLog) => {
+                        // A process can die after create_new but before the
+                        // first complete JSONL record.  The reserved ID makes
+                        // replacing this empty/torn seed unambiguous.
+                        let file = OpenOptions::new().write(true).truncate(true).open(&path)?;
+                        let mut log = Self {
+                            writer: BufWriter::new(file),
+                            conversation: expected,
+                        };
+                        log.write_event(&started)?;
+                        Ok(log)
+                    }
+                    Err(error) => Err(error),
+                }
+            }
+            Err(error) => Err(error.into()),
+        }
+    }
+
     pub fn open(sessions_dir: impl AsRef<Path>, session_id: &str) -> ConversationResult<Self> {
         let path = session_path(sessions_dir.as_ref(), session_id)?;
         let (conversation, valid_bytes, truncated) = replay_path(&path)?;
@@ -770,6 +823,56 @@ mod tests {
         let log = ConversationEventLog::open(&dir, "conversation-1").unwrap();
         assert_eq!(log.conversation().session_id, "conversation-1");
         assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idempotent_create_repairs_empty_and_reopens_torn_seed() {
+        let dir = test_dir("idempotent-seed");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("conversation-1.jsonl");
+        File::create(&path).unwrap();
+        let seed = started();
+        let mut log = ConversationEventLog::create_idempotent(&dir, seed.clone()).unwrap();
+        log.append(&ConversationEvent::new(
+            ConversationEventKind::TurnStarted {
+                session_id: "conversation-1".into(),
+                turn: 1,
+                clarification_id: "clarification-1".into(),
+                user_question: "question".into(),
+                started_at: now(),
+            },
+        ))
+        .unwrap();
+        let valid_len = fs::metadata(&path).unwrap().len();
+        assert_eq!(log.conversation().pending_turns.len(), 1);
+        drop(log);
+        OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap()
+            .write_all(b"{\"schema_version\":2")
+            .unwrap();
+        let reopened = ConversationEventLog::create_idempotent(&dir, seed).unwrap();
+        assert_eq!(reopened.conversation().session_id, "conversation-1");
+        assert_eq!(reopened.conversation().pending_turns.len(), 1);
+        assert_eq!(fs::metadata(&path).unwrap().len(), valid_len);
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn idempotent_create_rejects_a_different_seed_for_reserved_id() {
+        let dir = test_dir("idempotent-mismatch");
+        let first = ConversationEventLog::create_idempotent(&dir, started()).unwrap();
+        drop(first);
+        let different = ConversationEvent::new(ConversationEventKind::ConversationStarted {
+            session_id: "conversation-1".into(),
+            created_at: now() + chrono::Duration::seconds(1),
+        });
+        assert!(matches!(
+            ConversationEventLog::create_idempotent(&dir, different),
+            Err(ConversationError::InvalidEvent(_))
+        ));
         fs::remove_dir_all(dir).unwrap();
     }
 

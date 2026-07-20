@@ -1,0 +1,40 @@
+name: traceable-search
+
+services:
+  app:
+    build:
+      context: .
+      dockerfile: demo-host/Containerfile
+    restart: unless-stopped
+    environment:
+      BRAVE_SEARCH_API_KEY: ${BRAVE_SEARCH_API_KEY:?set BRAVE_SEARCH_API_KEY in .env}
+      TRACEABLE_SEARCH_DATA_DIR: /data
+      DEMO_CATALOG_PATH: /data/demo-catalog.sqlite
+      DEMO_CREDENTIAL_ENCRYPTION_KEY: ${DEMO_CREDENTIAL_ENCRYPTION_KEY:?set DEMO_CREDENTIAL_ENCRYPTION_KEY in .env}
+      DEMO_MAX_CONCURRENT_RESEARCH: ${DEMO_MAX_CONCURRENT_RESEARCH:-2}
+      DEMO_BIND: 0.0.0.0:8080
+      DEMO_ALLOW_NETWORK_BIND: "true"
+      DEMO_SECURE_COOKIES: ${DEMO_SECURE_COOKIES:-false}
+      DEMO_ALLOW_PRIVATE_MODEL_ENDPOINTS: ${DEMO_ALLOW_PRIVATE_MODEL_ENDPOINTS:-false}
+      DEMO_TRUSTED_HOSTS: ${DEMO_TRUSTED_HOSTS:-localhost,127.0.0.1}
+      DEMO_TRUSTED_ORIGINS: ${DEMO_TRUSTED_ORIGINS:-http://localhost:8080,http://127.0.0.1:8080}
+    ports:
+      - "${DEMO_HOST_PORT:-8080}:8080"
+    volumes:
+      - research-data:/data
+    healthcheck:
+      test:
+        [
+          "CMD",
+          "curl",
+          "--fail",
+          "--silent",
+          "http://127.0.0.1:8080/api/health",
+        ]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 10s
+
+volumes:
+  research-data:

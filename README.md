@@ -1,6 +1,6 @@
 # traceable-search
 
-可审计的 Web 研究运行时与 Demo 工作区。用户只通过自然语言聊天表达意图；模型在每个回合同时生成一条可见的理解回复和一个内部结构化 `ResearchBrief`，再自行决定继续对话或自动开始研究。用户不会看到、编辑或确认 Brief，也没有“开始研究”按钮。研究运行时经 SearXNG（Google 优先、Bing 回退）、crawl4ai 和 OpenAI-compatible 模型完成检索、快照锁定与带来源答案；内部以 `snapshot_ref`、内容哈希和追加式审计记录保持可回放性。
+可审计的 Web 研究运行时与 Demo 工作区。用户只通过自然语言聊天表达意图；模型在每个回合同时生成一条可见的理解回复和一个内部结构化 `ResearchBrief`，再自行决定继续对话或自动开始研究。用户不会看到、编辑或确认 Brief，也没有“开始研究”按钮。研究运行时经 Brave Search API、进程内安全网页提取和 OpenAI-compatible 模型完成检索、快照锁定与带来源答案；内部以 `snapshot_ref`、内容哈希和追加式审计记录保持可回放性。
 
 ## 架构
 
@@ -12,8 +12,8 @@ Browser / Rust caller
             ├── Research Conversation：长期上下文与已完成 Turn
             ├── Clarification：模型主导的自然对话与内部 Brief
             ├── Research Run：检索、抓取、选源、合成
-            ├── HTTP ── SearXNG ── Google → Bing（仅 unavailable 时回退）
-            ├── HTTP ── crawl4ai
+            ├── HTTPS ── Brave Search API
+            ├── HTTP ── public Web → embedded HTML-to-Markdown
             ├── HTTP ── upstream model
             └── data/
                 ├── sessions/<conversation_id>.jsonl
@@ -38,11 +38,17 @@ cargo build --release
 cargo fmt -- --check
 cargo clippy --all-targets -- -D warnings
 cargo test --all-targets
+cargo fmt --manifest-path demo-host/Cargo.toml --all -- --check
+cargo clippy --manifest-path demo-host/Cargo.toml --all-targets -- -D warnings
+cargo test --manifest-path demo-host/Cargo.toml
+npm --prefix web run check
+npm --prefix web test
+npm --prefix web run build
 ```
 
 ## Library 调用
 
-高层入口为 crate root 导出的 `TraceableResearchRuntime`。`ResearchInfrastructureConfig` 提供共享的 SearXNG、crawl4ai 和数据目录配置；`ModelAccessConfig` 则在每个命令中提供某个用户选定模型的端点、密钥和模型 ID。
+高层入口为 crate root 导出的 `TraceableResearchRuntime`。`ResearchInfrastructureConfig` 提供共享的 Brave Search API 凭据和数据目录配置；`ModelAccessConfig` 则在每个命令中提供某个用户选定模型的端点、密钥和模型 ID。
 
 1. 调用 `create_conversation()` 创建长期研究会话，再以 `start_research_turn(conversation_id, question, model_access)` 开始一轮。模型只看到本会话先前成功轮次的问题与最终答案；不同会话不会混入，且同一会话只能有一个未完成 Turn。
 2. 模型返回 `assistant_message + brief_draft + rationale + decision`。`continue_dialogue` 将 Turn 置为 `AwaitingUserMessage`，调用方以 `submit_dialogue_message(...)` 提交下一句普通用户消息；没有专用澄清题、选项或确认动作。
@@ -55,156 +61,24 @@ cargo test --all-targets
 
 - 聊天正文（L1）只展示自然对话、研究状态、最终答案和必要来源。
 - 右侧“研究概览”（L2）由服务端投影，展示理解摘要、检索方向、来源数量、主要来源和合成理由。
-- 右侧“审计详情”（L3）按阶段、分页返回带 v7 序号/时间的审阅安全事件，包括搜索引擎尝试、回退和探索停止原因。它不包含系统提示词、隐藏推理、API Key、模型原始输入或完整快照正文。
+- 右侧“审计详情”（L3）按阶段、分页返回带 v7 序号/时间的审阅安全事件，包括 Brave 搜索尝试和探索停止原因。它不包含系统提示词、隐藏推理、API Key、模型原始输入或完整快照正文。
 
-Demo Host 的拥有者受限端点为：
-
-- `POST /api/conversations/{conversation_id}/turns`
-- `POST /api/conversations/{conversation_id}/turns/{turn_id}/messages`
-- `GET /api/conversations/{conversation_id}/turns/{turn_id}/trace/summary`
-- `GET /api/conversations/{conversation_id}/turns/{turn_id}/trace/audit?stage=&cursor=&limit=`
+除注册、登录和健康检查外，Demo Host 的业务端点均要求有效的同源 Cookie Session。资源端点按账户所有权过滤，
+不存在和属于其他账户的资源统一返回 `404 not_found`，避免资源枚举。完整路由、DTO 与错误契约见
+[`docs/workspace-http-api.md`](docs/workspace-http-api.md)。
 
 Conversation 事件 schema 是 v2，Clarification 事件 schema 是 v5，Research Trace 已升级到 v7。v7 每行都有连续 `sequence` 和 `occurred_at`，并且只能通过完整 replay 校验读取；不能在旧 trace 日志上继续写入或回放。部署这一版本时必须使用新的数据目录或持久卷；不要在原卷上原地混用两种 schema。
 
 ## 外部服务
 
-本项目不部署或管理外部服务。Rust 宿主须能访问 SearXNG、待抓取的公开网页、crawl4ai 及上游模型端点。请自行准备：
+Rust 宿主须能访问 Brave Search API、待抓取的公开网页及上游模型端点。请自行准备：
 
-- SearXNG：自托管 JSON Search API；
-- crawl4ai `0.9.1`：可访问的 `/crawl` API 及 bearer token（若启用认证）；Rust 侧先安全抓取并清洗网页，再提交 `raw:<html>`，故 crawl4ai 只负责离线 HTML 转 Markdown；
+- Brave Search API：服务端 API key；
 - 上游模型：OpenAI-compatible `/v1/chat/completions` API、API key 与模型名。
 
-### SearXNG 部署示例
+Brave Search API 官方文档：<https://api.search.brave.com/app/documentation/>。API key 只注入 Rust 宿主，不能写入前端、镜像或 Trace。
 
-以下为 WSL rootless Podman 示例。宿主机需有 `python3`，用于生成 `SECRET_KEY` 及后续校验 JSON；SearXNG 容器已自带其运行环境：
-
-```bash
-install -d -m 700 ~/.config/searxng
-SECRET_KEY="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-umask 077
-cat > ~/.config/searxng/settings.yml <<EOF
-use_default_settings:
-  engines:
-    keep_only:
-      - google
-      - bing
-
-general:
-  instance_name: "traceable-search"
-
-server:
-  secret_key: "$SECRET_KEY"
-  bind_address: "0.0.0.0"
-  port: 8080
-  limiter: false
-  image_proxy: false
-
-search:
-  safe_search: 0
-  autocomplete: ""
-  default_lang: "auto"
-  formats:
-    - html
-    - json
-
-engines:
-  - name: google
-    engine: google
-    shortcut: go
-    disabled: false
-  - name: bing
-    engine: bing
-    shortcut: bi
-    disabled: false
-    base_url: https://cn.bing.com
-EOF
-unset SECRET_KEY
-
-podman run -d \
-  --name searxng \
-  --restart=unless-stopped \
-  --publish 127.0.0.1:8888:8080 \
-  --volume ~/.config/searxng:/etc/searxng:Z \
-  docker.io/searxng/searxng@sha256:bf2700fa1e7b63c9ef577004513efef509f9c23bfa2cd6e56be08211508df95a
-```
-
-分别强制单引擎请求，验证 JSON Search API：
-
-```bash
-curl -fsS --get 'http://127.0.0.1:8888/search' \
-  --data-urlencode 'q=Rust' --data-urlencode 'format=json' --data-urlencode 'engines=google'
-curl -fsS --get 'http://127.0.0.1:8888/search' \
-  --data-urlencode 'q=Rust' --data-urlencode 'format=json' --data-urlencode 'engines=bing'
-```
-
-> [!NOTE]
-> 应用对每个查询显式请求 Google；只有 Google transport/timeout/rate-limit/server-error/unresponsive 才显式请求 Bing。正常空结果不回退，契约错误也不回退。SearXNG 抓取公开搜索页而非官方付费 Search API，因此两台引擎仍可能受 CAPTCHA、限流、区域网络或页面结构变化影响。
-
-> [!IMPORTANT]
-> 上线前应确认 Google 和 Bing 各自至少返回一条带正确引擎元数据的 HTTP(S) 结果。任一失败都应阻止替换当前实例；不要通过关闭 Google 或改成永久 Bing 来绕过策略契约。
-
-> [!CAUTION]
-> 此配置关闭 limiter，仅适用于 localhost。若对外开放，须配置反向代理、HTTPS、访问控制及 Valkey/Redis limiter。
-
-### crawl4ai 部署示例
-
-本项目不维护 crawl4ai 镜像；以下为 WSL rootless Podman 示例。先生成 token 与权限受限的 env file：
-
-```bash
-install -d -m 700 ~/.config/traceable-search
-umask 077
-TOKEN="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
-printf 'CRAWL4AI_API_TOKEN=%s\n' "$TOKEN" > ~/.config/traceable-search/crawl4ai.env
-unset TOKEN
-```
-
-官方 `0.9.1` tag 在部分环境会因 Playwright browser 位于 root 目录、而服务以 `appuser` 运行而启动失败。构建一个只修正 browser 路径的派生镜像：
-
-```bash
-cat > /tmp/Containerfile.crawl4ai <<'EOF'
-FROM docker.io/unclecode/crawl4ai:0.9.1
-USER root
-ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
-RUN mkdir -p /opt/ms-playwright \
- && cp -a /root/.cache/ms-playwright/. /opt/ms-playwright/ \
- && chmod -R a+rX /opt/ms-playwright
-USER appuser
-EOF
-
-podman build \
-  --tag localhost/crawl4ai-with-browser:0.9.1 \
-  --file /tmp/Containerfile.crawl4ai \
-  /tmp
-```
-
-启动派生镜像：
-
-```bash
-podman run -d \
-  --name traceable-search-crawl4ai \
-  --restart=unless-stopped \
-  --shm-size=1g \
-  --publish 127.0.0.1:11235:11235 \
-  --env-file ~/.config/traceable-search/crawl4ai.env \
-  localhost/crawl4ai-with-browser:0.9.1
-```
-
-将同一 token 填入项目 `.env` 的 `CRAWL4AI_TOKEN`，而服务端变量名须为 `CRAWL4AI_API_TOKEN`。
-
-> [!NOTE]
-> 此派生镜像不下载或升级 browser，只把官方镜像已有文件复制到 `appuser` 可读的稳定路径。若构建时 `/root/.cache/ms-playwright` 为空，说明上游镜像已变化；请依该版本官方文档安装匹配的 Chromium，勿混用不同 Playwright 版本。
-
-> [!CAUTION]
-> 仅绑定 `127.0.0.1` 或可信私网；勿公开暴露 `/crawl`。生产环境还应限制容器访问私网、loopback、link-local 与云 metadata 地址，以防 SSRF。token 文件须保持 `0600`，且不得提交至仓库。
-
-检查服务：
-
-```bash
-podman logs --tail 50 traceable-search-crawl4ai
-curl -i http://127.0.0.1:11235/
-```
-
-未带 token 返回 `401` 说明认证已启用；最终应使用带 token 的 `POST /crawl` 提交一段 `raw:<html>`，验证离线 HTML 转 Markdown。真实网页由 Rust 侧在 SSRF 与重定向校验后抓取，crawl4ai 无须访问目标站点。
+网页正文由 Rust 进程直接执行 DNS/SSRF 校验、重定向控制、大小限制、HTML allowlist 清洗和 HTML-to-Markdown 转换，不需要 Python、浏览器或额外抓取服务。
 
 推荐使用 `deepseek-v4-pro`，已验证普通调用可用。当前项目不发送思考模式参数；思考行为由上游模型决定，项目仅解析最终 `content`。
 
@@ -233,19 +107,19 @@ test -w "$TRACEABLE_SEARCH_DATA_DIR"
 
 | 变量 | 必需 | 含义 |
 |---|---:|---|
-| `SEARCH_BASE_URL` | 是 | SearXNG 基础 URL；保留尾部 `/` |
-| `CRAWL4AI_BASE_URL` | 是 | crawl4ai 基础 URL；保留尾部 `/` |
-| `CRAWL4AI_TOKEN` | 否 | crawl4ai bearer token；服务启用认证时填写 |
+| `BRAVE_SEARCH_API_KEY` | 是 | Brave Search API 服务端密钥 |
 | `STRONG_MODEL_BASE_URL` | 是 | 上游模型的 OpenAI-compatible API 基础 URL |
 | `STRONG_MODEL_API_KEY` | 是 | 上游模型签发的 API key |
 | `STRONG_MODEL_ID` | 是 | 上游模型名；建议 `deepseek-v4-pro` |
 | `TRACEABLE_SEARCH_DATA_DIR` | 否 | `sessions/`、`intake/`、`traces/` 与快照目录；默认 `data`；运行用户须有写权限 |
+| `DEMO_CREDENTIAL_ENCRYPTION_KEY` | Demo Host | base64 编码的 32-byte Model Profile 加密主密钥 |
+| `VITE_API_PROXY_TARGET` | Vite 开发 | `/api` 同源代理目标；默认 `http://127.0.0.1:8080` |
 
 > [!IMPORTANT]
-> 基础 URL 应保留尾部 `/`。程序分别拼接 `search`、`crawl` 与 `chat/completions`。
+> Brave Search API 使用固定官方端点；程序只从服务端环境读取 API key。
 
 
-先验证 SearXNG、crawl4ai 与 OpenAI-compatible API 可达。宿主完成一次成功研究后，本项目应生成：
+先验证 Brave Search API 与 OpenAI-compatible API 可达。宿主完成一次成功研究后，本项目应生成：
 
 ```text
 data/snapshots.sqlite
@@ -260,8 +134,7 @@ data/traces/<run_id>.jsonl
 
 | 现象 | 检查 |
 |---|---|
-| SearXNG 返回空结果 | 分别运行强制 Google/Bing 探针，检查 `unresponsive_engines`、引擎元数据与 `SEARCH_BASE_URL` |
-| crawl4ai 返回认证失败 | `CRAWL4AI_TOKEN` 是否为该服务签发的有效 token |
+| Brave Search API 返回错误 | 检查 `BRAVE_SEARCH_API_KEY`、HTTP 状态、额度与服务端日志 |
 | 模型返回 401 | `STRONG_MODEL_API_KEY` 是否有效 |
 | 模型端点 404 | `STRONG_MODEL_BASE_URL` 是否指向 OpenAI-compatible `/v1/` API |
 | 模型不可用 | `STRONG_MODEL_ID` 是否与上游暴露名称完全一致；建议 `deepseek-v4-pro` |
@@ -269,13 +142,33 @@ data/traces/<run_id>.jsonl
 
 ## WSL2 Demo
 
-仓库只维护 `demo-host/Containerfile`，不维护环境专用的启动、停止或服务器替换脚本。在 WSL2 已准备 SearXNG、crawl4ai 和项目 `.env` 后，可从仓库根目录构建同源镜像：
+推荐使用仓库根目录的 `compose.yaml` 启动 App。复制 `.env.example` 后，填写 Brave API key 和仓库外持久保存的加密主密钥：
+
+```bash
+python3 -c 'import base64, os; print(base64.b64encode(os.urandom(32)).decode())'
+docker compose up -d --build
+```
+
+默认从 Windows 浏览器打开 <http://127.0.0.1:8080>。若覆盖 `DEMO_HOST_PORT`，还须同步覆盖 `DEMO_TRUSTED_ORIGINS`。停止时运行 `docker compose down`；不要使用 `down -v` 删除研究数据卷。
+
+仓库不维护环境专用的启动、停止或服务器替换脚本。若只需构建 App 镜像，可从仓库根目录运行：
 
 ```bash
 podman build --tag traceable-search-demo --file demo-host/Containerfile .
 ```
 
+Backend continuation status: Catalog v7 now preserves durable operation IDs,
+Runtime conversation/clarification logs are replayable, and each protected
+write commits its Catalog resource and response snapshot in one fenced SQLite
+transaction. Fault-injected process restart, Compose restart, and live
+Brave/model acceptance remain environment gates; a provider without request
+idempotency can still receive a repeated billable call after a local crash.
+
 运行镜像时由部署环境显式提供 `.env.example` 中的变量、可写数据卷和端口映射。`DEMO_CREDENTIAL_ENCRYPTION_KEY` 必须是仓库外持久保存的 base64 编码 32-byte 密钥；不得删除或替换，否则既有 Model Profile 的加密 API Key 无法解密。Research Trace v7 必须使用新的空数据目录或 volume，不得继续写入旧 schema 数据。
 
-Host 启动后从 Windows 浏览器打开其映射地址。首次使用依次注册账户、添加 OpenAI-compatible
+Host 启动后首次使用依次注册账户、添加 OpenAI-compatible
 Model Profile、创建研究对话。用户只在聊天框中发送问题或补充；模型会自然回复理解，并在信息足够时自动开始研究。对话、对话式校准状态和已完成答案会保留在 Podman volume 中，重启 Host 后仍可恢复。
+
+当前已实现持久状态加载和非终态自动研究候选恢复，但本轮尚未完成 Compose、真实模型/Brave 的进程重启验收。
+进程若在 Runtime/文件系统或 Catalog 副作用提交后、幂等 completion 持久化前退出，四类受保护写操作还不保证
+crash-safe exactly-once；详见 [`docs/workspace-http-api.md`](docs/workspace-http-api.md#open-delivery-gate)。

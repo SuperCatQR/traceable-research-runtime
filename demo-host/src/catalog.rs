@@ -160,6 +160,7 @@ pub struct ArchivedConversationRecord {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(dead_code)]
 pub enum IdempotencyClaim {
     Claimed {
         claim_token: String,
@@ -172,6 +173,7 @@ pub enum IdempotencyClaim {
     Reused,
 }
 
+#[allow(dead_code)]
 pub struct NewIdempotencyClaim<'a> {
     pub user_id: &'a str,
     pub method: &'a str,
@@ -182,6 +184,7 @@ pub struct NewIdempotencyClaim<'a> {
     pub expires_at: i64,
 }
 
+#[allow(dead_code)]
 pub struct CompleteIdempotency<'a> {
     pub user_id: &'a str,
     pub method: &'a str,
@@ -819,6 +822,7 @@ impl DemoCatalog {
         self.model_profile(user_id, profile_id)
     }
 
+    #[allow(dead_code)]
     pub fn create_research_conversation(
         &self,
         conversation: NewResearchConversation<'_>,
@@ -1187,6 +1191,7 @@ impl DemoCatalog {
         self.claim_operation(claim)
     }
 
+    #[allow(dead_code)]
     pub fn claim_idempotency_with_serialization(
         &self,
         claim: NewIdempotencyClaim<'_>,
@@ -1204,6 +1209,7 @@ impl DemoCatalog {
         })
     }
 
+    #[allow(dead_code)]
     pub fn claim_idempotency(
         &self,
         claim: NewIdempotencyClaim<'_>,
@@ -1442,6 +1448,7 @@ impl DemoCatalog {
         )
     }
 
+    #[allow(dead_code)]
     pub fn complete_idempotency(&self, completion: CompleteIdempotency<'_>) -> CatalogResult<()> {
         let mut connection = self.connection()?;
         let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -1564,6 +1571,7 @@ impl DemoCatalog {
         Ok(())
     }
 
+    #[allow(dead_code)]
     pub fn create_research_turn(
         &self,
         turn: NewResearchTurn<'_>,

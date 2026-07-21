@@ -1,4 +1,5 @@
 mod catalog;
+mod research_service;
 mod security;
 mod workspace_api;
 
@@ -23,6 +24,7 @@ use traceable_search::{ResearchInfrastructureConfig, TraceableResearchRuntime};
 use url::Url;
 
 use catalog::DemoCatalog;
+use research_service::ResearchService;
 use security::CredentialCipher;
 
 pub(crate) struct DemoHostState {
@@ -169,7 +171,7 @@ async fn main() -> anyhow::Result<()> {
     });
     // Recovery is detached so host startup and read-only conversation routes do
     // not wait on an external model or research backend after a process crash.
-    workspace_api::start_automatic_execution_recovery(state.clone());
+    ResearchService::new(state.clone()).start_automatic_execution_recovery();
     let app = build_app(state, static_dir, index);
 
     let listener = tokio::net::TcpListener::bind(address).await?;
@@ -339,6 +341,7 @@ mod tests {
     use sha2::{Digest, Sha256};
     use tempfile::TempDir;
     use tower::ServiceExt;
+    use traceable_search::ResearchAnswerStyle;
 
     use super::*;
     use crate::catalog::{
@@ -1450,7 +1453,7 @@ mod tests {
         let profile_id = profile["profile_id"].as_str().unwrap();
         let conversation = create_conversation(&app, &cookie, profile_id).await;
         let conversation_id = conversation["conversation_id"].as_str().unwrap();
-        let body = json!({"question": question, "answer_style": "web_first"});
+        let body = json!({"question": question, "answer_style": "knowledge_first"});
 
         let response = app
             .clone()
@@ -1470,6 +1473,10 @@ mod tests {
         assert_eq!(turn["dialogue"]["status"], "awaiting_message");
         assert_eq!(turn["dialogue"]["revision"], 1);
         assert_eq!(turn["answer"], Value::Null);
+        assert_eq!(
+            test.state.catalog.list_research_turns(conversation_id).unwrap()[0].answer_style,
+            ResearchAnswerStyle::WebFirst
+        );
         let serialized = turn.to_string();
         for forbidden in ["run_id", "brief", "api_base_url", "api_key", "rationale"] {
             assert!(!serialized.contains(forbidden), "leaked {forbidden}");

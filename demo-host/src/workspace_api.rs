@@ -21,12 +21,10 @@ use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use sha2::{Digest, Sha256};
 use time::Duration as CookieDuration;
 use traceable_search::{
-    ChatResearchAnswerResponse, ClarificationError, ClarificationEvent, ClarificationEventKind,
-    ClarificationState, ClarificationStatus, ConversationError, DialogueMessage,
-    ExplorationStopReason, ModelAccessConfig, OpenAiCompatibleModelClient, ResearchAnswerResponse,
-    ResearchAnswerStyle, ResearchRuntimeError, SearchBoundaryContractFailure, SearchEngine,
+    ClarificationEvent, ClarificationEventKind, ExplorationStopReason, ModelAccessConfig,
+    OpenAiCompatibleModelClient, SearchBoundaryContractFailure, SearchEngine,
     SearchEngineAttemptOutcome, SearchEngineUnavailability, TraceEvent, TraceEventEnvelope,
-    TracePolicy, project_chat_research_answer, replay_trace, validate_public_web_url,
+    replay_trace, validate_public_web_url,
 };
 use url::Url;
 use uuid::Uuid;
@@ -35,13 +33,16 @@ use crate::{
     DemoHostState, ErrorResponse, PublicHttpError,
     catalog::{
         ArchivedConversationRecord, ArchivedModelProfileRecord, CatalogConflict, CatalogError,
-        CompleteIdempotency, DEFAULT_RESEARCH_CONVERSATION_TITLE, DurableIdempotencyClaim,
-        DurableIdempotencyCompletion, IdempotencyClaim, ModelProfileRecord,
-        NewDurableIdempotencyClaim, NewIdempotencyClaim, NewModelProfile, NewResearchConversation,
-        NewResearchTurn, ResearchConversationRecord, ResearchTurnRecord, ResearchTurnStatus,
-        UpdatedModelProfile, UserAccountRecord,
+        DurableIdempotencyClaim, DurableIdempotencyCompletion, ModelProfileRecord,
+        NewDurableIdempotencyClaim, NewModelProfile, ResearchTurnRecord, UpdatedModelProfile,
+        UserAccountRecord,
     },
     security::{generate_login_token, hash_login_token, hash_password, password_matches},
+    research_service::{
+        ConversationDetailResponse, ConversationSummaryResponse, CreateConversationRequest,
+        CreateDialogueTurnRequest, DialogueMessageRequest, DurableIdempotencyLease,
+        DurableIdempotencyStart, ResearchService, project_conversation_summary,
+    },
 };
 
 const LOGIN_COOKIE_NAME: &str = "traceable_login";
@@ -56,8 +57,6 @@ const MAX_API_BASE_URL_CHARS: usize = 2_048;
 const MAX_API_KEY_CHARS: usize = 4_096;
 const MAX_CONVERSATION_TITLE_CHARS: usize = 200;
 const IDEMPOTENCY_RETENTION_SECONDS: i64 = 24 * 60 * 60;
-const AUTOMATIC_RESEARCH_FAILURE_MESSAGE: &str = "研究未能自动完成。请直接发送新的研究问题。";
-const AUTOMATIC_RESEARCH_FAILURE_SUMMARY: &str = "Automatic research could not complete.";
 
 pub fn routes() -> Router<Arc<DemoHostState>> {
     Router::new()
@@ -106,11 +105,11 @@ pub fn routes() -> Router<Arc<DemoHostState>> {
         )
         .route(
             "/conversations/{conversation_id}/turns",
-            post(create_dialogue_turn_durable),
+            post(create_dialogue_turn_service),
         )
         .route(
             "/conversations/{conversation_id}/turns/{turn_id}/messages",
-            post(submit_dialogue_message_durable),
+            post(submit_dialogue_message_service),
         )
         .route(
             "/conversations/{conversation_id}/turns/{turn_id}/trace/summary",
@@ -120,6 +119,85 @@ pub fn routes() -> Router<Arc<DemoHostState>> {
             "/conversations/{conversation_id}/turns/{turn_id}/trace/audit",
             get(load_research_turn_trace_audit),
         )
+}
+
+/// Thin HTTP adapter for the research use case. Authentication, JSON parsing,
+/// and idempotency replay stay at the transport seam; ownership, revision
+/// checks, compensation, durable commit, and projection live in the service.
+async fn create_dialogue_turn_service(
+    State(state): State<Arc<DemoHostState>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Path(conversation_id): Path<String>,
+    ApiJson(request): ApiJson<CreateDialogueTurnRequest>,
+) -> Result<Response, PublicHttpError> {
+    let user = authenticated_user(&state, &jar)?;
+    let resource_scope = format!("conversations/{conversation_id}/turns");
+    let serialization_key = format!("{}:{resource_scope}:active", user.user_id);
+    let idempotency = begin_durable_idempotent_request(
+        &state,
+        &headers,
+        &user.user_id,
+        &resource_scope,
+        &request,
+        Some(&serialization_key),
+    )?;
+    let mut lease = match idempotency {
+        DurableIdempotencyStart::Claimed(lease) => lease,
+        DurableIdempotencyStart::Replay(response) => return Ok(response),
+    };
+    let service = ResearchService::new(state.clone());
+    let operation = match service.create_turn(&mut lease, &conversation_id, &request).await {
+        Ok(operation) => operation,
+        Err(error) => return finish_durable_error(&mut lease, error),
+    };
+    let _ = service.schedule_automatic_research_turn(
+        user.user_id,
+        conversation_id,
+        operation.turn,
+        operation.clarification,
+        operation.model_access,
+    );
+    Ok(Json(operation.response).into_response())
+}
+
+async fn submit_dialogue_message_service(
+    State(state): State<Arc<DemoHostState>>,
+    jar: CookieJar,
+    headers: HeaderMap,
+    Path((conversation_id, turn_id)): Path<(String, String)>,
+    ApiJson(request): ApiJson<DialogueMessageRequest>,
+) -> Result<Response, PublicHttpError> {
+    let user = authenticated_user(&state, &jar)?;
+    let resource_scope = format!("conversations/{conversation_id}/turns/{turn_id}/messages");
+    let idempotency = begin_durable_idempotent_request(
+        &state,
+        &headers,
+        &user.user_id,
+        &resource_scope,
+        &request,
+        None,
+    )?;
+    let mut lease = match idempotency {
+        DurableIdempotencyStart::Claimed(lease) => lease,
+        DurableIdempotencyStart::Replay(response) => return Ok(response),
+    };
+    let service = ResearchService::new(state.clone());
+    let operation = match service
+        .submit_message(&mut lease, &conversation_id, &turn_id, &request)
+        .await
+    {
+        Ok(operation) => operation,
+        Err(error) => return finish_durable_error(&mut lease, error),
+    };
+    let _ = service.schedule_automatic_research_turn(
+        user.user_id,
+        conversation_id,
+        operation.turn,
+        operation.clarification,
+        operation.model_access,
+    );
+    Ok(Json(operation.response).into_response())
 }
 
 #[derive(Debug, Deserialize)]
@@ -179,12 +257,6 @@ struct ModelProfileResponse {
     updated_at: i64,
 }
 
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct CreateConversationRequest {
-    model_profile_id: Option<String>,
-}
-
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct UpdateConversationRequest {
@@ -196,62 +268,6 @@ struct UpdateConversationRequest {
 #[serde(deny_unknown_fields)]
 struct RestoreConversationRequest {
     model_profile_id: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ConversationSummaryResponse {
-    conversation_id: String,
-    title: String,
-    model_profile_id: String,
-    model_profile_name: String,
-    turn_count: i64,
-    latest_turn_status: Option<String>,
-    created_at: i64,
-    updated_at: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct ConversationDetailResponse {
-    #[serde(flatten)]
-    conversation: ConversationSummaryResponse,
-    turns: Vec<ResearchTurnResponse>,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-/// The first normal user message in a research turn. It begins model-led
-/// dialogue; it is not an instruction to manually execute research.
-struct CreateDialogueTurnRequest {
-    question: String,
-    answer_style: ResearchAnswerStyle,
-}
-
-#[derive(Debug, Deserialize, Serialize)]
-#[serde(deny_unknown_fields)]
-struct DialogueMessageRequest {
-    revision: u32,
-    message: String,
-}
-
-#[derive(Debug, Serialize)]
-struct TurnDialogueResponse {
-    revision: u32,
-    status: &'static str,
-    messages: Vec<DialogueMessage>,
-    failure: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct ResearchTurnResponse {
-    turn_id: String,
-    turn_number: i64,
-    user_question: String,
-    status: &'static str,
-    answer: Option<ChatResearchAnswerResponse>,
-    dialogue: Option<TurnDialogueResponse>,
-    created_at: i64,
-    updated_at: i64,
-    completed_at: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -334,53 +350,6 @@ struct LoadedTurnTrace {
     turn: ResearchTurnRecord,
     clarification_events: Vec<ClarificationEvent>,
     research_events: Vec<TraceEventEnvelope>,
-}
-
-enum IdempotencyStart {
-    Claimed(IdempotencyLease),
-    Replay(Response),
-}
-
-enum DurableIdempotencyStart {
-    Claimed(DurableIdempotencyLease),
-    Replay(Response),
-}
-
-struct DurableIdempotencyLease {
-    state: Arc<DemoHostState>,
-    user_id: String,
-    resource_scope: String,
-    key: String,
-    operation_id: String,
-    operation_created_at: i64,
-    claim_token: String,
-    completed: bool,
-}
-
-struct IdempotencyLease {
-    state: Arc<DemoHostState>,
-    user_id: String,
-    resource_scope: String,
-    key: String,
-    claim_token: String,
-    completed: bool,
-}
-
-impl Drop for IdempotencyLease {
-    fn drop(&mut self) {
-        if self.completed {
-            return;
-        }
-        if let Err(error) = self.state.catalog.abandon_idempotency(
-            &self.user_id,
-            "POST",
-            &self.resource_scope,
-            &self.key,
-            &self.claim_token,
-        ) {
-            tracing::error!(error = %error, "failed to abandon idempotency claim");
-        }
-    }
 }
 
 struct ApiJson<T>(T);
@@ -823,123 +792,14 @@ async fn create_conversation_durable(
         DurableIdempotencyStart::Claimed(lease) => lease,
         DurableIdempotencyStart::Replay(response) => return Ok(response),
     };
-    let profile = match request.model_profile_id {
-        Some(profile_id) => match state.catalog.model_profile(&user.user_id, &profile_id) {
-            Ok(profile) => profile,
-            Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
-        },
-        None => match state.catalog.default_model_profile(&user.user_id) {
-            Ok(profile) => profile,
-            Err(CatalogError::NotFound) => {
-                return finish_durable_error(
-                    &mut lease,
-                    PublicHttpError::conflict(
-                        "model_profile_required",
-                        "璇峰厛娣诲姞妯″瀷閰嶇疆",
-                    ),
-                );
-            }
-            Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
-        },
-    };
-    let conversation_id = lease.operation_id.clone();
-    let core_conversation_id = format!(
-        "session-{}",
-        derive_operation_resource_id(&lease.operation_id, "core-conversation")
-    );
-    if let Err(error) = state
-        .research_runtime
-        .create_conversation_idempotent(
-            &core_conversation_id,
-            operation_datetime(lease.operation_created_at),
-        )
+    let conversation = match ResearchService::new(state.clone())
+        .create_conversation(&mut lease, &request)
         .await
     {
-        return finish_durable_error(&mut lease, PublicHttpError::internal_failure(error));
-    }
-    let commit = state.catalog.commit_research_conversation_idempotent(
-        DurableIdempotencyCompletion {
-            user_id: &lease.user_id,
-            method: "POST",
-            resource_scope: &lease.resource_scope,
-            key: &lease.key,
-            operation_id: &lease.operation_id,
-            operation_created_at: lease.operation_created_at,
-            claim_token: &lease.claim_token,
-            status_code: i64::from(StatusCode::OK.as_u16()),
-        },
-        NewResearchConversation {
-            conversation_id: &conversation_id,
-            user_id: &user.user_id,
-            core_conversation_id: &core_conversation_id,
-            title: DEFAULT_RESEARCH_CONVERSATION_TITLE,
-            model_profile_id: &profile.profile_id,
-            now: lease.operation_created_at,
-        },
-        |conversation| ConversationDetailResponse {
-            conversation: project_conversation_summary(conversation.clone()),
-            turns: Vec::new(),
-        },
-    );
-    let commit = match commit {
-        Ok(commit) => commit,
-        Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
+        Ok(conversation) => conversation,
+        Err(error) => return finish_durable_error(&mut lease, error),
     };
-    lease.completed = true;
-    Ok(Json(commit.projection).into_response())
-}
-
-#[allow(dead_code)]
-async fn create_conversation(
-    State(state): State<Arc<DemoHostState>>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    ApiJson(request): ApiJson<CreateConversationRequest>,
-) -> Result<Response, PublicHttpError> {
-    let user = authenticated_user(&state, &jar)?;
-    let idempotency =
-        begin_idempotent_request(&state, &headers, &user.user_id, "conversations", &request)?;
-    let lease = match idempotency {
-        IdempotencyStart::Claimed(lease) => lease,
-        IdempotencyStart::Replay(response) => return Ok(response),
-    };
-    let result = async {
-        let profile =
-            match request.model_profile_id {
-                Some(profile_id) => state
-                    .catalog
-                    .model_profile(&user.user_id, &profile_id)
-                    .map_err(map_catalog_error)?,
-                None => state
-                    .catalog
-                    .default_model_profile(&user.user_id)
-                    .map_err(|error| match error {
-                        CatalogError::NotFound => {
-                            PublicHttpError::conflict("model_profile_required", "请先添加模型配置")
-                        }
-                        other => map_catalog_error(other),
-                    })?,
-            };
-        let core_conversation = state
-            .research_runtime
-            .create_conversation()
-            .await
-            .map_err(PublicHttpError::internal_failure)?;
-        let conversation = state
-            .catalog
-            .create_research_conversation(NewResearchConversation {
-                conversation_id: &new_public_id(),
-                user_id: &user.user_id,
-                core_conversation_id: &core_conversation.session_id,
-                title: DEFAULT_RESEARCH_CONVERSATION_TITLE,
-                model_profile_id: &profile.profile_id,
-                now: now(),
-            })
-            .map_err(map_catalog_error)?;
-        build_conversation_detail(&state, conversation).await
-    }
-    .await;
-    finish_idempotent_result(lease, result)
+    Ok(Json(conversation).into_response())
 }
 
 async fn load_conversation(
@@ -948,11 +808,11 @@ async fn load_conversation(
     Path(conversation_id): Path<String>,
 ) -> Result<Json<ConversationDetailResponse>, PublicHttpError> {
     let user = authenticated_user(&state, &jar)?;
-    let conversation = state
-        .catalog
-        .research_conversation(&user.user_id, &conversation_id)
-        .map_err(map_catalog_error)?;
-    Ok(Json(build_conversation_detail(&state, conversation).await?))
+    Ok(Json(
+        ResearchService::new(state)
+            .load_conversation(&user.user_id, &conversation_id)
+            .await?,
+    ))
 }
 
 async fn update_conversation(
@@ -1029,811 +889,6 @@ async fn restore_conversation(
         )
         .map_err(map_catalog_error)?;
     Ok(Json(project_conversation_summary(restored)))
-}
-
-async fn create_dialogue_turn_durable(
-    State(state): State<Arc<DemoHostState>>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Path(conversation_id): Path<String>,
-    ApiJson(request): ApiJson<CreateDialogueTurnRequest>,
-) -> Result<Response, PublicHttpError> {
-    let user = authenticated_user(&state, &jar)?;
-    let resource_scope = format!("conversations/{conversation_id}/turns");
-    let serialization_key = format!("{}:{resource_scope}:active", user.user_id);
-    let idempotency = begin_durable_idempotent_request(
-        &state,
-        &headers,
-        &user.user_id,
-        &resource_scope,
-        &request,
-        Some(&serialization_key),
-    )?;
-    let mut lease = match idempotency {
-        DurableIdempotencyStart::Claimed(lease) => lease,
-        DurableIdempotencyStart::Replay(response) => return Ok(response),
-    };
-    let question = match validate_trimmed_text(
-        &request.question,
-        1,
-        4_000,
-        "invalid_question",
-        "鐮旂┒闂闀垮害鏃犳晥",
-    ) {
-        Ok(question) => question,
-        Err(error) => return finish_durable_error(&mut lease, error),
-    };
-    let conversation = match state
-        .catalog
-        .research_conversation(&user.user_id, &conversation_id)
-    {
-        Ok(conversation) => conversation,
-        Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
-    };
-    let profile = match state
-        .catalog
-        .model_profile(&user.user_id, &conversation.model_profile_id)
-    {
-        Ok(profile) => profile,
-        Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
-    };
-    let model_access = match model_access_from_profile(&state, &profile) {
-        Ok(model_access) => model_access,
-        Err(error) => return finish_durable_error(&mut lease, error),
-    };
-    let clarification_id = derive_operation_resource_id(&lease.operation_id, "clarification");
-    let clarification = match state
-        .research_runtime
-        .start_research_turn_idempotent(
-            &conversation.core_conversation_id,
-            &clarification_id,
-            &lease.operation_id,
-            &question,
-            operation_datetime(lease.operation_created_at),
-            &model_access,
-        )
-        .await
-    {
-        Ok(clarification) => clarification,
-        Err(error) => {
-            return finish_durable_error(
-                &mut lease,
-                map_create_turn_runtime_error(error),
-            );
-        }
-    };
-    let current_conversation = match state
-        .catalog
-        .research_conversation(&user.user_id, &conversation_id)
-    {
-        Ok(current_conversation) => current_conversation,
-        Err(error) => {
-            let _ = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await;
-            return finish_durable_error(&mut lease, map_catalog_error(error));
-        }
-    };
-    if current_conversation.model_profile_id != conversation.model_profile_id {
-        let _ = state
-            .research_runtime
-            .cancel_clarification(&clarification.clarification_id, clarification.revision)
-            .await;
-        return finish_durable_error(
-            &mut lease,
-            PublicHttpError::conflict(
-                "conversation_model_profile_changed",
-                "浼氳瘽妯″瀷閰嶇疆宸插彉鏇达紝璇烽噸鏂板彂閫佺爺绌堕棶棰?",
-            ),
-        );
-    }
-    let current_profile = match state
-        .catalog
-        .model_profile(&user.user_id, &conversation.model_profile_id)
-    {
-        Ok(current_profile) => current_profile,
-        Err(error) => {
-            let _ = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await;
-            return finish_durable_error(&mut lease, map_catalog_error(error));
-        }
-    };
-    if current_profile.revision != profile.revision {
-        let _ = state
-            .research_runtime
-            .cancel_clarification(&clarification.clarification_id, clarification.revision)
-            .await;
-        return finish_durable_error(
-            &mut lease,
-            PublicHttpError::conflict(
-                "model_profile_changed",
-                "妯″瀷閰嶇疆宸插彉鏇达紝璇烽噸鏂板彂閫佺爺绌堕棶棰?",
-            ),
-        );
-    }
-    let turn_number = match clarification.turn.and_then(|turn| i64::try_from(turn).ok()) {
-        Some(turn_number) => turn_number,
-        None => {
-            let _ = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await;
-            return finish_durable_error(
-                &mut lease,
-                PublicHttpError::internal_failure("research clarification has no turn number"),
-            );
-        }
-    };
-    let turn_id = derive_operation_resource_id(&lease.operation_id, "turn");
-    let status = clarification_catalog_status(&clarification);
-    let response_clarification = clarification.clone();
-    let commit = state.catalog.commit_research_turn_idempotent_result(
-        DurableIdempotencyCompletion {
-            user_id: &lease.user_id,
-            method: "POST",
-            resource_scope: &lease.resource_scope,
-            key: &lease.key,
-            operation_id: &lease.operation_id,
-            operation_created_at: lease.operation_created_at,
-            claim_token: &lease.claim_token,
-            status_code: i64::from(StatusCode::OK.as_u16()),
-        },
-        NewResearchTurn {
-            turn_id: &turn_id,
-            conversation_id: &conversation_id,
-            turn_number,
-            clarification_id: &clarification.clarification_id,
-            user_question: &question,
-            status,
-            answer_style: request.answer_style,
-            model_profile: &profile,
-            now: lease.operation_created_at,
-        },
-        move |turn| {
-            let projected = project_research_turn(turn.clone(), Some(response_clarification.clone()))
-                .map_err(|_| CatalogError::InvalidData("invalid research turn projection"))?;
-            serde_json::to_value(projected).map_err(CatalogError::ResponseSerialization)
-        },
-    );
-    let commit = match commit {
-        Ok(commit) => commit,
-        Err(error) => {
-            let _ = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await;
-            return finish_durable_error(&mut lease, map_catalog_error(error));
-        }
-    };
-    lease.completed = true;
-    let _ = schedule_automatic_research_turn(
-        &state,
-        user.user_id.clone(),
-        conversation_id,
-        commit.resource.clone(),
-        clarification,
-        model_access,
-    );
-    Ok(Json(commit.projection).into_response())
-}
-
-#[allow(dead_code)]
-async fn create_dialogue_turn(
-    State(state): State<Arc<DemoHostState>>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Path(conversation_id): Path<String>,
-    ApiJson(request): ApiJson<CreateDialogueTurnRequest>,
-) -> Result<Response, PublicHttpError> {
-    let user = authenticated_user(&state, &jar)?;
-    let resource_scope = format!("conversations/{conversation_id}/turns");
-    let idempotency =
-        begin_idempotent_request(&state, &headers, &user.user_id, &resource_scope, &request)?;
-    let lease = match idempotency {
-        IdempotencyStart::Claimed(lease) => lease,
-        IdempotencyStart::Replay(response) => return Ok(response),
-    };
-    let result = async {
-    let question = validate_trimmed_text(
-        &request.question,
-        1,
-        4_000,
-        "invalid_question",
-        "研究问题长度无效",
-    )?;
-    let conversation = state
-        .catalog
-        .research_conversation(&user.user_id, &conversation_id)
-        .map_err(map_catalog_error)?;
-    let profile = state
-        .catalog
-        .model_profile(&user.user_id, &conversation.model_profile_id)
-        .map_err(map_catalog_error)?;
-    let model_access = model_access_from_profile(&state, &profile)?;
-    let clarification = state
-        .research_runtime
-        .start_research_turn(&conversation.core_conversation_id, &question, &model_access)
-        .await
-        .map_err(map_create_turn_runtime_error)?;
-    // The model request above awaits external I/O. Re-check the pinned profile
-    // before recording the turn so a concurrent profile edit cannot create a
-    // dialogue that later fails its revision guard.
-    let current_conversation = match state
-        .catalog
-        .research_conversation(&user.user_id, &conversation_id)
-    {
-        Ok(current_conversation) => current_conversation,
-        Err(error) => {
-            if let Err(cancel_error) = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await
-            {
-                tracing::error!(error = %cancel_error, "failed to compensate clarification after conversation lookup failed");
-            }
-            return Err(map_catalog_error(error));
-        }
-    };
-    if current_conversation.model_profile_id != conversation.model_profile_id {
-        state
-            .research_runtime
-            .cancel_clarification(&clarification.clarification_id, clarification.revision)
-            .await
-            .map_err(PublicHttpError::internal_failure)?;
-        return Err(PublicHttpError::conflict(
-            "conversation_model_profile_changed",
-            "会话模型配置已变更，请重新发送研究问题",
-        ));
-    }
-    let current_profile = match state
-        .catalog
-        .model_profile(&user.user_id, &conversation.model_profile_id)
-    {
-        Ok(current_profile) => current_profile,
-        Err(error) => {
-            if let Err(cancel_error) = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await
-            {
-                tracing::error!(error = %cancel_error, "failed to compensate clarification after model-profile lookup failed");
-            }
-            return Err(map_catalog_error(error));
-        }
-    };
-    if current_profile.revision != profile.revision {
-        state
-            .research_runtime
-            .cancel_clarification(&clarification.clarification_id, clarification.revision)
-            .await
-            .map_err(PublicHttpError::internal_failure)?;
-        return Err(PublicHttpError::conflict(
-            "model_profile_changed",
-            "模型配置已变更，请重新发送研究问题",
-        ));
-    }
-    let turn_id = new_public_id();
-    let status = clarification_catalog_status(&clarification);
-    let created = state.catalog.create_research_turn(NewResearchTurn {
-        turn_id: &turn_id,
-        conversation_id: &conversation_id,
-        turn_number: i64::try_from(clarification.turn.unwrap_or_default())
-            .map_err(PublicHttpError::internal_failure)?,
-        clarification_id: &clarification.clarification_id,
-        user_question: &question,
-        status,
-        answer_style: request.answer_style,
-        model_profile: &profile,
-        now: now(),
-    });
-    let turn = match created {
-        Ok(turn) => turn,
-        Err(error) => {
-            if let Err(cancel_error) = state
-                .research_runtime
-                .cancel_clarification(&clarification.clarification_id, clarification.revision)
-                .await
-            {
-                tracing::error!(error = %cancel_error, "failed to compensate unregistered clarification");
-            }
-            return Err(map_catalog_error(error));
-        }
-    };
-    let (turn, clarification) = schedule_automatic_research_turn(
-        &state,
-        user.user_id.clone(),
-        conversation_id.clone(),
-        turn,
-        clarification,
-        model_access,
-    );
-    let response = project_research_turn(turn, Some(clarification))?;
-    Ok(response)
-    }
-    .await;
-    finish_idempotent_result(lease, result)
-}
-
-async fn submit_dialogue_message_durable(
-    State(state): State<Arc<DemoHostState>>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Path((conversation_id, turn_id)): Path<(String, String)>,
-    ApiJson(request): ApiJson<DialogueMessageRequest>,
-) -> Result<Response, PublicHttpError> {
-    let user = authenticated_user(&state, &jar)?;
-    let resource_scope = format!("conversations/{conversation_id}/turns/{turn_id}/messages");
-    let idempotency = begin_durable_idempotent_request(
-        &state,
-        &headers,
-        &user.user_id,
-        &resource_scope,
-        &request,
-        None,
-    )?;
-    let mut lease = match idempotency {
-        DurableIdempotencyStart::Claimed(lease) => lease,
-        DurableIdempotencyStart::Replay(response) => return Ok(response),
-    };
-    let message = match validate_trimmed_text(
-        &request.message,
-        1,
-        4_000,
-        "invalid_dialogue_message",
-        "娑堟伅闀垮害鏃犳晥",
-    ) {
-        Ok(message) => message,
-        Err(error) => return finish_durable_error(&mut lease, error),
-    };
-    let (_, turn, model_access) = match owned_turn_with_model(
-        &state,
-        &jar,
-        &conversation_id,
-        &turn_id,
-    ) {
-        Ok(value) => value,
-        Err(error) => return finish_durable_error(&mut lease, error),
-    };
-    let clarification = match state
-        .research_runtime
-        .submit_dialogue_message_idempotent(
-            &turn.clarification_id,
-            &lease.operation_id,
-            request.revision,
-            &message,
-            operation_datetime(lease.operation_created_at),
-            &model_access,
-        )
-        .await
-    {
-        Ok(clarification) => clarification,
-        Err(error) => {
-            return finish_durable_error(&mut lease, map_dialogue_runtime_error(error));
-        }
-    };
-    let status = clarification_catalog_status(&clarification);
-    let response_clarification = clarification.clone();
-    let commit = state.catalog.commit_research_turn_status_idempotent_result(
-        DurableIdempotencyCompletion {
-            user_id: &lease.user_id,
-            method: "POST",
-            resource_scope: &lease.resource_scope,
-            key: &lease.key,
-            operation_id: &lease.operation_id,
-            operation_created_at: lease.operation_created_at,
-            claim_token: &lease.claim_token,
-            status_code: i64::from(StatusCode::OK.as_u16()),
-        },
-        &turn.turn_id,
-        status,
-        None,
-        None,
-        lease.operation_created_at,
-        move |updated| {
-            let projected = project_research_turn(updated.clone(), Some(response_clarification.clone()))
-                .map_err(|_| CatalogError::InvalidData("invalid research turn projection"))?;
-            serde_json::to_value(projected).map_err(CatalogError::ResponseSerialization)
-        },
-    );
-    let commit = match commit {
-        Ok(commit) => commit,
-        Err(error) => return finish_durable_error(&mut lease, map_catalog_error(error)),
-    };
-    lease.completed = true;
-    let _ = schedule_automatic_research_turn(
-        &state,
-        user.user_id.clone(),
-        conversation_id,
-        commit.resource.clone(),
-        clarification,
-        model_access,
-    );
-    Ok(Json(commit.projection).into_response())
-}
-
-#[allow(dead_code)]
-async fn submit_dialogue_message(
-    State(state): State<Arc<DemoHostState>>,
-    jar: CookieJar,
-    headers: HeaderMap,
-    Path((conversation_id, turn_id)): Path<(String, String)>,
-    ApiJson(request): ApiJson<DialogueMessageRequest>,
-) -> Result<Response, PublicHttpError> {
-    let user = authenticated_user(&state, &jar)?;
-    let resource_scope = format!("conversations/{conversation_id}/turns/{turn_id}/messages");
-    let idempotency =
-        begin_idempotent_request(&state, &headers, &user.user_id, &resource_scope, &request)?;
-    let lease = match idempotency {
-        IdempotencyStart::Claimed(lease) => lease,
-        IdempotencyStart::Replay(response) => return Ok(response),
-    };
-    let result = async {
-        let message = validate_trimmed_text(
-            &request.message,
-            1,
-            4_000,
-            "invalid_dialogue_message",
-            "消息长度无效",
-        )?;
-        let (_, turn, model_access) =
-            owned_turn_with_model(&state, &jar, &conversation_id, &turn_id)?;
-        let clarification = state
-            .research_runtime
-            .submit_dialogue_message(
-                &turn.clarification_id,
-                request.revision,
-                &message,
-                &model_access,
-            )
-            .await
-            .map_err(map_dialogue_runtime_error)?;
-        state
-            .catalog
-            .update_research_turn_status(
-                &turn.turn_id,
-                clarification_catalog_status(&clarification),
-                None,
-                None,
-                now(),
-            )
-            .map_err(map_catalog_error)?;
-        let updated = state
-            .catalog
-            .owned_research_turn(&user.user_id, &conversation_id, &turn_id)
-            .map_err(map_catalog_error)?;
-        let (updated, clarification) = schedule_automatic_research_turn(
-            &state,
-            user.user_id.clone(),
-            conversation_id.clone(),
-            updated,
-            clarification,
-            model_access,
-        );
-        let response = project_research_turn(updated, Some(clarification))?;
-        Ok(response)
-    }
-    .await;
-    finish_idempotent_result(lease, result)
-}
-
-/// Research starts as a consequence of the model's `start_research` decision,
-/// never as a second browser command. Scheduling returns the pending Turn to
-/// the browser immediately; a detached task owns execution and terminalization.
-fn schedule_automatic_research_turn(
-    state: &Arc<DemoHostState>,
-    user_id: String,
-    conversation_id: String,
-    turn: ResearchTurnRecord,
-    clarification: ClarificationState,
-    model_access: ModelAccessConfig,
-) -> (ResearchTurnRecord, ClarificationState) {
-    if !is_automatic_execution_pending(turn.status, clarification.status) {
-        return (turn, clarification);
-    }
-    let execution_state = Arc::clone(state);
-    let execution_turn = turn.clone();
-    tokio::spawn(async move {
-        let turn_id = execution_turn.turn_id.clone();
-        if let Err(error) = execute_scheduled_research_turn(
-            &execution_state,
-            &user_id,
-            &conversation_id,
-            execution_turn,
-            &model_access,
-        )
-        .await
-        {
-            tracing::error!(turn_id = %turn_id, "scheduled automatic research failed: {}", error.public_message);
-        }
-    });
-    (turn, clarification)
-}
-
-async fn execute_scheduled_research_turn(
-    state: &Arc<DemoHostState>,
-    user_id: &str,
-    conversation_id: &str,
-    turn: ResearchTurnRecord,
-    model_access: &ModelAccessConfig,
-) -> Result<(ResearchTurnRecord, ClarificationState), PublicHttpError> {
-    let permit =
-        state.research_slots.acquire().await.map_err(|_| {
-            PublicHttpError::internal_failure("research capacity semaphore was closed")
-        })?;
-    let prepared = match state
-        .research_runtime
-        .prepare_research_run_with_answer_style(
-            &turn.clarification_id,
-            TracePolicy::default(),
-            turn.answer_style,
-        )
-        .await
-    {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            tracing::error!(error = %error, turn_id = %turn.turn_id, "automatic research preparation failed");
-            return fail_automatic_research_turn(state, user_id, conversation_id, turn).await;
-        }
-    };
-    state
-        .catalog
-        .update_research_turn_status(
-            &turn.turn_id,
-            ResearchTurnStatus::Running,
-            Some(&prepared.run_id),
-            None,
-            now(),
-        )
-        .map_err(map_catalog_error)?;
-    let result = state
-        .research_runtime
-        .execute_prepared_research(prepared, model_access)
-        .await;
-    drop(permit);
-    match result {
-        Ok(answer) => {
-            let answer_json =
-                serde_json::to_string(&answer).map_err(PublicHttpError::internal_failure)?;
-            state
-                .catalog
-                .update_research_turn_status(
-                    &turn.turn_id,
-                    ResearchTurnStatus::Completed,
-                    None,
-                    Some(&answer_json),
-                    now(),
-                )
-                .map_err(map_catalog_error)?;
-        }
-        Err(error) => {
-            tracing::error!(error = %error, turn_id = %turn.turn_id, "automatic research turn failed");
-            return fail_automatic_research_turn(state, user_id, conversation_id, turn).await;
-        }
-    }
-    let updated = state
-        .catalog
-        .owned_research_turn(user_id, conversation_id, &turn.turn_id)
-        .map_err(map_catalog_error)?;
-    let clarification = state
-        .research_runtime
-        .load_clarification(&turn.clarification_id)
-        .await
-        .map_err(PublicHttpError::internal_failure)?;
-    Ok((updated, clarification))
-}
-
-/// Records an automatic-execution failure as a terminal host state. When the
-/// preparation attempt failed before its append-only preparation event, the
-/// intake is still `ResearchReady`; terminalizing the preparation failure
-/// releases the core conversation without requiring a browser action.
-async fn fail_automatic_research_turn(
-    state: &Arc<DemoHostState>,
-    user_id: &str,
-    conversation_id: &str,
-    turn: ResearchTurnRecord,
-) -> Result<(ResearchTurnRecord, ClarificationState), PublicHttpError> {
-    let current = state
-        .research_runtime
-        .load_clarification(&turn.clarification_id)
-        .await
-        .map_err(PublicHttpError::internal_failure)?;
-    let clarification = match current.status {
-        ClarificationStatus::ResearchReady => state
-            .research_runtime
-            .terminalize_research_preparation_failure(
-                &turn.clarification_id,
-                AUTOMATIC_RESEARCH_FAILURE_SUMMARY,
-            )
-            .await
-            .map_err(PublicHttpError::internal_failure)?,
-        ClarificationStatus::ResearchPrepared => {
-            let preparation = current.preparation.as_ref().ok_or_else(|| {
-                PublicHttpError::internal_failure("prepared research has no run identifier")
-            })?;
-            state
-                .research_runtime
-                .terminalize_prepared_research_failure(
-                    &turn.clarification_id,
-                    &preparation.run_id,
-                    AUTOMATIC_RESEARCH_FAILURE_SUMMARY,
-                )
-                .await
-                .map_err(PublicHttpError::internal_failure)?
-        }
-        ClarificationStatus::ResearchFailed | ClarificationStatus::Cancelled => current,
-        status => {
-            return Err(PublicHttpError::internal_failure(format!(
-                "automatic research failure cannot terminalize clarification in {status:?}"
-            )));
-        }
-    };
-    let status = match clarification.status {
-        ClarificationStatus::ResearchFailed => ResearchTurnStatus::Failed,
-        ClarificationStatus::Cancelled => ResearchTurnStatus::Cancelled,
-        status => {
-            return Err(PublicHttpError::internal_failure(format!(
-                "automatic research failure did not produce a terminal clarification state: {status:?}"
-            )));
-        }
-    };
-    state
-        .catalog
-        .update_research_turn_status(&turn.turn_id, status, None, None, now())
-        .map_err(map_catalog_error)?;
-    let updated = state
-        .catalog
-        .owned_research_turn(user_id, conversation_id, &turn.turn_id)
-        .map_err(map_catalog_error)?;
-    Ok((updated, clarification))
-}
-
-fn is_automatic_execution_pending(
-    turn_status: ResearchTurnStatus,
-    clarification_status: ClarificationStatus,
-) -> bool {
-    matches!(
-        turn_status,
-        ResearchTurnStatus::Ready | ResearchTurnStatus::Running
-    ) && matches!(
-        clarification_status,
-        ClarificationStatus::ResearchReady | ClarificationStatus::ResearchPrepared
-    )
-}
-
-/// A server restart can occur after the model committed `start_research` but
-/// before execution finished. The startup recovery coordinator resumes that
-/// work using the turn's pinned model-profile revision; it never asks the
-/// browser to confirm or press an execute command.
-async fn resume_automatic_execution_if_needed(
-    state: &Arc<DemoHostState>,
-    user_id: &str,
-    conversation_id: &str,
-    turn: ResearchTurnRecord,
-    clarification: ClarificationState,
-) -> Result<(ResearchTurnRecord, ClarificationState), PublicHttpError> {
-    if matches!(
-        clarification.status,
-        ClarificationStatus::ResearchFailed | ClarificationStatus::Cancelled
-    ) {
-        return reconcile_terminal_automatic_turn(
-            state,
-            user_id,
-            conversation_id,
-            turn,
-            clarification,
-        )
-        .await;
-    }
-    if !is_automatic_execution_pending(turn.status, clarification.status) {
-        return Ok((turn, clarification));
-    }
-    let profile = match state.catalog.model_profile_for_turn(user_id, &turn) {
-        Ok(profile) => profile,
-        Err(error) => {
-            tracing::error!(error = %error, turn_id = %turn.turn_id, "automatic research cannot resume with its pinned model profile");
-            return fail_automatic_research_turn(state, user_id, conversation_id, turn).await;
-        }
-    };
-    let model_access = match model_access_from_profile(state, &profile) {
-        Ok(model_access) => model_access,
-        Err(error) => {
-            tracing::error!(turn_id = %turn.turn_id, "automatic research cannot resume because model access is unavailable");
-            let _ = error;
-            return fail_automatic_research_turn(state, user_id, conversation_id, turn).await;
-        }
-    };
-    Ok(schedule_automatic_research_turn(
-        state,
-        user_id.to_owned(),
-        conversation_id.to_owned(),
-        turn,
-        clarification,
-        model_access,
-    ))
-}
-
-/// Repairs the host catalogue after a crash between the append-only core
-/// terminal event and its SQL status update. This deliberately performs no
-/// model call or research execution.
-async fn reconcile_terminal_automatic_turn(
-    state: &Arc<DemoHostState>,
-    user_id: &str,
-    conversation_id: &str,
-    turn: ResearchTurnRecord,
-    clarification: ClarificationState,
-) -> Result<(ResearchTurnRecord, ClarificationState), PublicHttpError> {
-    let status = match clarification.status {
-        ClarificationStatus::ResearchFailed => ResearchTurnStatus::Failed,
-        ClarificationStatus::Cancelled => ResearchTurnStatus::Cancelled,
-        status => {
-            return Err(PublicHttpError::internal_failure(format!(
-                "terminal reconciliation received nonterminal clarification state {status:?}"
-            )));
-        }
-    };
-    state
-        .catalog
-        .update_research_turn_status(&turn.turn_id, status, None, None, now())
-        .map_err(map_catalog_error)?;
-    let updated = state
-        .catalog
-        .owned_research_turn(user_id, conversation_id, &turn.turn_id)
-        .map_err(map_catalog_error)?;
-    Ok((updated, clarification))
-}
-
-/// Starts bounded, detached recovery after the host has constructed its shared
-/// state. This preserves read-only conversation routes while ensuring a crash
-/// cannot turn a model-approved `start_research` decision into a browser
-/// action. Runtime clarification and conversation locks make duplicate calls
-/// idempotent: preparation reuses its persisted run id, and execution recovers
-/// a completed or failed trace instead of running it twice.
-pub(crate) fn start_automatic_execution_recovery(state: Arc<DemoHostState>) {
-    tokio::spawn(async move {
-        let candidates = match state.catalog.automatic_execution_recovery_candidates() {
-            Ok(candidates) => candidates,
-            Err(error) => {
-                tracing::error!(error = %error, "could not list automatic research recovery candidates");
-                return;
-            }
-        };
-        if !candidates.is_empty() {
-            tracing::info!(
-                count = candidates.len(),
-                "recovering automatic research turns"
-            );
-        }
-        for candidate in candidates {
-            let turn = candidate.turn;
-            let turn_id = turn.turn_id.clone();
-            let conversation_id = turn.conversation_id.clone();
-            let clarification = match state
-                .research_runtime
-                .load_clarification(&turn.clarification_id)
-                .await
-            {
-                Ok(clarification) => clarification,
-                Err(error) => {
-                    tracing::error!(error = %error, turn_id = %turn.turn_id, "could not load automatic research recovery state");
-                    continue;
-                }
-            };
-            if let Err(error) = resume_automatic_execution_if_needed(
-                &state,
-                &candidate.user_id,
-                &conversation_id,
-                turn,
-                clarification,
-            )
-            .await
-            {
-                tracing::error!(turn_id = %turn_id, "automatic research recovery failed: {}", error.public_message);
-            }
-        }
-    });
 }
 
 async fn load_research_turn_trace_summary(
@@ -2490,38 +1545,6 @@ fn removal_cookie(secure: bool) -> Cookie<'static> {
         .build()
 }
 
-fn owned_turn_with_model(
-    state: &DemoHostState,
-    jar: &CookieJar,
-    conversation_id: &str,
-    turn_id: &str,
-) -> Result<(UserAccountRecord, ResearchTurnRecord, ModelAccessConfig), PublicHttpError> {
-    let user = authenticated_user(state, jar)?;
-    let turn = state
-        .catalog
-        .owned_research_turn(&user.user_id, conversation_id, turn_id)
-        .map_err(map_catalog_error)?;
-    let profile = state
-        .catalog
-        .model_profile_for_turn(&user.user_id, &turn)
-        .map_err(map_catalog_error)?;
-    let model_access = model_access_from_profile(state, &profile)?;
-    Ok((user, turn, model_access))
-}
-
-fn model_access_from_profile(
-    state: &DemoHostState,
-    profile: &ModelProfileRecord,
-) -> Result<ModelAccessConfig, PublicHttpError> {
-    let api_key = decrypt_profile_api_key(state, profile)?;
-    if state.allow_private_model_endpoints {
-        ModelAccessConfig::new(&profile.api_base_url, api_key, &profile.model_id)
-    } else {
-        ModelAccessConfig::new_public(&profile.api_base_url, api_key, &profile.model_id)
-    }
-    .map_err(PublicHttpError::internal_failure)
-}
-
 fn decrypt_profile_api_key(
     state: &DemoHostState,
     profile: &ModelProfileRecord,
@@ -2584,29 +1607,6 @@ async fn validate_model_access(
     Ok(normalized)
 }
 
-async fn build_conversation_detail(
-    state: &DemoHostState,
-    conversation: ResearchConversationRecord,
-) -> Result<ConversationDetailResponse, PublicHttpError> {
-    let turns = state
-        .catalog
-        .list_research_turns(&conversation.conversation_id)
-        .map_err(map_catalog_error)?;
-    let mut responses = Vec::with_capacity(turns.len());
-    for turn in turns {
-        let clarification = state
-            .research_runtime
-            .load_clarification(&turn.clarification_id)
-            .await
-            .map_err(PublicHttpError::internal_failure)?;
-        responses.push(project_research_turn(turn, Some(clarification))?);
-    }
-    Ok(ConversationDetailResponse {
-        conversation: project_conversation_summary(conversation),
-        turns: responses,
-    })
-}
-
 fn project_user_account(account: UserAccountRecord) -> UserAccountResponse {
     UserAccountResponse {
         user_id: account.user_id,
@@ -2640,21 +1640,6 @@ fn project_archived_model_profile(
     }
 }
 
-fn project_conversation_summary(
-    conversation: ResearchConversationRecord,
-) -> ConversationSummaryResponse {
-    ConversationSummaryResponse {
-        conversation_id: conversation.conversation_id,
-        title: conversation.title,
-        model_profile_id: conversation.model_profile_id,
-        model_profile_name: conversation.model_profile_name,
-        turn_count: conversation.turn_count,
-        latest_turn_status: conversation.latest_turn_status,
-        created_at: conversation.created_at,
-        updated_at: conversation.updated_at,
-    }
-}
-
 fn project_archived_conversation(
     conversation: ArchivedConversationRecord,
 ) -> ArchivedConversationResponse {
@@ -2663,42 +1648,6 @@ fn project_archived_conversation(
         model_profile_available: conversation.model_profile_available,
         conversation: project_conversation_summary(conversation.conversation),
     }
-}
-
-fn project_research_turn(
-    turn: ResearchTurnRecord,
-    clarification: Option<ClarificationState>,
-) -> Result<ResearchTurnResponse, PublicHttpError> {
-    let has_answer = turn.answer_json.is_some();
-    if (turn.status == ResearchTurnStatus::Completed && !has_answer)
-        || (turn.status != ResearchTurnStatus::Completed && has_answer)
-        || (turn.status == ResearchTurnStatus::Clarifying && clarification.is_none())
-    {
-        return Err(PublicHttpError::internal_failure(
-            "research turn state violates the public projection contract",
-        ));
-    }
-    let complete_answer = turn
-        .answer_json
-        .as_deref()
-        .map(serde_json::from_str::<ResearchAnswerResponse>)
-        .transpose()
-        .map_err(PublicHttpError::internal_failure)?;
-    let answer = complete_answer.as_ref().map(project_chat_research_answer);
-    let dialogue = clarification
-        .map(|clarification| project_dialogue(clarification, turn.status))
-        .transpose()?;
-    Ok(ResearchTurnResponse {
-        turn_id: turn.turn_id,
-        turn_number: turn.turn_number,
-        user_question: turn.user_question,
-        status: turn.status.as_str(),
-        answer,
-        dialogue,
-        created_at: turn.created_at,
-        updated_at: turn.updated_at,
-        completed_at: turn.completed_at,
-    })
 }
 
 fn read_jsonl_events<T: serde::de::DeserializeOwned>(
@@ -2713,67 +1662,6 @@ fn read_jsonl_events<T: serde::de::DeserializeOwned>(
         .map(serde_json::from_str)
         .collect::<Result<Vec<T>, _>>()
         .map_err(PublicHttpError::internal_failure)
-}
-
-fn project_dialogue(
-    clarification: ClarificationState,
-    turn_status: ResearchTurnStatus,
-) -> Result<TurnDialogueResponse, PublicHttpError> {
-    let (status, failure) = dialogue_status_and_failure(turn_status, &clarification);
-    Ok(TurnDialogueResponse {
-        revision: clarification.revision,
-        status,
-        messages: clarification.dialogue,
-        failure,
-    })
-}
-
-fn dialogue_status_and_failure(
-    turn_status: ResearchTurnStatus,
-    clarification: &ClarificationState,
-) -> (&'static str, Option<String>) {
-    if let Some((status, failure)) = terminal_dialogue_outcome(turn_status) {
-        return (status, Some(failure.into()));
-    }
-    match clarification.status {
-        ClarificationStatus::ModelEvaluationPending => ("thinking", None),
-        ClarificationStatus::AwaitingUserMessage => ("awaiting_message", None),
-        ClarificationStatus::ResearchReady | ClarificationStatus::ResearchPrepared => {
-            ("research_started", None)
-        }
-        ClarificationStatus::ResearchFailed => {
-            ("failed", Some(AUTOMATIC_RESEARCH_FAILURE_MESSAGE.into()))
-        }
-        ClarificationStatus::ModelRequestFailed => (
-            "failed",
-            Some(
-                clarification
-                    .failure
-                    .clone()
-                    .unwrap_or_else(|| "模型暂时无法继续理解该问题。".into()),
-            ),
-        ),
-        ClarificationStatus::Cancelled => ("cancelled", None),
-    }
-}
-
-fn terminal_dialogue_outcome(
-    turn_status: ResearchTurnStatus,
-) -> Option<(&'static str, &'static str)> {
-    (turn_status == ResearchTurnStatus::Failed)
-        .then_some(("failed", AUTOMATIC_RESEARCH_FAILURE_MESSAGE))
-}
-
-fn clarification_catalog_status(clarification: &ClarificationState) -> ResearchTurnStatus {
-    match clarification.status {
-        ClarificationStatus::ResearchReady => ResearchTurnStatus::Ready,
-        ClarificationStatus::ResearchPrepared => ResearchTurnStatus::Running,
-        ClarificationStatus::ResearchFailed => ResearchTurnStatus::Failed,
-        ClarificationStatus::Cancelled => ResearchTurnStatus::Cancelled,
-        ClarificationStatus::ModelRequestFailed
-        | ClarificationStatus::ModelEvaluationPending
-        | ClarificationStatus::AwaitingUserMessage => ResearchTurnStatus::Clarifying,
-    }
 }
 
 fn begin_durable_idempotent_request<T: Serialize>(
@@ -2908,139 +1796,6 @@ fn finish_durable_error(
     Err(error)
 }
 
-fn derive_operation_resource_id(operation_id: &str, purpose: &str) -> String {
-    let mut value = format!("{:x}", Sha256::digest(format!("{operation_id}:{purpose}").as_bytes()));
-    value.truncate(32);
-    value
-}
-
-fn operation_datetime(seconds: i64) -> DateTime<Utc> {
-    DateTime::<Utc>::from_timestamp(seconds, 0).unwrap_or_else(Utc::now)
-}
-
-fn begin_idempotent_request<T: Serialize>(
-    state: &Arc<DemoHostState>,
-    headers: &HeaderMap,
-    user_id: &str,
-    resource_scope: &str,
-    request: &T,
-) -> Result<IdempotencyStart, PublicHttpError> {
-    let key = headers
-        .get("idempotency-key")
-        .ok_or_else(|| {
-            PublicHttpError::bounded_bad_request(
-                "idempotency_key_required",
-                "Idempotency-Key is required",
-            )
-        })?
-        .to_str()
-        .map_err(|_| {
-            PublicHttpError::bounded_bad_request(
-                "invalid_idempotency_key",
-                "Idempotency-Key is invalid",
-            )
-        })?
-        .trim();
-    if !(8..=128).contains(&key.len())
-        || !key
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
-    {
-        return Err(PublicHttpError::bounded_bad_request(
-            "invalid_idempotency_key",
-            "Idempotency-Key is invalid",
-        ));
-    }
-    let request_bytes = serde_json::to_vec(request).map_err(PublicHttpError::internal_failure)?;
-    let request_hash = format!("{:x}", Sha256::digest(request_bytes));
-    let current_time = now();
-    match state
-        .catalog
-        .claim_idempotency(NewIdempotencyClaim {
-            user_id,
-            method: "POST",
-            resource_scope,
-            key,
-            request_hash: &request_hash,
-            now: current_time,
-            expires_at: current_time + IDEMPOTENCY_RETENTION_SECONDS,
-        })
-        .map_err(map_catalog_error)?
-    {
-        IdempotencyClaim::Claimed { claim_token } => {
-            Ok(IdempotencyStart::Claimed(IdempotencyLease {
-                state: Arc::clone(state),
-                user_id: user_id.into(),
-                resource_scope: resource_scope.into(),
-                key: key.into(),
-                claim_token,
-                completed: false,
-            }))
-        }
-        IdempotencyClaim::InProgress => Err(PublicHttpError {
-            status: StatusCode::CONFLICT,
-            code: "idempotency_request_in_progress",
-            public_message: "The original request is still in progress",
-            retryable: true,
-        }),
-        IdempotencyClaim::Reused => Err(PublicHttpError::conflict(
-            "idempotency_key_reused",
-            "Idempotency-Key was already used for a different request",
-        )),
-        IdempotencyClaim::Replay {
-            status_code,
-            response_json,
-        } => {
-            let status = StatusCode::from_u16(
-                u16::try_from(status_code).map_err(PublicHttpError::internal_failure)?,
-            )
-            .map_err(PublicHttpError::internal_failure)?;
-            let response = Response::builder()
-                .status(status)
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(response_json))
-                .map_err(PublicHttpError::internal_failure)?;
-            Ok(IdempotencyStart::Replay(response))
-        }
-    }
-}
-
-fn finish_idempotent_result<T: Serialize>(
-    mut lease: IdempotencyLease,
-    result: Result<T, PublicHttpError>,
-) -> Result<Response, PublicHttpError> {
-    let (status, response_json) = match &result {
-        Ok(value) => (
-            StatusCode::OK,
-            serde_json::to_string(value).map_err(PublicHttpError::internal_failure)?,
-        ),
-        Err(error) => (
-            error.status,
-            serde_json::to_string(&ErrorResponse {
-                code: error.code,
-                message: error.public_message,
-                retryable: error.retryable,
-            })
-            .map_err(PublicHttpError::internal_failure)?,
-        ),
-    };
-    lease
-        .state
-        .catalog
-        .complete_idempotency(CompleteIdempotency {
-            user_id: &lease.user_id,
-            method: "POST",
-            resource_scope: &lease.resource_scope,
-            key: &lease.key,
-            claim_token: &lease.claim_token,
-            status_code: i64::from(status.as_u16()),
-            response_json: &response_json,
-        })
-        .map_err(map_catalog_error)?;
-    lease.completed = true;
-    result.map(|value| Json(value).into_response())
-}
-
 fn normalize_email(value: &str) -> Result<String, PublicHttpError> {
     let normalized = value.trim().to_lowercase();
     let valid = normalized.chars().count() <= MAX_EMAIL_CHARS
@@ -3144,36 +1899,6 @@ fn map_catalog_error(error: CatalogError) -> PublicHttpError {
             PublicHttpError::conflict(
                 "turn_not_accepting_messages",
                 "This research turn is no longer accepting messages",
-            )
-        }
-        other => PublicHttpError::internal_failure(other),
-    }
-}
-
-fn map_dialogue_runtime_error(error: ResearchRuntimeError) -> PublicHttpError {
-    match error {
-        ResearchRuntimeError::Clarification(ClarificationError::StaleRevision { .. }) => {
-            PublicHttpError::conflict(
-                "dialogue_revision_conflict",
-                "The dialogue changed; refresh before sending this message again",
-            )
-        }
-        ResearchRuntimeError::Clarification(ClarificationError::InvalidTransition { .. }) => {
-            PublicHttpError::conflict(
-                "turn_not_accepting_messages",
-                "This research turn is no longer accepting messages",
-            )
-        }
-        other => PublicHttpError::internal_failure(other),
-    }
-}
-
-fn map_create_turn_runtime_error(error: ResearchRuntimeError) -> PublicHttpError {
-    match error {
-        ResearchRuntimeError::Conversation(ConversationError::InvalidEvent(_)) => {
-            PublicHttpError::conflict(
-                "conversation_has_active_turn",
-                "Finish or cancel the active turn before starting another",
             )
         }
         other => PublicHttpError::internal_failure(other),
@@ -3338,163 +2063,6 @@ mod tests {
         assert!(!json.contains("ciphertext"));
         assert!(!json.contains("nonce"));
         assert!(!json.contains("\"api_key\":"));
-    }
-
-    #[test]
-    fn chat_turn_projection_exposes_only_l1_fields() {
-        let complete_answer = serde_json::json!({
-            "answer_style": "web_first",
-            "answer": "Grounded answer",
-            "knowledge_draft": {
-                "answer": "draft",
-                "claims": ["draft claim"],
-                "uncertainty": "uncertain",
-                "basis_summary": "review-safe basis"
-            },
-            "comparison": {
-                "agreements": [],
-                "differences": [],
-                "synthesis_rationale": "review-safe synthesis"
-            },
-            "claims": [{
-                "text": "Grounded claim",
-                "origin": "web_evidence",
-                "rationale": "review-safe claim rationale",
-                "sources": [{"url": "https://example.com/", "title": "Example"}]
-            }]
-        });
-        let response = project_research_turn(
-            ResearchTurnRecord {
-                turn_id: "t".repeat(32),
-                conversation_id: "c".repeat(32),
-                turn_number: 1,
-                clarification_id: "i".repeat(32),
-                run_id: Some("r".repeat(32)),
-                user_question: "question".into(),
-                status: ResearchTurnStatus::Completed,
-                answer_style: ResearchAnswerStyle::WebFirst,
-                model_profile_id: "p".repeat(32),
-                model_profile_revision: 1,
-                model_api_base_url: "https://model.example/v1/".into(),
-                model_id: "secret-model-id".into(),
-                answer_json: Some(complete_answer.to_string()),
-                created_at: 1,
-                updated_at: 2,
-                completed_at: Some(2),
-            },
-            None,
-        )
-        .unwrap();
-        let value = serde_json::to_value(response).unwrap();
-        let keys = value
-            .as_object()
-            .unwrap()
-            .keys()
-            .map(String::as_str)
-            .collect::<Vec<_>>();
-
-        assert_eq!(
-            keys,
-            [
-                "answer",
-                "completed_at",
-                "created_at",
-                "dialogue",
-                "status",
-                "turn_id",
-                "turn_number",
-                "updated_at",
-                "user_question",
-            ]
-        );
-        assert_eq!(
-            value["answer"],
-            serde_json::json!({
-                "answer": "Grounded answer",
-                "sources": [{"url": "https://example.com/", "title": "Example"}]
-            })
-        );
-    }
-
-    fn turn_record(status: ResearchTurnStatus, answer_json: Option<String>) -> ResearchTurnRecord {
-        ResearchTurnRecord {
-            turn_id: "t".repeat(32),
-            conversation_id: "c".repeat(32),
-            turn_number: 1,
-            clarification_id: "i".repeat(32),
-            run_id: None,
-            user_question: "question".into(),
-            status,
-            answer_style: ResearchAnswerStyle::WebFirst,
-            model_profile_id: "p".repeat(32),
-            model_profile_revision: 1,
-            model_api_base_url: "https://model.example/v1/".into(),
-            model_id: "model-id".into(),
-            answer_json,
-            created_at: 1,
-            updated_at: 2,
-            completed_at: None,
-        }
-    }
-
-    #[test]
-    fn invalid_turn_state_combinations_are_not_projected_as_normal_browser_state() {
-        let answer = serde_json::json!({
-            "answer_style": "web_first",
-            "answer": "Grounded answer",
-            "knowledge_draft": {
-                "answer": "draft",
-                "claims": [],
-                "uncertainty": "none",
-                "basis_summary": "basis"
-            },
-            "comparison": {
-                "agreements": [],
-                "differences": [],
-                "synthesis_rationale": "synthesis"
-            },
-            "claims": []
-        })
-        .to_string();
-
-        for (turn, clarification) in [
-            (turn_record(ResearchTurnStatus::Completed, None), None),
-            (turn_record(ResearchTurnStatus::Running, Some(answer)), None),
-            (turn_record(ResearchTurnStatus::Clarifying, None), None),
-        ] {
-            let error = project_research_turn(turn, clarification).unwrap_err();
-            assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
-            assert_eq!(error.code, "internal_error");
-        }
-    }
-
-    #[test]
-    fn automatic_execution_only_resumes_nonterminal_model_ready_work() {
-        assert!(is_automatic_execution_pending(
-            ResearchTurnStatus::Ready,
-            ClarificationStatus::ResearchReady,
-        ));
-        assert!(is_automatic_execution_pending(
-            ResearchTurnStatus::Running,
-            ClarificationStatus::ResearchPrepared,
-        ));
-        assert!(!is_automatic_execution_pending(
-            ResearchTurnStatus::Failed,
-            ClarificationStatus::ResearchPrepared,
-        ));
-        assert!(!is_automatic_execution_pending(
-            ResearchTurnStatus::Ready,
-            ClarificationStatus::AwaitingUserMessage,
-        ));
-    }
-
-    #[test]
-    fn automatic_failure_is_never_presented_as_research_started() {
-        assert_eq!(
-            terminal_dialogue_outcome(ResearchTurnStatus::Failed),
-            Some(("failed", AUTOMATIC_RESEARCH_FAILURE_MESSAGE)),
-        );
-        assert_eq!(terminal_dialogue_outcome(ResearchTurnStatus::Running), None,);
     }
 
     #[test]

@@ -22,7 +22,9 @@ Browser / Rust caller
                 └── snapshots.sqlite
 ```
 
-详见 [`docs/web-search-architecture.md`](docs/web-search-architecture.md)。
+详见 [`docs/web-search-architecture.md`](docs/web-search-architecture.md)。后端开发者可先读
+[`docs/backend-architecture.md`](docs/backend-architecture.md)，其中包含当前模块依赖、请求时序、
+持久化边界和实现状态。
 
 ## 前置条件
 

@@ -6,6 +6,10 @@
 >
 > 本文以 `src/`、`web/src/`、`demo-host/Containerfile` 和已接受 ADR 的现状为准，描述已经实现的模块、接口和限制。计划与待办不代表当前能力。
 
+后端模块、调用时序、依赖关系和当前实现状态请先读
+[`backend-architecture.md`](backend-architecture.md)；本文保留更完整的 Web 搜索、Trace
+披露和 Browser 行为设计。
+
 ## 1. 目标、语言与设计规则
 
 系统的目标是在不打断自然对话的前提下，让一次 Web 研究从意图理解、检索和正文抓取，到来源选择、答案合成和失败恢复都可复查。模型负责生成受限的结构化建议；程序负责验证、状态转换、外部访问、资源上限、持久化、权限和公开投影。
@@ -50,11 +54,13 @@ flowchart LR
     subgraph Host["Demo Host"]
         entry["main.rs\n进程组装与静态托管"]
         http["workspace_api.rs\nHTTP 用例与公开投影"]
+        service["research_service.rs\nTurn/Message use cases"]
         security["security.rs\n认证与凭据原语"]
         catalog["catalog.rs\n身份与公开对象目录"]
         entry --> http
         http --> security
-        http --> catalog
+        http --> service
+        service --> catalog
     end
 
     subgraph Core["traceable-search library"]
@@ -99,7 +105,7 @@ flowchart LR
     end
 
     client --> http
-    http --> runtime
+    service --> runtime
     catalog --> catalogdb
     conversation --> sessionlog
     clarification --> intakelog
@@ -151,7 +157,8 @@ flowchart LR
 | 模块 | 主要接口 | 责任 | 明确不负责 |
 | --- | --- | --- | --- |
 | `demo-host/src/main.rs` | Axum 进程入口、`DemoHostState`、统一公开错误 | 从环境组装 Runtime、Semaphore、Catalogue、CredentialCipher；启动恢复任务；挂载 `/api`、静态文件、Host/Origin 中间件和 16 KiB body limit | 业务 SQL、研究算法、页面状态 |
-| `demo-host/src/workspace_api.rs` | 路由、HTTP DTO、用例函数、Trace projector | 认证、所有权、Profile/Conversation/Turn 用例；调用 Core；后台准备/执行/恢复；L1/L2/L3 白名单投影 | 搜索与抓取实现、密码学算法 |
+| `demo-host/src/workspace_api.rs` | 路由、HTTP DTO、Trace projector | 请求解析、认证、幂等回放、HTTP 错误和 L1/L2/L3 白名单投影 | Conversation/Turn 状态编排、后台调度、搜索与抓取实现、密码学算法 |
+| `demo-host/src/research_service.rs` | `create_conversation`、`load_conversation`、`create_turn`、`submit_message` | 收敛主链所有权、Profile revision、Clarification 补偿、Catalog durable commit、后台调度/恢复和公开响应投影；固定 `web_first` | 搜索与抓取实现、HTTP 路由、Core reducer |
 | `demo-host/src/catalog.rs` | `DemoCatalog` 与 record/input 类型 | Host 身份和公开对象的权威目录；管理账户、登录会话、Profile、公开 Conversation/Turn 映射、状态和完整答案恢复副本 | Core JSONL、Snapshot 正文、Trace 事件 |
 | `demo-host/src/security.rs` | `CredentialCipher`、密码和 token 函数 | 密码哈希/校验、随机登录 token、token SHA-256、AES-256-GCM API key 加解密；AAD 绑定 user/profile | Cookie 策略、SQL、授权判断 |
 | `docs/database/0001-demo-catalog.sql` | Catalogue schema v1 | 建立 STRICT 账户、登录会话、模型 Profile、Conversation、Turn 表及约束 | Core schema |
